@@ -16,26 +16,22 @@ fi
 echo "Retrieving resources from stack '${STACK_NAME}' in region '${REGION}'..."
 echo ""
 
-# Get ECS Instance Profile ARN
-INSTANCE_PROFILE=$(aws cloudformation describe-stacks \
+# Get ECS Instance Profile name
+INSTANCE_PROFILE=$(aws cloudformation list-stack-resources \
   --region ${REGION} \
   --stack-name ${STACK_NAME} \
-  --query "Stacks[0].Resources[?LogicalResourceId=='ECSTaskInstanceProfile'].PhysicalResourceId" \
-  --output text 2>/dev/null)
-
-if [[ "$INSTANCE_PROFILE" == "" ]]; then
-  INSTANCE_PROFILE=$(aws cloudformation list-stack-resources \
-    --region ${REGION} \
-    --stack-name ${STACK_NAME} \
-    --query "StackResourceSummaries[?LogicalResourceId=='ECSTaskInstanceProfile'].PhysicalResourceId" \
-    --output text)
-fi
+  --query "StackResourceSummaries[?LogicalResourceId=='ECSTaskInstanceProfile'].PhysicalResourceId" \
+  --output text)
 
 # Get full ARN for instance profile
-INSTANCE_PROFILE_ARN=$(aws iam get-instance-profile \
-  --instance-profile-name ${INSTANCE_PROFILE} \
-  --query "InstanceProfile.Arn" \
-  --output text 2>/dev/null)
+if [[ "$INSTANCE_PROFILE" != "" ]]; then
+  INSTANCE_PROFILE_ARN=$(aws iam get-instance-profile \
+    --instance-profile-name ${INSTANCE_PROFILE} \
+    --query "InstanceProfile.Arn" \
+    --output text 2>/dev/null)
+else
+  INSTANCE_PROFILE_ARN="ERROR: Could not find ECSTaskInstanceProfile"
+fi
 
 # Get Batch Service Role ARN
 BATCH_ROLE=$(aws cloudformation list-stack-resources \
