@@ -31,6 +31,7 @@ ADD ./templates/*.sh /opt/vf/tools/templates/
 ENV LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
 
 # Install Boost (1.59 or above)
+RUN yum install -y boost-devel
 WORKDIR /tmp
 RUN wget -O boost_1_70_0.tar.gz https://boostorg.jfrog.io/artifactory/main/release/1.70.0/source/boost_1_70_0.tar.gz && \
     tar -xvzf boost_1_70_0.tar.gz && \

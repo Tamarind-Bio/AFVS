@@ -108,6 +108,14 @@ def main():
   	}
   )
 
+  botoconfigathena = Config(
+  	region_name = 'us-west-1',
+  	retries = {
+  		'max_attempts': 50,
+  		'mode': 'standard'
+  	}
+  )
+
   args_dict = vars(args)
 
   scenario = args_dict['scenario_name']
@@ -124,9 +132,10 @@ def main():
   scenario_info = ctx['config']['docking_scenarios_internal'][scenario]
   athena_location = f"s3://{object_store_job_bucket}/{ctx['config']['object_store_job_prefix_full']}/athena"
 
+  print(f'>>>>Athena Location: {athena_location}', flush=True)
 
 
-  client = boto3.client('athena', config=botoconfig)
+  client = boto3.client('athena', config=botoconfigathena)
   s3_client = boto3.client('s3', config=botoconfig)
 
   print("Running query in AWS Athena\n")
@@ -141,6 +150,7 @@ def main():
   """
   athena_location_tmp = f"{athena_location}/tmp"
 
+  print(f'>>>>Issue client.start_query_execution', flush=True)
   create_db_response = client.start_query_execution(
       QueryString=create_database,
       QueryExecutionContext={
@@ -150,6 +160,7 @@ def main():
           'OutputLocation': athena_location_tmp
       }
   )
+  print(f'>>>>Done client.start_query_execution', flush=True)
 
   response = wait_for_athena_completion(client, s3_client, create_db_response, desc="createdb if needed")
   if(response['QueryExecution']['Status']['State'] != "SUCCEEDED"):
@@ -232,7 +243,7 @@ def main():
   else:
     top_string = ""
 
-  select_statement = f"SELECT *,\"$path\" from {table_name} ORDER BY score_min ASC {top_string};"
+  select_statement = f'SELECT *,\"$path\" from "{table_name}" ORDER BY score_min ASC {top_string};'
 
   select_response = client.start_query_execution(
       QueryString=select_statement,

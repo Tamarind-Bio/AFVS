@@ -207,10 +207,13 @@ def gen_s3_download_path(ctx, collection_name, collection_number):
 
     else:
 
+        # Extract meta-tranche (first 2 characters) from collection name
+        collection_mt = collection_name[:2]
         collection_name_dir = collection_name.replace("_", "/")
 
         object_path = [
             ctx['config']['object_store_data_collection_prefix'],
+            collection_mt,
             collection_name_dir,
             f"{collection_number}.tar.gz"
         ]

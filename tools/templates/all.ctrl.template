@@ -1,6 +1,6 @@
 ****** Job Resource Configuration 
 
-job_name=test
+job_name={{JOB_NAME}}
 # alphabetic characters (i.e. letters from a-z or A-Z)
 # Used to describe distinct runs (using the same name will
 # overwrite data if using S3!)
@@ -144,7 +144,7 @@ job_addressing_mode=metatranche
 object_store_job_bucket=virtual-screening-afvs
 # Bucket name for the job data (output and job files)
 
-object_store_job_prefix=VF2/AFVS/jobs/test
+object_store_job_prefix=VF2/AFVS/jobs/{{JOB_NAME}}
 # Where to place job-specific data. This includes where AdaptiveFlow will place 
 # the input data needed for jobs as well as the output files. 
 #
@@ -262,7 +262,7 @@ tempdir_default=/dev/shm
 
 ****** Virtual Screening Options
 
-docking_scenario_names=qvina02
+docking_scenario_names={{DOCKING_TOOL}}
 # Names for the docking scenarios, separated by colons
 # Each docking scenario has one value. Multiple docking scenarios/names have
 #    to be separated by colons ":" and without spaces
@@ -273,7 +273,7 @@ docking_scenario_names=qvina02
 # In each of thes e folders must be the file config.txt which is used by the docking method to specify its options
 # If other input files are required by the docking type, usually specified in the config.txt file, they have to be in the same folder.
 
-docking_scenario_methods=qvina02
+docking_scenario_methods={{DOCKING_TOOL}}
 # For each docking scenario name, a docking method has to be specified
 # Possible values: qvina02, qvina_w, vina, smina_rigid, smina_flexible, gwovina, adfr, AutodockVina_1.2, AutodockZN
 #                  gnina, rDock, M-Dock, MCDock, LigandFit, ledock, gold, iGemDock, idock, GalaxyDock3, autodock_gpu

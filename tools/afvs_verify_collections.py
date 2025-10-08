@@ -66,10 +66,13 @@ def get_collection_list(ctx, collection_tranche, collection_name):
         collection_name,
     ]
 
+    s3_prefix = "/".join(s3_path)
+    print(f"Searching S3: s3://{ctx['config']['object_store_data_bucket']}/{s3_prefix}")
+
     try:
         response = ctx['s3'].list_objects_v2(
                 Bucket=ctx['config']['object_store_data_bucket'],
-                Prefix="/".join(s3_path)
+                Prefix=s3_prefix
                 )
     except ClientError as e:
         logging.error(e)
@@ -139,9 +142,14 @@ def process(ctx):
                 collection_list_cache = get_collection_list(ctx, collection_tranche, collection_name)
                 last_collection_name = collection_name
 
+            expected_file = f"{collection_name}_{collection_number}.tar.gz"
+            s3_full_path = f"s3://{ctx['config']['object_store_data_bucket']}/{ctx['config']['object_store_data_collection_prefix']}/{collection_tranche}/{collection_name}/{expected_file}"
+
             if(collection_number not in collection_list_cache):
+                print(f"NOT FOUND: {collection_full_name} - Expected: {s3_full_path}")
                 not_found.append(collection_full_name)
             else:
+                print(f"FOUND: {collection_full_name} - {s3_full_path}")
                 fp.write(f"{collection_full_name} {collection_count}\n")
 
             counter += 1
