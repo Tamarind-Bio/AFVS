@@ -36,6 +36,8 @@ import shutil
 from pathlib import Path
 from botocore.config import Config
 
+MAX_LIGANDS_ON_DEMAND = 100000 # This will be about 100 subjobs
+
 def parse_config(filename):
     with open(filename, "r") as read_file:
         config = json.load(read_file)
@@ -386,6 +388,12 @@ def main():
     if args.report_only:
         print("\n[Report-only mode: No resubmission performed]")
         return 0
+
+    if total_expected_ligands > MAX_LIGANDS_ON_DEMAND and args.queue == 'vf-queue-ondemand':
+        print(f"\nWARNING: Total expected ligands ({total_expected_ligands:,}) exceeds on-demand threshold ({MAX_LIGANDS_ON_DEMAND:,})")
+        print(f"Automatically switching to spot queues to reduce costs.")
+        print(f"To override, increase MAX_LIGANDS_ON_DEMAND in the script.\n")
+        args.queue = None
 
     # Create recovery workunits
     print(f"\nCreating recovery workunits (max {args.max_subjobs_per_workunit} subjobs per workunit)...")
