@@ -119,6 +119,8 @@ def process(config):
     parser = argparse.ArgumentParser()
     parser.add_argument('--detailed', action='store_true',
         help="Get detailed ligand information (this can take a long time!)")
+    parser.add_argument('--recovery', action='store_true',
+        help="Show only recovery jobs status")
     args = parser.parse_args()
 
     client = boto3.client('batch', config=aws_config)
@@ -127,8 +129,28 @@ def process(config):
     with open("../workflow/status.json", "r") as read_file:
         complete = json.load(read_file)
 
+    # Determine which status to process
+    if args.recovery:
+        recovery_status_file = "../workflow/status.recovery.json"
+        if os.path.exists(recovery_status_file):
+            with open(recovery_status_file, "r") as read_file:
+                recovery_complete = json.load(read_file)
 
-    status = complete['workunits']
+            # Use recovery workunits as the main status
+            status = recovery_complete['recovery_workunits']
+            status_file_path = recovery_status_file
+            is_recovery_mode = True
+            workunit_prefix = "recovery-"
+        else:
+            print(f"Error: Recovery status file not found at {recovery_status_file}")
+            print(f"No recovery jobs have been submitted yet.")
+            return
+    else:
+        status = complete['workunits']
+        status_file_path = "../workflow/status.json"
+        is_recovery_mode = False
+        workunit_prefix = ""
+
     finished = []
 
     use_list_jobs_status = ['SUBMITTED', 'PENDING']
@@ -215,13 +237,11 @@ def process(config):
         else:
             logging.error(f"Did not get jobs response from AWS Batch")
 
-
     # Now let's check on the ones that have finished
-
-    print("Getting subjob status")
 
     subjobs_to_parse = []
 
+    print("Getting subjob status")
 
     for status_index_begin in range(0, len(subjobs_to_check), 100):
         job_keys_to_check = []
@@ -274,7 +294,6 @@ def process(config):
                     # Non-final state.
 
 
-
     # Now, we need to go check the files to see how many ligands there actually were
 
     download_queue = Queue()
@@ -292,7 +311,8 @@ def process(config):
         subjob_id = item['subjob_id']
 
         # Get the link to the output
-        item['s3_path'] = f"{config['object_store_job_prefix']}/{config['job_name']}/summary/{workunit_id}/{subjob_id}.json.gz"
+        # Use workunit_prefix for recovery jobs (will be "recovery-" or "")
+        item['s3_path'] = f"{config['object_store_job_prefix']}/{config['job_name']}/summary/{workunit_prefix}{workunit_id}/{subjob_id}.json.gz"
 
         download_queue.put(item)
 
@@ -329,6 +349,7 @@ def process(config):
         # Otherwise process
         workunit_id = item['workunit_id']
         subjob_id = item['subjob_id']
+
         subjob = status[workunit_id]['subjobs'][subjob_id]
 
         subjob['overview'] = {
@@ -458,11 +479,19 @@ def process(config):
     print(f"* vCPU hours interrupted  : {vcpu_hrs_interrupted:0.2f}")
     print(f"")
 
-    # Output the condensed version
-    with open("../workflow/status.tmp.json", "w") as json_out:
-        json.dump(complete, json_out)
-
-    shutil.move("../workflow/status.tmp.json", "../workflow/status.json")
+    # Save the updated status to the appropriate file
+    if is_recovery_mode:
+        # Update the recovery_workunits in the recovery_complete structure
+        recovery_complete['recovery_workunits'] = status
+        with open("../workflow/status.recovery.tmp.json", "w") as json_out:
+            json.dump(recovery_complete, json_out)
+        shutil.move("../workflow/status.recovery.tmp.json", "../workflow/status.recovery.json")
+    else:
+        # Update the workunits in the complete structure
+        complete['workunits'] = status
+        with open("../workflow/status.tmp.json", "w") as json_out:
+            json.dump(complete, json_out)
+        shutil.move("../workflow/status.tmp.json", "../workflow/status.json")
 
 
 
