@@ -140,7 +140,7 @@ def process(config):
             status = recovery_complete['recovery_workunits']
             status_file_path = recovery_status_file
             is_recovery_mode = True
-            workunit_prefix = f"recovery-{config['job_name']}-"
+            workunit_prefix = "recovery-"
         else:
             print(f"Error: Recovery status file not found at {recovery_status_file}")
             print(f"No recovery jobs have been submitted yet.")
@@ -319,7 +319,7 @@ def process(config):
         subjob_id = item['subjob_id']
 
         # Get the link to the output
-        # Use workunit_prefix for recovery jobs (will be "recovery-{job_name}-" or "")
+        # Use workunit_prefix for recovery jobs (will be "recovery-" or "")
         item['s3_path'] = f"{config['object_store_job_prefix']}/{config['job_name']}/summary/{workunit_prefix}{workunit_id}/{subjob_id}.json.gz"
 
         download_queue.put(item)
