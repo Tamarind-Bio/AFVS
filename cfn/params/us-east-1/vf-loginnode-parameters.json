@@ -9,11 +9,11 @@
   },
   {
     "ParameterKey": "KeyName",
-    "ParameterValue": "yourEC2keypairname"
+    "ParameterValue": "useast-key"
   },
   {
     "ParameterKey": "S3BucketName",
-    "ParameterValue": "YourS3BucketName"
+    "ParameterValue": "virtual-screening-afvs"
   },
   {
     "ParameterKey": "VPCStackParameter",

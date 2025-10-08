@@ -21,7 +21,7 @@
   },
   {
     "ParameterKey": "S3BucketName",
-    "ParameterValue": "YourS3BucketName"
+    "ParameterValue": "virtual-screening-afvs"
   },
   {
     "ParameterKey": "VPCStackParameter",

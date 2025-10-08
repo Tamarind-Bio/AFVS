@@ -1,0 +1,38 @@
+[
+  {
+    "ParameterKey": "ProjectName",
+    "ParameterValue": "AdaptiveFlow-us-east-1"
+  },
+  {
+    "ParameterKey": "VFStackName",
+    "ParameterValue": "vf"
+  },
+  {
+    "ParameterKey": "VPCStackParameter",
+    "ParameterValue": "vf-vpc"
+  },
+  {
+    "ParameterKey": "OnDemandInstanceTypes",
+    "ParameterValue": "c5.24xlarge,c5.12xlarge,c5.9xlarge,c5.4xlarge"
+  },
+  {
+    "ParameterKey": "OnDemandMaxvCPUs",
+    "ParameterValue": "256"
+  },
+  {
+    "ParameterKey": "ECSInstanceProfile",
+    "ParameterValue": "REPLACE_WITH_INSTANCE_PROFILE_ARN"
+  },
+  {
+    "ParameterKey": "BatchServiceRole",
+    "ParameterValue": "REPLACE_WITH_BATCH_SERVICE_ROLE_ARN"
+  },
+  {
+    "ParameterKey": "LaunchTemplateId",
+    "ParameterValue": "REPLACE_WITH_LAUNCH_TEMPLATE_ID"
+  },
+  {
+    "ParameterKey": "SecurityGroupId",
+    "ParameterValue": "REPLACE_WITH_SECURITY_GROUP_ID"
+  }
+]

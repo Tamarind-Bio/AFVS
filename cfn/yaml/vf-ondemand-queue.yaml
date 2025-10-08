@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Optional on-demand queue for AdaptiveFlow failed subjob recovery'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Project name for tagging purpose
+  VFStackName:
+    Type: String
+    Description: Name of the main VF stack (e.g., vf)
+    Default: vf
+  VPCStackParameter:
+    Type: String
+    Description: Name of the VPC Stack previously deployed
+  OnDemandInstanceTypes:
+    Type: String
+    Default: c5.24xlarge,c5.12xlarge,c5.9xlarge,c5.4xlarge
+    Description: Instance types for on-demand compute environment
+  OnDemandMaxvCPUs:
+    Description: Max vCPUs for on-demand compute environment
+    Type: Number
+    Default: 256
+  ECSInstanceProfile:
+    Type: String
+    Description: ECS Instance Profile ARN from main VF stack
+  BatchServiceRole:
+    Type: String
+    Description: Batch Service Role ARN from main VF stack
+  LaunchTemplateId:
+    Type: String
+    Description: Launch Template ID from main VF stack
+  SecurityGroupId:
+    Type: String
+    Description: Security Group ID from main VF stack
+
+Resources:
+
+  # On-demand Compute Environment for recovery jobs
+  BatchComputeEnvironmentOnDemand:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+      ComputeEnvironmentName: !Sub ${VFStackName}-ce-ondemand
+      ComputeResources:
+        AllocationStrategy: BEST_FIT_PROGRESSIVE
+        InstanceRole: !Ref ECSInstanceProfile
+        InstanceTypes: !Split
+          - ','
+          - !Ref OnDemandInstanceTypes
+        LaunchTemplate:
+          LaunchTemplateId: !Ref LaunchTemplateId
+        MaxvCpus: !Ref OnDemandMaxvCPUs
+        MinvCpus: 0
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        Subnets: !Split
+          - ','
+          - Fn::ImportValue:
+              !Sub ${VPCStackParameter}-PrivateSubnets
+        Type: EC2  # On-demand instances
+      ServiceRole: !Ref BatchServiceRole
+      State: ENABLED
+      Type: MANAGED
+
+  # On-demand Job Queue for recovery
+  BatchJobQueueOnDemand:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      Tags:
+        Project: !Ref ProjectName
+      ComputeEnvironmentOrder:
+        - ComputeEnvironment: !Ref BatchComputeEnvironmentOnDemand
+          Order: 1
+      JobQueueName: !Sub ${VFStackName}-queue-ondemand
+      Priority: 10  # Higher priority than spot queues
+      State: ENABLED
+
+Outputs:
+  OnDemandQueueName:
+    Description: Name of the on-demand queue for recovery jobs
+    Value: !Ref BatchJobQueueOnDemand
+    Export:
+      Name: !Sub ${AWS::StackName}-OnDemandQueue
+
+  OnDemandComputeEnvironment:
+    Description: Name of the on-demand compute environment
+    Value: !Ref BatchComputeEnvironmentOnDemand
+    Export:
+      Name: !Sub ${AWS::StackName}-OnDemandCE
