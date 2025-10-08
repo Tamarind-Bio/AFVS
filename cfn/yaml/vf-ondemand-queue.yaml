@@ -40,8 +40,7 @@ Resources:
     Type: AWS::Batch::ComputeEnvironment
     Properties:
       Tags:
-        - Key: Project
-          Value: !Ref ProjectName
+        Project: !Ref ProjectName
       ComputeEnvironmentName: !Sub ${VFStackName}-ce-ondemand
       ComputeResources:
         AllocationStrategy: BEST_FIT_PROGRESSIVE
@@ -68,8 +67,7 @@ Resources:
   BatchJobQueueOnDemand:
     Type: AWS::Batch::JobQueue
     Properties:
-      Tags:
-        Project: !Ref ProjectName
+      Tags: { "Project": !Ref ProjectName }
       ComputeEnvironmentOrder:
         - ComputeEnvironment: !Ref BatchComputeEnvironmentOnDemand
           Order: 1
