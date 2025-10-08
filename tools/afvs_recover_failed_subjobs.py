@@ -42,12 +42,44 @@ def parse_config(filename):
     return config
 
 
-def identify_failed_subjobs(status_file):
+def get_subjob_collections_from_workunit(ctx, workunit_id, subjob_id, workunit_data):
+    """
+    Download and extract collection data from original workunit tarball
+    """
+    # Download the workunit tarball from S3
+    if 's3_download_path' in workunit_data:
+        s3_path = workunit_data['s3_download_path']
+        bucket = ctx['config']['object_store_job_bucket']
+
+        with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as tmp_file:
+            try:
+                ctx['s3'].download_file(bucket, s3_path, tmp_file.name)
+
+                # Extract config.json from tarball
+                with tarfile.open(tmp_file.name, 'r:gz') as tar:
+                    config_member = tar.getmember('vf_input/config.json')
+                    config_file = tar.extractfile(config_member)
+                    workunit_config = json.load(config_file)
+
+                    # Get the subjob's collections
+                    if subjob_id in workunit_config['subjobs']:
+                        return workunit_config['subjobs'][subjob_id].get('collections', {})
+
+            except Exception as e:
+                print(f"  WARNING: Could not retrieve collections for workunit {workunit_id}, subjob {subjob_id}: {e}")
+                return {}
+            finally:
+                os.unlink(tmp_file.name)
+
+    return {}
+
+
+def identify_failed_subjobs(status_file, ctx):
     """
     Identify all failed subjobs from the status.json file
 
     Returns:
-        List of dicts containing workunit_id, subjob_id, and subjob data
+        List of dicts containing workunit_id, subjob_id, and subjob data with collections
     """
     with open(status_file, "r") as read_file:
         status = json.load(read_file)
@@ -60,10 +92,14 @@ def identify_failed_subjobs(status_file):
 
         for subjob_id, subjob in workunit['subjobs'].items():
             if 'status' in subjob and subjob['status'] == 'FAILED':
+                # Get collections from original workunit tarball
+                collections = get_subjob_collections_from_workunit(ctx, workunit_id, subjob_id, workunit)
+
                 failed_subjobs.append({
                     'workunit_id': workunit_id,
                     'subjob_id': subjob_id,
                     'subjob': subjob,
+                    'collections': collections,  # Add collections here
                     'workunit': workunit
                 })
 
@@ -90,10 +126,15 @@ def create_recovery_workunit(ctx, failed_subjobs, recovery_workunit_id):
     # Build the recovery subjobs structure
     recovery_subjobs = {}
     for idx, failed_item in enumerate(failed_subjobs):
+        # Skip if no collections data available
+        if not failed_item['collections']:
+            print(f"  WARNING: Skipping {failed_item['workunit_id']}:{failed_item['subjob_id']} - no collections data")
+            continue
+
         # Map old subjob to new index in recovery workunit
         recovery_subjobs[str(idx)] = {
-            'collections': failed_item['subjob']['collections'],
-            'ligands_expected': failed_item['subjob']['ligands_expected'],
+            'collections': failed_item['collections'],
+            'ligands_expected': failed_item['subjob'].get('ligands_expected', 0),
             'original_workunit_id': failed_item['workunit_id'],
             'original_subjob_id': failed_item['subjob_id']
         }
@@ -305,9 +346,18 @@ def main():
     # Parse configuration
     config = parse_config(args.config_file)
 
+    # Initialize AWS clients (needed to download workunit tarballs)
+    aws_config = Config(region_name=config['aws_region'])
+    ctx = {
+        'config': config,
+        's3': boto3.client('s3', config=aws_config),
+        'batch': boto3.client('batch', config=aws_config)
+    }
+
     # Identify failed subjobs
     print("Analyzing status file for failed subjobs...")
-    failed_subjobs = identify_failed_subjobs(args.status_file)
+    print("Downloading workunit tarballs to extract collection data...")
+    failed_subjobs = identify_failed_subjobs(args.status_file, ctx)
 
     if not failed_subjobs:
         print("No failed subjobs found!")
@@ -319,9 +369,12 @@ def main():
 
     total_expected_ligands = 0
     for item in failed_subjobs:
-        collections_str = ', '.join(item['subjob']['collections'].keys())
-        if len(collections_str) > 35:
-            collections_str = collections_str[:32] + "..."
+        if item['collections']:
+            collections_str = ', '.join(item['collections'].keys())
+            if len(collections_str) > 35:
+                collections_str = collections_str[:32] + "..."
+        else:
+            collections_str = "N/A (no collections data)"
 
         expected = item['subjob'].get('ligands_expected', 0)
         total_expected_ligands += expected
@@ -333,14 +386,6 @@ def main():
     if args.report_only:
         print("\n[Report-only mode: No resubmission performed]")
         return 0
-
-    # Initialize AWS clients
-    aws_config = Config(region_name=config['aws_region'])
-    ctx = {
-        'config': config,
-        's3': boto3.client('s3', config=aws_config),
-        'batch': boto3.client('batch', config=aws_config)
-    }
 
     # Create recovery workunits
     print(f"\nCreating recovery workunits (max {args.max_subjobs_per_workunit} subjobs per workunit)...")
