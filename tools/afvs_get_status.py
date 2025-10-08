@@ -473,29 +473,31 @@ def process(config):
     print(f"Active vCPUs: {active_vcpus}")
 
 
-    print(f"")
-    print(f"-----------------------------------------------------------------")
-    print("Completed Summary")
-    print(f"-----------------------------------------------------------------")
-    print(f"")
-    print(f"* Total Dockings  : {complete['summary']['total_dockings']}")
-    print(f"  - Succeeded     : {complete['summary']['docking_succeeded']}")
-    print(f"  - Failed        : {complete['summary']['docking_failed']}")
-    print(f"* Skipped ligands : {complete['summary']['skipped_ligands']}")
-    print(f"* Failed Downloads: {complete['summary']['failed_downloads']} (est. {complete['summary']['failed_downloads_dockings']} dockings)")
-    if(complete['summary']['failed_downloads'] != 0):
-        print(f"     (failed downloads are in '../workflow/failed_downloads.csv')")
-    print(f"")
+    # Only show completed summary for main jobs (not recovery)
+    if not is_recovery_mode:
+        print(f"")
+        print(f"-----------------------------------------------------------------")
+        print("Completed Summary")
+        print(f"-----------------------------------------------------------------")
+        print(f"")
+        print(f"* Total Dockings  : {complete['summary']['total_dockings']}")
+        print(f"  - Succeeded     : {complete['summary']['docking_succeeded']}")
+        print(f"  - Failed        : {complete['summary']['docking_failed']}")
+        print(f"* Skipped ligands : {complete['summary']['skipped_ligands']}")
+        print(f"* Failed Downloads: {complete['summary']['failed_downloads']} (est. {complete['summary']['failed_downloads_dockings']} dockings)")
+        if(complete['summary']['failed_downloads'] != 0):
+            print(f"     (failed downloads are in '../workflow/failed_downloads.csv')")
+        print(f"")
 
 
-    if(complete['summary']['total_dockings'] != 0):
-        vcpu_sec = complete['summary']['vcpu_seconds'] / complete['summary']['total_dockings']
-        print(f"* vCPU seconds per docking: {vcpu_sec:0.2f}")
-    else:
-        print(f"* vCPU seconds per docking: N/A")
-    print(f"* vCPU hours total        : {vcpu_hrs:0.2f}")
-    print(f"* vCPU hours interrupted  : {vcpu_hrs_interrupted:0.2f}")
-    print(f"")
+        if(complete['summary']['total_dockings'] != 0):
+            vcpu_sec = complete['summary']['vcpu_seconds'] / complete['summary']['total_dockings']
+            print(f"* vCPU seconds per docking: {vcpu_sec:0.2f}")
+        else:
+            print(f"* vCPU seconds per docking: N/A")
+        print(f"* vCPU hours total        : {vcpu_hrs:0.2f}")
+        print(f"* vCPU hours interrupted  : {vcpu_hrs_interrupted:0.2f}")
+        print(f"")
 
     # Save the updated status to the appropriate file
     if is_recovery_mode:
