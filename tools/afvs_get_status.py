@@ -162,8 +162,12 @@ def process(config):
     workunits_to_check = []
     for workunit_id, workunit in status.items():
         if 'status' not in workunit:
-            # workunit has not been submitted yet
-            continue
+            # Initialize status for workunits that don't have it yet (e.g., newly submitted recovery jobs)
+            if 'job_id' in workunit:
+                workunit['status'] = 'SUBMITTED'
+            else:
+                # workunit has not been submitted yet
+                continue
 
         if(workunit['status'] in use_list_jobs_status):
             workunits_to_check.append({
@@ -227,6 +231,10 @@ def process(config):
                     workunits_to_recompute[workunit_id] = 1
 
                     for subjob_id, subjob in workunit['subjobs'].items():
+                        # Initialize subjob status if not present
+                        if 'status' not in subjob:
+                            subjob['status'] = 'PENDING'
+
                         if(subjob['status'] not in final_states):
                             subjobs_to_check.append({
                                     'workunit_id': workunit_id,
@@ -409,6 +417,16 @@ def process(config):
         if 'status' not in workunit:
             # workunit has not been submitted yet
             continue
+
+        # Initialize overview_status if it doesn't exist (for recovery jobs)
+        if 'overview_status' not in workunit:
+            workunit['overview_status'] = {}
+            for status_val in statuses:
+                workunit['overview_status'][status_val] = {
+                    'ligands': 0,
+                    'workunits': 0,
+                    'subjobs': 0
+                }
 
         for status_val in statuses:
             complete['overview_status'][status_val]['ligands'] += workunit['overview_status'][status_val]['ligands']
