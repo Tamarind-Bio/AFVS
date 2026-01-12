@@ -230,7 +230,7 @@ collection_list_file=templates/todo.all
 # Path to the file that contains the collection data on what should be 
 # processed as part of the workflow
 
-dockings_per_subjob=1000
+dockings_per_subjob=150
 # Used as how many dockings should be processed per subjob. In general,
 # a subjob should take about 20 min to an hour for efficiency. 
 # A reasonable number for this is generally 1000. The length of time
