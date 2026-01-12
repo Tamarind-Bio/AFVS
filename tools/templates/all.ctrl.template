@@ -54,11 +54,11 @@ aws_region=us-east-2
 # Set to the AWS location code where you are running AWS Batch
 # (e.g. us-east-1 for North America, Northern Virginia)
 
-aws_batch_subjob_vcpus=8
+aws_batch_subjob_vcpus=16
 # Set to the number of vCPUs that should be launched per subjob. 
 # 'threads_to_use' above should be >= to this value. 
 
-aws_batch_subjob_memory=15000
+aws_batch_subjob_memory=32000
 # Memory per subjob to setup for the container in MB
 
 aws_batch_subjob_timeout=20800
