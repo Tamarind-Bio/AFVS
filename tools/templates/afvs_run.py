@@ -58,6 +58,17 @@ import uuid
 from typing import Dict, Tuple
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+def log_info(msg, *args):
+    try:
+        logger.info(msg, *args)
+    except Exception:
+        print(msg, *args, flush=True)
+
+
+# How many ligands between aggregated progress logs
+LOG_AGGREGATE_N = 50
 
 def read_config_line(line: str) -> Tuple[str, str]:
     key, sep, value = line.strip().partition("=")
@@ -134,8 +145,12 @@ def downloader(download_queue, unpack_queue, summary_queue, tmp_dir):
             job_bucket = item['collection']['s3_bucket']
 
             try:
+                log_info(f"START download {job_bucket}/{remote_path} to {item['local_path']}")
+                dl_t0 = time.perf_counter()
                 with open(item['local_path'], 'wb') as f:
                     s3.download_fileobj(job_bucket, remote_path, f)
+                dl_t1 = time.perf_counter()
+                log_info(f"END download {job_bucket}/{remote_path} duration={dl_t1-dl_t0:.2f}s size_path={item['local_path']}")
             except botocore.exceptions.ClientError as error:
                     reason = f"Failed to download from S3 {job_bucket}/{remote_path} to {item['local_path']}: ({error})"
                     logging.error(reason)
@@ -197,6 +212,8 @@ def unpack_item(item):
 
     os.chdir(item['temp_dir'])
     try:
+        log_info(f"START untar {item['local_path']} into {item['temp_dir']}")
+        untar_t0 = time.perf_counter()
         tar = tarfile.open(item['local_path'])
         for member in tar.getmembers():
             if(not member.isdir()):
@@ -215,6 +232,8 @@ def unpack_item(item):
 
         tar.extractall()
         tar.close()
+        untar_t1 = time.perf_counter()
+        log_info(f"END untar {item['local_path']} duration={untar_t1-untar_t0:.2f}s ligand_count={len(ligands)}")
     except Exception as err:
         logging.error(
             f"ERR: Cannot open {item['local_path']} type: {str(type(err))}, err: {str(err)}")
@@ -377,6 +396,8 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
             'base_collection_key': item['collection_key'],
             'expected_completions': expected_ligands
         }
+
+        log_info(f"Collection {item.get('collection_key')} prepared temp_dir={item.get('temp_dir')} expected_ligands={expected_ligands}")
 
         summary_queue.put(summary_item)
 
@@ -544,6 +565,10 @@ def docking_process_batch(summary_queue, scenario, items, temp_dir):
         }
 
     if batched_item['execution_type'] == "single":
+        # aggregated logging window
+        agg_window_count = 0
+        agg_window_sum = 0.0
+        total_processed = 0
         for item in batched_item['items']:
             ret = None
             start = time.perf_counter()
@@ -559,8 +584,12 @@ def docking_process_batch(summary_queue, scenario, items, temp_dir):
                 raise(err)
 
             try:
+                log_info(f"START single docking {item['ligand_key']} program={item['program']} tmp_dir={item['tmp_run_dir']}")
+                dock_t0 = time.perf_counter()
                 ret = subprocess.run(cmd, capture_output=True,
                          text=True, cwd=item['tmp_run_dir_input'], timeout=item['timeout'])
+                dock_t1 = time.perf_counter()
+                log_info(f"END single docking {item['ligand_key']} rc={getattr(ret,'returncode', 'NA')} duration={dock_t1-dock_t0:.2f}s")
             except subprocess.TimeoutExpired as err:
                 item['log']['reason'] = f"timeout on {item['ligand_key']}"
                 logging.error(item['log']['reason'])
@@ -581,8 +610,17 @@ def docking_process_batch(summary_queue, scenario, items, temp_dir):
                     output_f.write(f"STDERR:\n{ret.stderr}\n")
 
                 item['seconds'] = time.perf_counter() - item['start_time']
+                log_info(f"processing {item['ligand_key']} - done in {item['seconds']:.2f}s")
 
-                print(f"processing {item['ligand_key']} - done in {item['seconds']}")
+                # update aggregate window and emit periodic summary
+                agg_window_sum += item['seconds']
+                agg_window_count += 1
+                total_processed += 1
+                if agg_window_count >= LOG_AGGREGATE_N:
+                    avg = agg_window_sum / agg_window_count if agg_window_count else 0.0
+                    log_info(f"AGGREGATE processed_total={total_processed} last_{agg_window_count}_avg_s={avg:.2f}")
+                    agg_window_sum = 0.0
+                    agg_window_count = 0
 
             docking_process_clean_common(item)
 
@@ -605,8 +643,12 @@ def docking_process_batch(summary_queue, scenario, items, temp_dir):
             raise(err)
 
         try:
+            log_info(f"START batch docking program={batched_item['program']} batch_size={len(batched_item['items'])} tmp_dir={batched_item['tmp_run_dir']}")
+            batch_t0 = time.perf_counter()
             ret = subprocess.run(cmd, capture_output=True,
                      text=True, cwd=batched_item['tmp_run_dir_input'], timeout=batched_item['timeout'])
+            batch_t1 = time.perf_counter()
+            log_info(f"END batch docking rc={getattr(ret,'returncode','NA')} duration={batch_t1-batch_t0:.2f}s avg_per_ligand={(batch_t1-batch_t0)/max(1,len(batched_item['items'])):.2f}s")
         except subprocess.TimeoutExpired as err:
             reason = "Batched execution timed out"
             for item in batched_item['items']:
