@@ -144,29 +144,53 @@ def downloader(download_queue, unpack_queue, summary_queue, tmp_dir):
             remote_path = item['collection']['s3_download_path']
             job_bucket = item['collection']['s3_bucket']
 
-            try:
-                log_info(f"START download {job_bucket}/{remote_path} to {item['local_path']}")
-                dl_t0 = time.perf_counter()
-                with open(item['local_path'], 'wb') as f:
-                    s3.download_fileobj(job_bucket, remote_path, f)
-                dl_t1 = time.perf_counter()
-                log_info(f"END download {job_bucket}/{remote_path} duration={dl_t1-dl_t0:.2f}s size_path={item['local_path']}")
-            except botocore.exceptions.ClientError as error:
-                    reason = f"Failed to download from S3 {job_bucket}/{remote_path} to {item['local_path']}: ({error})"
-                    logging.error(reason)
+            # Retry logic with exponential backoff for S3 throttling
+            max_retries = 5
+            download_successful = False
 
-                    # log this to know we skipped
-                    # put on the logging queue
-                    summary_item = {
-                        'type': "download_failed",
-                        'log': {
-                            'base_collection_key': item['collection_key'],
-                            'reason': reason,
-                            'dockings': item['collection']['dockings']
-                        }
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        log_info(f"RETRY {attempt}/{max_retries} download {job_bucket}/{remote_path}")
+                    else:
+                        log_info(f"START download {job_bucket}/{remote_path} to {item['local_path']}")
+
+                    dl_t0 = time.perf_counter()
+                    with open(item['local_path'], 'wb') as f:
+                        s3.download_fileobj(job_bucket, remote_path, f)
+                    dl_t1 = time.perf_counter()
+
+                    log_info(f"END download {job_bucket}/{remote_path} duration={dl_t1-dl_t0:.2f}s size_path={item['local_path']}")
+                    download_successful = True
+                    break
+
+                except botocore.exceptions.ClientError as error:
+                    error_code = error.response.get('Error', {}).get('Code', 'Unknown')
+
+                    if error_code == 'SlowDown' and attempt < max_retries - 1:
+                        backoff_time = (2 ** attempt) * 0.5  # 0.5s, 1s, 2s, 4s, 8s
+                        log_info(f"[S3-THROTTLE] SlowDown error on attempt {attempt+1}/{max_retries} for {remote_path}, backing off {backoff_time:.1f}s")
+                        time.sleep(backoff_time)
+                        continue
+                    else:
+                        # Final attempt failed or non-throttle error
+                        reason = f"Failed to download from S3 {job_bucket}/{remote_path} to {item['local_path']}: ({error})"
+                        logging.error(reason)
+                        break
+
+            if not download_successful:
+                # log this to know we skipped
+                # put on the logging queue
+                summary_item = {
+                    'type': "download_failed",
+                    'log': {
+                        'base_collection_key': item['collection_key'],
+                        'reason': f"Failed after {max_retries} retries",
+                        'dockings': item['collection']['dockings']
                     }
-                    summary_queue.put(summary_item)
-                    continue
+                }
+                summary_queue.put(summary_item)
+                continue
 
         elif('sharedfs_path' in item['collection']):
             shutil.copyfile(Path(item['collection']['sharedfs_path']), item['local_path'])
@@ -4132,6 +4156,9 @@ def get_subjob_config(ctx, workunit_id, subjob_id):
 
 def process(ctx):
 
+    # Start timing
+    t0_total = time.perf_counter()
+    print(f"[TIMING] Job started at {time.time()}")
 
     ctx['vcpus_to_use'] = int(os.getenv('AFVS_VCPUS', 1))
     ctx['run_sequential'] = int(os.getenv('AFVS_RUN_SEQUENTIAL', 0))
@@ -4150,6 +4177,9 @@ def process(ctx):
     # and we have specific subjob information in ctx['subjob_config']
 
     get_subjob_config(ctx, workunit_id, subjob_id)
+
+    t1_config = time.perf_counter()
+    print(f"[TIMING] Config download completed in {t1_config - t0_total:.2f}s")
 
     # Update some of the path information
 
@@ -4183,7 +4213,10 @@ def process(ctx):
     summary_queue = Queue()
     upload_queue = Queue()
 
-
+    t2_setup = time.perf_counter()
+    print(f"[TIMING] Setup completed in {t2_setup - t1_config:.2f}s")
+    print(f"[TIMING] Starting docking workers with {ctx['vcpus_to_use']} vCPUs")
+    t_docking_start = time.perf_counter()
 
     try:
         downloader_processes = []
@@ -4259,8 +4292,16 @@ def process(ctx):
         flush_queue(unpack_queue, unpacker_processes, "unpack")
         flush_queue(collection_queue, collection_processes, "collection")
         flush_queue(docking_queue, docking_processes, "docking")
+
+        t3_docking = time.perf_counter()
+        print(f"[TIMING] All docking completed in {t3_docking - t_docking_start:.2f}s")
+
         flush_queue(summary_queue, summary_processes, "summary")
         flush_queue(upload_queue, uploader_processes, "upload")
+
+        t_final = time.perf_counter()
+        print(f"[TIMING] Total job time: {t_final - t0_total:.2f}s")
+        print(f"[TIMING] Breakdown - Config: {t1_config-t0_total:.2f}s, Setup: {t2_setup-t1_config:.2f}s, Docking: {t3_docking-t_docking_start:.2f}s, Upload: {t_final-t3_docking:.2f}s")
     except Exception as e:
         logging.error(f"Received exception {e}, terminating")
 

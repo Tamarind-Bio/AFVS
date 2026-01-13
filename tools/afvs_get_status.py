@@ -283,13 +283,25 @@ def process(config):
                     subjob['vcpu_seconds_interrupted'] = 0
                     subjob['vcpu_seconds'] = 0
 
+                    # Track timing metrics for analysis
+                    if 'queue_wait_times' not in complete['summary']:
+                        complete['summary']['queue_wait_times'] = []
+                        complete['summary']['execution_times'] = []
+
+                    # Calculate queue wait and execution time from job metadata
+                    if 'createdAt' in job and 'startedAt' in job:
+                        queue_wait = (job['startedAt'] - job['createdAt']) / 1000
+                        complete['summary']['queue_wait_times'].append(queue_wait)
+
                     last_attempt_index = len(job['attempts']) - 1
                     for attempt_index, attempt in enumerate(job['attempts']):
                         if ( 'stoppedAt' in attempt and 'startedAt' in attempt):
                             vcpu_time = (attempt['stoppedAt'] - attempt['startedAt']) / 1000 * vcpus_per_job
+                            execution_time = (attempt['stoppedAt'] - attempt['startedAt']) / 1000
 
                             if(attempt_index == last_attempt_index):
                                 subjob['vcpu_seconds'] = vcpu_time
+                                complete['summary']['execution_times'].append(execution_time)
                             else:
                                 subjob['vcpu_seconds_interrupted'] += vcpu_time
 
@@ -498,6 +510,26 @@ def process(config):
         print(f"* vCPU hours total        : {vcpu_hrs:0.2f}")
         print(f"* vCPU hours interrupted  : {vcpu_hrs_interrupted:0.2f}")
         print(f"")
+
+        # Add job timing analysis
+        if 'queue_wait_times' in complete['summary'] and len(complete['summary']['queue_wait_times']) > 0:
+            queue_times = complete['summary']['queue_wait_times']
+            exec_times = complete['summary']['execution_times']
+
+            print(f"-----------------------------------------------------------------")
+            print(f"Job Timing Analysis ({len(queue_times)} completed jobs)")
+            print(f"-----------------------------------------------------------------")
+            print(f"* Avg queue wait time : {sum(queue_times)/len(queue_times):0.2f}s (min: {min(queue_times):0.2f}s, max: {max(queue_times):0.2f}s)")
+            print(f"* Avg execution time  : {sum(exec_times)/len(exec_times):0.2f}s (min: {min(exec_times):0.2f}s, max: {max(exec_times):0.2f}s)")
+            print(f"* Max execution time  : {max(exec_times):0.2f}s")
+
+            # Detect if jobs are taking too long
+            if max(exec_times) > 1200:  # 20 minutes
+                print(f"")
+                print(f"⚠️  WARNING: Some jobs taking >{max(exec_times)/60:.1f} min - likely S3 throttling or other bottleneck!")
+                print(f"⚠️  Expected job time with {vcpus_per_job} vCPUs: ~{(vcpu_sec * 200 / vcpus_per_job):.1f}s for 200 ligands")
+
+            print(f"")
 
     # Save the updated status to the appropriate file
     if is_recovery_mode:
