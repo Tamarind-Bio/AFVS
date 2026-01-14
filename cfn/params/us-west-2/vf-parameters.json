@@ -17,11 +17,11 @@
   },
   {
     "ParameterKey": "CEvCPUs",
-    "ParameterValue": "64"
+    "ParameterValue": "7500"
   },
   {
     "ParameterKey": "S3BucketName",
-    "ParameterValue": "YourS3BucketName"
+    "ParameterValue": "virtual-screening-afvs"
   },
   {
     "ParameterKey": "VPCStackParameter",

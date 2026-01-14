@@ -50,7 +50,7 @@ aws_ecr_repository_name=vf-afvs-ecr
 # repository (e.g. vf-afvs-ecr) in your AWS account
 # (If you used the template it is generally vf-afvs-ecr)
 
-aws_region=us-east-2
+aws_region=us-west-2
 # Set to the AWS location code where you are running AWS Batch
 # (e.g. us-east-1 for North America, Northern Virginia)
 
