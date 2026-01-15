@@ -1,0 +1,38 @@
+[
+  {
+    "ParameterKey": "ProjectName",
+    "ParameterValue": "AdaptiveFlow-us-west-2"
+  },
+  {
+    "ParameterKey": "VFStackName",
+    "ParameterValue": "vf"
+  },
+  {
+    "ParameterKey": "VPCStackParameter",
+    "ParameterValue": "vf-vpc"
+  },
+  {
+    "ParameterKey": "OnDemandInstanceTypes",
+    "ParameterValue": "c5.4xlarge,c5.9xlarge,c5.12xlarge,c5.24xlarge"
+  },
+  {
+    "ParameterKey": "OnDemandMaxvCPUs",
+    "ParameterValue": "256"
+  },
+  {
+    "ParameterKey": "ECSInstanceProfile",
+    "ParameterValue": "vf-us-west-2-ECSTaskInstanceProfileIAM"
+  },
+  {
+    "ParameterKey": "BatchServiceRole",
+    "ParameterValue": "vf-BatchInstanceRole-KesYNArSGDrN"
+  },
+  {
+    "ParameterKey": "LaunchTemplateId",
+    "ParameterValue": "lt-063d89845d316cbe8"
+  },
+  {
+    "ParameterKey": "SecurityGroupId",
+    "ParameterValue": "sg-028c30819443fbcfb"
+  }
+]

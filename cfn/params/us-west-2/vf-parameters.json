@@ -9,7 +9,7 @@
   },
   {
     "ParameterKey": "CEInstanceTypes",
-    "ParameterValue": "c5.24xlarge,c5.4xlarge,c5.12xlarge,c5.9xlarge,c5.18xlarge,c5n.18xlarge,c5n.9xlarge,c5n.4xlarge"
+    "ParameterValue": "c5.4xlarge,c5n.4xlarge,c5.9xlarge,c5n.9xlarge,c5.12xlarge,c5.18xlarge,c5n.18xlarge,c5.24xlarge"
   },
   {
     "ParameterKey": "CEType",
