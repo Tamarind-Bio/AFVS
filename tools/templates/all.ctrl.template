@@ -226,7 +226,7 @@ collection_list_type=standard
 #       The header line with "collection_name,..." is required for this format.
 #
 
-collection_list_file=templates/todo.test-batch200.all
+collection_list_file=templates/test-batch200.todo.all
 # Path to the file that contains the collection data on what should be 
 # processed as part of the workflow
 
