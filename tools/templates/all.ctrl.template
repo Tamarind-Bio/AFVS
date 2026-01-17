@@ -141,10 +141,10 @@ job_addressing_mode=metatranche
 
 ****** Object Store Settings (S3)
 
-object_store_job_bucket=virtual-screening-afvs
+object_store_job_bucket={{JOB_BUCKET}}
 # Bucket name for the job data (output and job files)
 
-object_store_job_prefix=VF2/AFVS/jobs/{{JOB_NAME}}
+object_store_job_prefix={{JOB_PREFIX}}
 # Where to place job-specific data. This includes where AdaptiveFlow will place 
 # the input data needed for jobs as well as the output files. 
 #
@@ -156,10 +156,10 @@ object_store_job_prefix=VF2/AFVS/jobs/{{JOB_NAME}}
 # else
 # 	in object_store_job_prefix/<job_letter>
 
-object_store_data_bucket=virtual-screening-afvs
+object_store_data_bucket={{DATA_BUCKET}}
 # Bucket name for the input collection data (often the same as the job one)
 
-object_store_data_collection_prefix=ligands/ligand-library/test-batch200
+object_store_data_collection_prefix={{COLLECTION_PREFIX}}
 # Prefix used within the object store to address the collections
 
 
@@ -226,7 +226,7 @@ collection_list_type=standard
 #       The header line with "collection_name,..." is required for this format.
 #
 
-collection_list_file=templates/test-batch200.todo.all
+collection_list_file={{TODO_FILE}}
 # Path to the file that contains the collection data on what should be 
 # processed as part of the workflow
 
