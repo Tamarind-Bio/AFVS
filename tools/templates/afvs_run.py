@@ -2183,6 +2183,9 @@ def docking_finish_vina(item, ret):
         matches = match.groupdict()
         item['score'] = float(matches['value'])
         item['status'] = "success"
+        # Convert PDBQT pose to SDF format
+        if 'output_path' in item and os.path.exists(item['output_path']):
+            item['output_path'] = convert_pose_to_sdf(item['output_path'])
     else:
         item['log']['reason'] = f"Could not find score"
         logging.error(item['log']['reason'])
@@ -2218,6 +2221,10 @@ def docking_finish_smina(item, ret):
     if(found == 0):
         item['log']['reason'] = f"Could not find score"
         logging.error(item['log']['reason'])
+    else:
+        # Convert PDBQT pose to SDF format
+        if 'output_path' in item and os.path.exists(item['output_path']):
+            item['output_path'] = convert_pose_to_sdf(item['output_path'])
 
 
 ## plants
@@ -2854,7 +2861,39 @@ def docking_finish_fred(task, ret):
     return
 
 
-# Scoring functions: 
+def convert_pose_to_sdf(output_path):
+    """Convert a docking pose file (PDBQT) to SDF format using Open Babel.
+
+    Args:
+        output_path (str): Path to the docking output file (typically PDBQT).
+
+    Returns:
+        str: Path to the SDF file if conversion succeeded, original path otherwise.
+    """
+    if not os.path.exists(output_path):
+        return output_path
+
+    input_format = output_path.split('.')[-1].lower()
+
+    # Already SDF - no conversion needed
+    if input_format == 'sdf':
+        return output_path
+
+    # Convert PDBQT/MOL2/PDB to SDF
+    if input_format in ['pdbqt', 'mol2', 'pdb']:
+        sdf_path = output_path.rsplit('.', 1)[0] + '.sdf'
+        try:
+            result = os.system(f'obabel {output_path} -O {sdf_path} 2>/dev/null')
+            if result == 0 and os.path.exists(sdf_path):
+                os.remove(output_path)  # Remove original to save space
+                return sdf_path
+        except Exception as e:
+            logging.warning(f"Failed to convert {output_path} to SDF: {e}")
+
+    return output_path
+
+
+# Scoring functions:
 def convert_ligand_format(ligand_, new_format): 
     """Converts a ligand file to a different file format using the Open Babel tool.
 
