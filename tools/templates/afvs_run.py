@@ -66,8 +66,12 @@ _last_progress_update = 0
 _progress_update_interval = 30  # seconds between updates
 _progress_update_count = 100    # also update every N dockings
 
-def send_tamarind_progress(ctx, dockings_processed, success_count, failed_count, vcpu_seconds):
-    """Send progress update to Tamarind API (fire-and-forget, non-blocking)."""
+def send_tamarind_progress(ctx, dockings_processed, success_count, failed_count, vcpu_seconds, force=False):
+    """Send progress update to Tamarind API (fire-and-forget, non-blocking).
+
+    Args:
+        force: If True, bypass throttling and send update immediately (for final update)
+    """
     global _last_progress_update
 
     # Get Tamarind config from environment variables (set by AWS Batch)
@@ -79,8 +83,8 @@ def send_tamarind_progress(ctx, dockings_processed, success_count, failed_count,
 
     current_time = time.time()
 
-    # Throttle updates: only send every N seconds or N dockings
-    if (current_time - _last_progress_update < _progress_update_interval and
+    # Throttle updates: only send every N seconds or N dockings (unless forced)
+    if not force and (current_time - _last_progress_update < _progress_update_interval and
         dockings_processed % _progress_update_count != 0):
         return
 
@@ -768,6 +772,17 @@ def summary_process(ctx, summary_queue, upload_queue, metadata):
 
             # Calculate how much time we spent
             overview_data['sec']  = time.perf_counter() - start_time
+
+            # Send final progress update to Tamarind (forced, bypass throttling)
+            vcpu_count = ctx.get('vcpus_to_use', 1)
+            send_tamarind_progress(
+                ctx,
+                dockings_processed,
+                overview_data['dockings_status']['success'],
+                overview_data['dockings_status']['failed'],
+                overview_data['sec'] * vcpu_count,
+                force=True
+            )
 
             # We need to generate the general overview data
             # even if we didn't process anything
