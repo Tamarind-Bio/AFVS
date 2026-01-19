@@ -257,10 +257,6 @@ def submit_aws_batch(config, client, current_workunit, jobline):
                         'value': config.get('tamarind_job_id', '')
                     },
                     {
-                        'name': 'TAMARIND_API_KEY',
-                        'value': config.get('tamarind_api_key', '')
-                    },
-                    {
                         'name': 'TAMARIND_API_URL',
                         'value': config.get('tamarind_api_url', 'https://app.tamarind.bio')
                     },

@@ -343,9 +343,6 @@ run_atom_check=1
 tamarind_job_id={{TAMARIND_JOB_ID}}
 # Tamarind job ID for progress tracking (set by run-virtual-screening.sh)
 
-tamarind_api_key={{TAMARIND_API_KEY}}
-# API key for authenticating progress updates
-
 tamarind_api_url={{TAMARIND_API_URL}}
 # Tamarind API URL (defaults to https://app.tamarind.bio)
 

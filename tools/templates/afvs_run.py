@@ -72,10 +72,9 @@ def send_tamarind_progress(ctx, dockings_processed, success_count, failed_count,
 
     # Get Tamarind config from environment variables (set by AWS Batch)
     job_id = os.getenv('TAMARIND_JOB_ID')
-    api_key = os.getenv('TAMARIND_API_KEY')
     api_url = os.getenv('TAMARIND_API_URL', 'https://app.tamarind.bio')
 
-    if not job_id or not api_key:
+    if not job_id:
         return  # Not configured for Tamarind tracking
 
     current_time = time.time()
@@ -93,8 +92,7 @@ def send_tamarind_progress(ctx, dockings_processed, success_count, failed_count,
             'processedLigands': dockings_processed,
             'successfulDockings': success_count,
             'failedDockings': failed_count,
-            'vcpuSeconds': vcpu_seconds,
-            'apiKey': api_key
+            'vcpuSeconds': vcpu_seconds
         }
 
         data = json.dumps(payload).encode('utf-8')
