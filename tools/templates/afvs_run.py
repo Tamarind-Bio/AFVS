@@ -56,8 +56,62 @@ import sys
 import uuid
 
 from typing import Dict, Tuple
+import urllib.request
+import urllib.error
 
 logger = logging.getLogger(__name__)
+
+# Progress tracking for Tamarind integration
+_last_progress_update = 0
+_progress_update_interval = 30  # seconds between updates
+_progress_update_count = 100    # also update every N dockings
+
+def send_tamarind_progress(ctx, dockings_processed, success_count, failed_count, vcpu_seconds):
+    """Send progress update to Tamarind API (fire-and-forget, non-blocking)."""
+    global _last_progress_update
+
+    # Get Tamarind config from environment variables (set by AWS Batch)
+    job_id = os.getenv('TAMARIND_JOB_ID')
+    api_key = os.getenv('TAMARIND_API_KEY')
+    api_url = os.getenv('TAMARIND_API_URL', 'https://app.tamarind.bio')
+
+    if not job_id or not api_key:
+        return  # Not configured for Tamarind tracking
+
+    current_time = time.time()
+
+    # Throttle updates: only send every N seconds or N dockings
+    if (current_time - _last_progress_update < _progress_update_interval and
+        dockings_processed % _progress_update_count != 0):
+        return
+
+    _last_progress_update = current_time
+
+    try:
+        payload = {
+            'jobId': job_id,
+            'processedLigands': dockings_processed,
+            'successfulDockings': success_count,
+            'failedDockings': failed_count,
+            'vcpuSeconds': vcpu_seconds,
+            'apiKey': api_key
+        }
+
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            f"{api_url}/api/ligands/updateScreeningProgress",
+            data=data,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+
+        # Non-blocking with short timeout
+        with urllib.request.urlopen(req, timeout=5) as response:
+            if response.status == 200:
+                logger.debug(f"Progress update sent: {dockings_processed} ligands processed")
+    except Exception as e:
+        # Don't fail the job if progress tracking fails
+        logger.warning(f"Failed to send progress update: {e}")
 
 def read_config_line(line: str) -> Tuple[str, str]:
     key, sep, value = line.strip().partition("=")
@@ -760,6 +814,18 @@ def summary_process(ctx, summary_queue, upload_queue, metadata):
                 overview_data['total_dockings'] += 1
                 overview_data['dockings_status'][single_item['status']] += 1
 
+            # Send progress update to Tamarind (throttled internally)
+            elapsed_seconds = time.perf_counter() - start_time
+            vcpu_count = ctx.get('vcpus_to_use', 1)
+            send_tamarind_progress(
+                ctx,
+                dockings_processed,
+                overview_data['dockings_status']['success'],
+                overview_data['dockings_status']['failed'],
+                elapsed_seconds * vcpu_count
+            )
+
+            for single_item in item['items']:
                 if(single_item['status'] == "success"):
                     summary_key = f"{single_item['ligand_key']}"
 
@@ -2861,11 +2927,13 @@ def docking_finish_fred(task, ret):
     return
 
 
-def convert_pose_to_sdf(output_path):
+def convert_pose_to_sdf(output_path, input_format=None):
     """Convert a docking pose file (PDBQT) to SDF format using Open Babel.
 
     Args:
         output_path (str): Path to the docking output file (typically PDBQT).
+        input_format (str): Optional input format hint (e.g., 'pdbqt', 'mol2').
+                           If not provided, will try to detect from extension.
 
     Returns:
         str: Path to the SDF file if conversion succeeded, original path otherwise.
@@ -2873,17 +2941,26 @@ def convert_pose_to_sdf(output_path):
     if not os.path.exists(output_path):
         return output_path
 
-    input_format = output_path.split('.')[-1].lower()
+    # Try to detect format from file extension
+    basename = os.path.basename(output_path)
+    if '.' in basename:
+        detected_format = output_path.split('.')[-1].lower()
+    else:
+        detected_format = None
+
+    # Use provided format hint, or detected format, or default to pdbqt (most common)
+    fmt = input_format or detected_format or 'pdbqt'
 
     # Already SDF - no conversion needed
-    if input_format == 'sdf':
+    if fmt == 'sdf':
         return output_path
 
-    # Convert PDBQT/MOL2/PDB to SDF
-    if input_format in ['pdbqt', 'mol2', 'pdb']:
-        sdf_path = output_path.rsplit('.', 1)[0] + '.sdf'
+    # Convert to SDF
+    if fmt in ['pdbqt', 'mol2', 'pdb']:
+        sdf_path = output_path + '.sdf'
         try:
-            result = os.system(f'obabel {output_path} -O {sdf_path} 2>/dev/null')
+            # Use explicit input format flag for obabel
+            result = os.system(f'obabel -i{fmt} {output_path} -O {sdf_path} 2>/dev/null')
             if result == 0 and os.path.exists(sdf_path):
                 os.remove(output_path)  # Remove original to save space
                 return sdf_path
