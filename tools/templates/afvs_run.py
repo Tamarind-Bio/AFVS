@@ -67,53 +67,11 @@ _progress_update_interval = 30  # seconds between updates
 _progress_update_count = 100    # also update every N dockings
 
 def send_tamarind_progress(ctx, dockings_processed, success_count, failed_count, vcpu_seconds, force=False):
-    """Send progress update to Tamarind API (fire-and-forget, non-blocking).
-
-    Args:
-        force: If True, bypass throttling and send update immediately (for final update)
-    """
-    global _last_progress_update
-
-    # Get Tamarind config from environment variables (set by AWS Batch)
-    job_id = os.getenv('TAMARIND_JOB_ID')
-    api_url = os.getenv('TAMARIND_API_URL', 'https://app.tamarind.bio')
-
-    if not job_id:
-        return  # Not configured for Tamarind tracking
-
-    current_time = time.time()
-
-    # Throttle updates: only send every N seconds or N dockings (unless forced)
-    if not force and (current_time - _last_progress_update < _progress_update_interval and
-        dockings_processed % _progress_update_count != 0):
-        return
-
-    _last_progress_update = current_time
-
-    try:
-        payload = {
-            'jobId': job_id,
-            'processedLigands': dockings_processed,
-            'successfulDockings': success_count,
-            'failedDockings': failed_count,
-            'vcpuSeconds': vcpu_seconds
-        }
-
-        data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(
-            f"{api_url}/api/ligands/updateScreeningProgress",
-            data=data,
-            headers={'Content-Type': 'application/json'},
-            method='POST'
-        )
-
-        # Non-blocking with short timeout
-        with urllib.request.urlopen(req, timeout=5) as response:
-            if response.status == 200:
-                logger.debug(f"Progress update sent: {dockings_processed} ligands processed")
-    except Exception as e:
-        # Don't fail the job if progress tracking fails
-        logger.warning(f"Failed to send progress update: {e}")
+    """Progress tracking placeholder - actual updates done by EC2 head instance."""
+    # Progress is now tracked by the EC2 head instance via run-virtual-screening.sh
+    # which polls afvs_get_status.py and updates DynamoDB directly.
+    # This function is kept for compatibility but does nothing.
+    pass
 
 def read_config_line(line: str) -> Tuple[str, str]:
     key, sep, value = line.strip().partition("=")

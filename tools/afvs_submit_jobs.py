@@ -251,15 +251,6 @@ def submit_aws_batch(config, client, current_workunit, jobline):
                         'name': 'AFVS_CONFIG_JOB_BUCKET',
                         'value': config['object_store_job_bucket']
                     },
-                    # Tamarind progress tracking
-                    {
-                        'name': 'TAMARIND_JOB_ID',
-                        'value': config.get('tamarind_job_id', '')
-                    },
-                    {
-                        'name': 'TAMARIND_API_URL',
-                        'value': config.get('tamarind_api_url', 'https://app.tamarind.bio')
-                    },
                 ]
             }
         )
