@@ -2913,7 +2913,7 @@ def convert_pose_to_sdf(output_path, input_format=None):
                            If not provided, will try to detect from extension.
 
     Returns:
-        str: Path to the SDF file if conversion succeeded, original path otherwise.
+        str: Path to the SDF file if conversion succeeded, path with correct extension otherwise.
     """
     if not os.path.exists(output_path):
         logging.warning(f"convert_pose_to_sdf: File does not exist: {output_path}")
@@ -2954,6 +2954,16 @@ def convert_pose_to_sdf(output_path, input_format=None):
             logging.warning(f"Failed to convert {output_path} to SDF: {e}")
     else:
         logging.warning(f"Unsupported format for conversion: {fmt}")
+
+    # Conversion failed - rename file to have correct extension so it's not mislabeled
+    if detected_format is None:
+        correct_path = f"{output_path}.{fmt}"
+        try:
+            os.rename(output_path, correct_path)
+            logging.warning(f"Conversion failed - renamed to {correct_path} to preserve correct format")
+            return correct_path
+        except Exception as e:
+            logging.warning(f"Failed to rename {output_path}: {e}")
 
     return output_path
 
