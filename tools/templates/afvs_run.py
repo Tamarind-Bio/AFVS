@@ -1251,26 +1251,28 @@ def docking_start_MpSDockZN(task):
         
     return cmd
 
-def docking_finish_MpSDockZN(item, ret): 
-    try: 
-        score_path = os.path.join(item['tmp_run_dir'], "receptor_input_docked_result.list")
+def docking_finish_MpSDockZN(task, ret):
+    try:
+        score_path = os.path.join(task['tmp_run_dir'], "receptor_input_docked_result.list")
         score_all = []
-        with open(score_path, 'r') as f: 
+        with open(score_path, 'r') as f:
             lines = f.readlines()
-        for item in lines: 
-            A = item.split(' ')
+        for line in lines:
+            A = line.split(' ')
             A = [x for x in A if x != '']
-            try: score_1, score_2, score_3, score_4, score_5 = float(A[0]), float(A[1]), float(A[2]),float(A[3]), float(A[4])
-            except: continue 
+            try:
+                score_1, score_2, score_3, score_4, score_5 = float(A[0]), float(A[1]), float(A[2]), float(A[3]), float(A[4])
+            except:
+                continue
             final_score = score_1 + score_2 + score_3 + score_4 + score_5
             score_all.append(final_score)
-        item['score'] = min(score_all)   
- 
-        pose_path = os.path.join(item['tmp_run_dir'], "receptor_input_docked_result.mol2")
-        shutil.move(pose_path, item['output_dir'])  
-        item['status'] = "success"
+        task['score'] = min(score_all)
 
-    except: 
+        pose_path = os.path.join(task['tmp_run_dir'], "receptor_input_docked_result.mol2")
+        shutil.move(pose_path, task['output_dir'])
+        task['status'] = "success"
+
+    except:
         logging.error("failed parsing")
 
 ## SEED
@@ -1298,19 +1300,19 @@ def docking_start_SEED(task):
         
     return cmd
 
-def docking_finish_SEED(item, ret): 
-    try: 
-        score_path = os.path.join(item['tmp_run_dir'], "seed_best.dat")
-        with open(score_path, 'r') as f: 
+def docking_finish_SEED(task, ret):
+    try:
+        score_path = os.path.join(task['tmp_run_dir'], "seed_best.dat")
+        with open(score_path, 'r') as f:
             lines = f.readlines()
         docking_score = float([x for x in lines[1].split(' ') if x != ''][4])
-        item['score'] = min(docking_score)   
- 
-        pose_path = os.path.join(item['tmp_run_dir'], "ligand_seed_best.mol2")
-        shutil.move(pose_path, item['output_dir'])  
-        item['status'] = "success"
+        task['score'] = docking_score
 
-    except: 
+        pose_path = os.path.join(task['tmp_run_dir'], "ligand_seed_best.mol2")
+        shutil.move(pose_path, task['output_dir'])
+        task['status'] = "success"
+
+    except:
         logging.error("failed parsing")
 
 
@@ -1334,17 +1336,17 @@ def docking_start_HDock(task):
         
     return cmd
 
-def docking_finish_HDock(item, ret): 
-    try: 
-        pose_path = os.path.join(item['tmp_run_dir'], "model_1.pdb")        
-        with open(pose_path, 'r') as f: 
+def docking_finish_HDock(task, ret):
+    try:
+        pose_path = os.path.join(task['tmp_run_dir'], "model_1.pdb")
+        with open(pose_path, 'r') as f:
             lines = f.readlines()
         docking_score = float(lines[3].split(' ')[-1])
-        
-        shutil.move(pose_path, item['output_dir'])  
-        item['status'] = "success"
-        item['score'] = docking_score   
-    except: 
+
+        shutil.move(pose_path, task['output_dir'])
+        task['status'] = "success"
+        task['score'] = docking_score
+    except:
         logging.error("failed parsing")
 
 
@@ -1426,21 +1428,21 @@ def docking_start_dock6(task):
 
     return cmd
 
-def docking_finish_dock6(item, ret): 
-    try: 
+def docking_finish_dock6(item, ret):
+    try:
         dock_file = [x for x in os.listdir(item['tmp_run_dir']) if 'ligand_out' in x]
         dock_file = [x for x in dock_file if 'mol2' in x][0]
         os.system('cp {} {}'.format(dock_file, item['output_dir']))
-        
-        # Save the results: 
-        with open('./ligand_out_scored.mol2', 'r') as f: 
-            lines = f.readlines()
-        docking_score = float(lines[2].split(' ')[-1])           
 
-        item['score'] = docking_score   
+        # Save the results:
+        with open('./ligand_out_scored.mol2', 'r') as f:
+            lines = f.readlines()
+        docking_score = float(lines[2].split(' ')[-1])
+
+        item['score'] = docking_score
         item['status'] = "success"
 
-    except: 
+    except:
         logging.error("failed parsing")
 
 
@@ -1478,29 +1480,29 @@ def docking_start_rosetta_ligand(task):
         
     return cmd
 
-def docking_finish_rosetta_ligand(item, ret): 
-    try: 
-        
-        docking_score_path = os.path.join(item['tmp_run_dir'], "scoreout.sc")
+def docking_finish_rosetta_ligand(task, ret):
+    try:
 
-        with open(docking_score_path, 'r') as f: 
+        docking_score_path = os.path.join(task['tmp_run_dir'], "scoreout.sc")
+
+        with open(docking_score_path, 'r') as f:
             lines = f.readlines()
-        lines = lines[2: ]
+        lines = lines[2:]
         docking_scores = []
-        for item in lines: 
-            A = item.split(' ')
-            A = [x for x in A if x!='']
+        for line in lines:
+            A = line.split(' ')
+            A = [x for x in A if x != '']
             docking_scores.append(float(A[44]))
-        
-        item['score'] = min(docking_scores)   
-        
-        out_files = [x for x in os.listdir(item['tmp_run_dir']) if 'complexout' in x][0] 
-        docking_out_path = os.path.join(item['tmp_run_dir'], out_files)
-        shutil.move(docking_out_path, item['output_dir'])             
-        item['status'] = "success"
-    except: 
+
+        task['score'] = min(docking_scores)
+
+        out_files = [x for x in os.listdir(task['tmp_run_dir']) if 'complexout' in x][0]
+        docking_out_path = os.path.join(task['tmp_run_dir'], out_files)
+        shutil.move(docking_out_path, task['output_dir'])
+        task['status'] = "success"
+    except:
         logging.error("failed parsing")
-        
+
     return 
 
 
@@ -1537,25 +1539,25 @@ def docking_start_Molegro(task):
         
     return cmd
 
-def docking_finish_Molegro(item, ret): 
-    try: 
-        
-        cmd_run = ret.stdout.split('\n')[-2]
-        cmd_run = [x for x in cmd_run if 'Pose:' in x]
-        scores = []
-        for item in cmd_run: 
-            scores.append( float(item.split('Energy')[-1].split(' ')[1][:-2]) )
-        item['score'] = min(scores)
-        
-        docking_out_file = os.path.join(item['tmp_run_dir'])
-        docking_out_file = [x for x in os.listdir(docking_out_file) if 'mol2' in x][0]
-        docking_out_file = os.path.join(item['tmp_run_dir'], docking_out_file)
+def docking_finish_Molegro(task, ret):
+    try:
 
-        shutil.move(docking_out_file, item['output_dir'])             
-        item['status'] = "success"
-    except: 
+        cmd_run = ret.stdout.split('\n')[-2]
+        pose_lines = [x for x in cmd_run if 'Pose:' in x]
+        scores = []
+        for line in pose_lines:
+            scores.append(float(line.split('Energy')[-1].split(' ')[1][:-2]))
+        task['score'] = min(scores)
+
+        docking_out_dir = os.path.join(task['tmp_run_dir'])
+        docking_out_file = [x for x in os.listdir(docking_out_dir) if 'mol2' in x][0]
+        docking_out_path = os.path.join(task['tmp_run_dir'], docking_out_file)
+
+        shutil.move(docking_out_path, task['output_dir'])
+        task['status'] = "success"
+    except:
         logging.error("failed parsing")
-        
+
     return 
 
 ## FitDock
@@ -1580,23 +1582,23 @@ def docking_start_FitDock(task):
         
     return cmd
 
-def docking_finish_FitDock(item, ret): 
-    try: 
-        
-        docking_score_file = os.path.join(item['tmp_run_dir'], "out.log")
-        docking_out_file = os.path.join(item['tmp_run_dir'], "o.mol2")
-                
-        with open(docking_score_file, 'r') as f: 
+def docking_finish_FitDock(task, ret):
+    try:
+
+        docking_score_file = os.path.join(task['tmp_run_dir'], "out.log")
+        docking_out_file = os.path.join(task['tmp_run_dir'], "o.mol2")
+
+        with open(docking_score_file, 'r') as f:
             lines = f.readlines()
         lines = [x for x in lines if 'Binding Score after  EM' in x]
         docking_score = float(lines[0].split(' ')[-2])
-        item['score'] = min(docking_score)
+        task['score'] = docking_score
 
-        shutil.move(docking_out_file, item['output_dir'])             
-        item['status'] = "success"
-    except: 
+        shutil.move(docking_out_file, task['output_dir'])
+        task['status'] = "success"
+    except:
         logging.error("failed parsing")
-        
+
     return 
 
 
@@ -1620,24 +1622,26 @@ def docking_start_flexx(task):
     
     return cmd
 
-def docking_finish_flexx(item, ret): 
-    try: 
-        output_file_path = item['output_dir'] + item['lig_path'].split('/')[-1].replace('.mol2', '.sdf')
-        
-        with open(output_file_path, 'r') as f: 
-            lines = f.readlines()    
-        
-        for i,item in enumerate(lines): 
-            docking_scores = []
-            if '>  <docking-score>' in item : 
+def docking_finish_flexx(task, ret):
+    try:
+        output_file_path = task['output_dir'] + task['lig_path'].split('/')[-1].replace('.mol2', '.sdf')
+
+        with open(output_file_path, 'r') as f:
+            lines = f.readlines()
+
+        docking_scores = []
+        for i, line in enumerate(lines):
+            if '>  <docking-score>' in line:
                 docking_score = float(lines[i+1])
                 docking_scores.append(docking_score)
-        
-        item['score'] = min(docking_scores)
-        item['status'] = "success"
-    except: 
+
+        task['score'] = min(docking_scores)
+        task['status'] = "success"
+        task['output_path'] = output_file_path
+        # Flexx outputs SDF format, no conversion needed
+    except:
         logging.error("failed parsing")
-        
+
     return 
 
 
@@ -1663,28 +1667,28 @@ def docking_start_LightDock(task):
     
     return cmd
 
-def docking_finish_LightDock(item, ret): 
-    try: 
-        
-        docking_score_file = os.path.join(item['tmp_run_dir'], "swarm_0", "gso_100.out")
-        
-        with open(docking_score_file, 'r') as f: 
+def docking_finish_LightDock(task, ret):
+    try:
+
+        docking_score_file = os.path.join(task['tmp_run_dir'], "swarm_0", "gso_100.out")
+
+        with open(docking_score_file, 'r') as f:
             lines = f.readlines()
-        lines = lines[1: ]
+        lines = lines[1:]
         scoring = []
-        for item in lines: 
-            A = item.split(' ')
+        for line in lines:
+            A = line.split(' ')
             scoring.append(float(A[-1]))
 
-        docking_pose_file = os.path.join(item['tmp_run_dir'], "swarm_0")
-        complex_file = [x for x in os.listdir(docking_pose_file) if '.pdb' in x][0]
-        docking_pose_file = os.path.join(item['tmp_run_dir'], "swarm_0", complex_file)
-        shutil.move(docking_pose_file, item['output_dir'])     
-        
-        item['score'] = min(scoring)
-        item['status'] = "success"
-        
-    except: 
+        docking_pose_dir = os.path.join(task['tmp_run_dir'], "swarm_0")
+        complex_file = [x for x in os.listdir(docking_pose_dir) if '.pdb' in x][0]
+        docking_pose_file = os.path.join(task['tmp_run_dir'], "swarm_0", complex_file)
+        shutil.move(docking_pose_file, task['output_dir'])
+
+        task['score'] = min(scoring)
+        task['status'] = "success"
+
+    except:
         logging.error("failed parsing")
     return 
 
@@ -1708,24 +1712,24 @@ def docking_start_rldock(task):
         ]
     return cmd
 
-def docking_finish_rldock(item, ret): 
-    try: 
-        docking_pose = os.path.join(item['tmp_run_dir_input'], "output_cluster.mol2")
+def docking_finish_rldock(task, ret):
+    try:
+        docking_pose = os.path.join(task['tmp_run_dir_input'], "output_cluster.mol2")
 
-        with open(docking_pose, 'r') as f: 
+        with open(docking_pose, 'r') as f:
             lines = f.readlines()
-        lines = [x for x in lines if '# Total_Energy:' in x]
+        score_lines = [x for x in lines if '# Total_Energy:' in x]
         docking_scores = []
-        for item in lines: 
-            docking_scores.append(float(item.split(' ')[-1]))
+        for line in score_lines:
+            docking_scores.append(float(line.split(' ')[-1]))
 
-        shutil.move(docking_pose, item['output_dir'])        
-        item['score'] = min(docking_scores)
-        item['status'] = "success"
+        shutil.move(docking_pose, task['output_dir'])
+        task['score'] = min(docking_scores)
+        task['status'] = "success"
 
-    except: 
+    except:
         logging.error("failed parsing")
-    
+
     return 
 
 ## Autodock koto
@@ -1754,27 +1758,28 @@ def docking_start_autodock_koto(task):
         ]
     return cmd
 
-def docking_finish_autodock_koto(item, ret): 
-    try: 
+def docking_finish_autodock_koto(task, ret):
+    try:
         docking_out = ret.stdout
         A = docking_out.split('\n')
         docking_score = []
-        for item in A: 
-            line_split = item.split(' ')
+        for line in A:
+            line_split = line.split(' ')
             line_split = [x for x in line_split if x != '']
-            if len(line_split) == 4: 
-                try: 
+            if len(line_split) == 4:
+                try:
                     vr_1 = float(line_split[0])
                     vr_2 = float(line_split[1])
                     vr_3 = float(line_split[2])
                     vr_4 = float(line_split[3])
                     docking_score.append(vr_2)
                 except: continue
-            item['score'] = min(docking_score)
-            item['status'] = "success"        
-    except: 
+        if docking_score:
+            task['score'] = min(docking_score)
+            task['status'] = "success"
+    except:
         logging.error("failed parsing")
-    
+
     return 
 
 
@@ -2385,17 +2390,18 @@ def docking_start_rdock(task):
                 '-n', config_['runs']]
     return cmd
 
-def docking_finish_rdock(item, ret):
+def docking_finish_rdock(task, ret):
 
     try:
-        with open(item['output_path'], 'r') as f:
+        with open(task['output_path'], 'r') as f:
             lines = f.readlines()
-        score = []
-        for i, item in enumerate(lines):
-            if item.strip() == '>  <SCORE>':
-                score.append(float(lines[i+1]))
-        item['score'] = min(score)
-        item['status'] = "success"
+        scores = []
+        for i, line in enumerate(lines):
+            if line.strip() == '>  <SCORE>':
+                scores.append(float(lines[i+1]))
+        task['score'] = min(scores)
+        task['status'] = "success"
+        # rDock outputs SDF format, no conversion needed
     except:
         logging.error("failed parsing")
 
@@ -2420,24 +2426,24 @@ def docking_start_mdock(task):
     return cmd
 
 
-def docking_finish_mdock(item, ret):
+def docking_finish_mdock(task, ret):
 
     try:
         docking_scores = []
 
-        output_file = os.path.join(item['tmp_run_dir_input'], "mdock_dock.out")
+        output_file = os.path.join(task['tmp_run_dir_input'], "mdock_dock.out")
         with open(output_file, 'r') as f:
             lines = f.readlines()
 
-        for item in lines:
-            docking_scores.append( float([x for x in item.split(' ') if x != ''][4]))
+        for line in lines:
+            docking_scores.append(float([x for x in line.split(' ') if x != ''][4]))
 
-        shutil.move(output_file, item['output_dir'])
-        mol_output_file = os.path.join(item['tmp_run_dir_input'], "mdock_dock.mol2")
-        shutil.move(mol_output_file, item['output_path'])
+        shutil.move(output_file, task['output_dir'])
+        mol_output_file = os.path.join(task['tmp_run_dir_input'], "mdock_dock.mol2")
+        shutil.move(mol_output_file, task['output_path'])
 
-        item['score'] = min(docking_scores)
-        item['status'] = "success"
+        task['score'] = min(docking_scores)
+        task['status'] = "success"
     except:
         logging.error("failed parsing")
 
@@ -2454,23 +2460,23 @@ def docking_start_mcdock(task):
 
     return cmd
 
-def docking_finish_mcdock(item, ret):
+def docking_finish_mcdock(task, ret):
 
     try:
-        output_file = os.path.join(item['tmp_run_dir_input'], "out.xyz")
+        output_file = os.path.join(task['tmp_run_dir_input'], "out.xyz")
 
         with open(output_file, 'r') as f:
             lines = f.readlines()
 
-        lines = [x for x in lines if 'Binding Energy' in x]
+        score_lines = [x for x in lines if 'Binding Energy' in x]
         binding_energies = []
-        for item in lines:
-            binding_energies.append(float(item.split(' ')[2].split('\t')[0]))
+        for line in score_lines:
+            binding_energies.append(float(line.split(' ')[2].split('\t')[0]))
 
-        item['score'] = min(binding_energies)
-        item['status'] = "success"
+        task['score'] = min(binding_energies)
+        task['status'] = "success"
 
-        shutil.move(output_file, item['output_path'])
+        shutil.move(output_file, task['output_path'])
     except:
         logging.error("failed parsing")
 
@@ -2493,24 +2499,24 @@ def docking_start_ligandfit(task):
 
     return cmd
 
-def docking_finish_ligandfit(item, ret):
+def docking_finish_ligandfit(task, ret):
 
-    run_pdb = os.path.join(item['tmp_run_dir_input'], "LigandFit_run_1_", "ligand_fit_1.pdb")
-    run_log = os.path.join(item['tmp_run_dir_input'], "LigandFit_run_1_", "ligand_1_1.log")
+    run_pdb = os.path.join(task['tmp_run_dir_input'], "LigandFit_run_1_", "ligand_fit_1.pdb")
+    run_log = os.path.join(task['tmp_run_dir_input'], "LigandFit_run_1_", "ligand_1_1.log")
 
     try:
         with open(run_log, 'r') as f:
             lines = f.readlines()
-        lines = [x for x in lines if 'Best score' in x]
+        score_lines = [x for x in lines if 'Best score' in x]
         scores = []
-        for item in lines:
-            scores.append( float([x for x in item.split(' ') if x != ''][-2]) )
+        for line in score_lines:
+            scores.append(float([x for x in line.split(' ') if x != ''][-2]))
 
-        item['score'] = min(scores)
-        item['status'] = "success"
+        task['score'] = min(scores)
+        task['status'] = "success"
 
-        shutil.move(run_pdb, item['output_path'])
-        shutil.move(run_log, item['output_dir'])
+        shutil.move(run_pdb, task['output_path'])
+        shutil.move(run_log, task['output_dir'])
     except:
         logging.error("failed parsing")
 
@@ -2557,25 +2563,25 @@ def docking_start_ledock(item):
 
     return cmd
 
-def docking_finish_ledock(item, ret):
+def docking_finish_ledock(task, ret):
 
     try:
-        ligand_filename = item['ligand_path'].split('/')[-1]
+        ligand_filename = task['ligand_path'].split('/')[-1]
         ligand_base = ligand_filename.split('.')[0]
 
-        run_dok = os.path.join(item['tmp_run_dir_input'], "ligands", f"{ligand_base}.dok")
+        run_dok = os.path.join(task['tmp_run_dir_input'], "ligands", f"{ligand_base}.dok")
 
         with open(run_dok, 'r') as f:
             lines = f.readlines()
         lines = [x for x in lines if 'Score' in x]
         scores = []
-        for item in lines:
-            A = item.split('Score')[-1].strip().split(': ')[1].split(' ')[0]
+        for line in lines:
+            A = line.split('Score')[-1].strip().split(': ')[1].split(' ')[0]
             scores.append(float(A))
-        item['score'] = min(scores)
-        item['status'] = "success"
+        task['score'] = min(scores)
+        task['status'] = "success"
 
-        shutil.move(run_dok, item['output_dir'])
+        shutil.move(run_dok, task['output_dir'])
 
     except:
         logging.error("failed parsing")
@@ -2671,7 +2677,7 @@ def docking_finish_gold(item, ret):
         with open(run_output, 'r') as f:
             lines = f.readlines()
             docking_score = float([x for x in lines[-1].split(' ') if x!=''][1])
-            item['score'] = min(docking_score)
+            item['score'] = docking_score
             item['status'] = "success"
 
         shutil.move(run_pose, item['output_dir'])
@@ -2717,7 +2723,7 @@ def docking_finish_igemdock(task, ret):
 
         shutil.move(docked_pose, task['output_path'])
 
-        task['score'] = min(docking_score)
+        task['score'] = docking_score
         task['status'] = "success"
     except:
         logging.error("failed parsing")
@@ -2750,7 +2756,7 @@ def docking_finish_idock(item, ret):
     try:
         docking_out = ret.stdout
         docking_out = float([x for x in docking_out.split(' ') if x != ''][-2])
-        item['score'] = min(docking_out)
+        item['score'] = docking_out
         item['status'] = "success"
     except:
         logging.error("failed parsing")
@@ -2804,29 +2810,29 @@ def docking_start_galaxydock3(task):
 
     return cmd
 
-def docking_finish_galaxydock3(item, ret):
+def docking_finish_galaxydock3(task, ret):
     try:
 
-        info_file = os.path.join(item['tmp_run_dir_input'], f"{item['ligdock_prefix']}_fb.E.info")
-        mol_file = os.path.join(item['tmp_run_dir_input'], f"{item['ligdock_prefix']}_fb.mol2")
+        info_file = os.path.join(task['tmp_run_dir_input'], f"{task['ligdock_prefix']}_fb.E.info")
+        mol_file = os.path.join(task['tmp_run_dir_input'], f"{task['ligdock_prefix']}_fb.mol2")
 
         with open(info_file, 'r') as f:
             lines = f.readlines()
         lines = lines[3: ]
         docking_scores = []
-        for item in lines:
+        for line in lines:
             try:
-                A = item.split(' ')
+                A = line.split(' ')
                 A = [x for x in A if x != '']
                 docking_scores.append(float(A[5]))
             except:
                 continue
 
-        shutil.move(info_file, item['output_dir'])
-        shutil.move(mol_file, item['output_dir'])
+        shutil.move(info_file, task['output_dir'])
+        shutil.move(mol_file, task['output_dir'])
 
-        item['score'] = min(docking_scores)
-        item['status'] = "success"
+        task['score'] = min(docking_scores)
+        task['status'] = "success"
     except:
         logging.error("failed parsing")
 
@@ -2853,11 +2859,11 @@ def docking_start_autodock(item, arch_type):
     return cmd
 
 def docking_finish_autodock(item, ret):
-    try :
+    try:
         output = ret.stdout.split('\n')[-6]
         lines = [x.strip() for x in output if 'best energy' in x][0]
         docking_score = float(lines.split(',')[1].split(' ')[-2])
-        item['score'] = min(docking_score)
+        item['score'] = docking_score
         item['status'] = "success"
     except:
         logging.error("failed parsing")
@@ -2899,17 +2905,18 @@ def docking_finish_fred(task, ret):
 
 
 def convert_pose_to_sdf(output_path, input_format=None):
-    """Convert a docking pose file (PDBQT) to SDF format using Open Babel.
+    """Convert a docking pose file to SDF format using Open Babel.
 
     Args:
-        output_path (str): Path to the docking output file (typically PDBQT).
-        input_format (str): Optional input format hint (e.g., 'pdbqt', 'mol2').
+        output_path (str): Path to the docking output file (typically PDBQT, MOL2, PDB, or XYZ).
+        input_format (str): Optional input format hint (e.g., 'pdbqt', 'mol2', 'pdb', 'xyz').
                            If not provided, will try to detect from extension.
 
     Returns:
         str: Path to the SDF file if conversion succeeded, original path otherwise.
     """
     if not os.path.exists(output_path):
+        logging.warning(f"convert_pose_to_sdf: File does not exist: {output_path}")
         return output_path
 
     # Try to detect format from file extension
@@ -2926,17 +2933,27 @@ def convert_pose_to_sdf(output_path, input_format=None):
     if fmt == 'sdf':
         return output_path
 
+    # Supported formats for conversion
+    supported_formats = ['pdbqt', 'mol2', 'pdb', 'xyz', 'dok']
+
     # Convert to SDF
-    if fmt in ['pdbqt', 'mol2', 'pdb']:
+    if fmt in supported_formats:
+        # For dok format, treat as mol2 since it's similar
+        obabel_fmt = 'mol2' if fmt == 'dok' else fmt
         sdf_path = output_path + '.sdf'
         try:
             # Use explicit input format flag for obabel
-            result = os.system(f'obabel -i{fmt} {output_path} -O {sdf_path} 2>/dev/null')
-            if result == 0 and os.path.exists(sdf_path):
+            result = os.system(f'obabel -i{obabel_fmt} {output_path} -O {sdf_path} 2>/dev/null')
+            if result == 0 and os.path.exists(sdf_path) and os.path.getsize(sdf_path) > 0:
                 os.remove(output_path)  # Remove original to save space
+                logging.info(f"Successfully converted {output_path} to SDF")
                 return sdf_path
+            else:
+                logging.warning(f"obabel conversion failed for {output_path} (format: {fmt})")
         except Exception as e:
             logging.warning(f"Failed to convert {output_path} to SDF: {e}")
+    else:
+        logging.warning(f"Unsupported format for conversion: {fmt}")
 
     return output_path
 

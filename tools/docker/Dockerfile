@@ -19,7 +19,7 @@
 FROM amazonlinux:2
 
 # Installing basic packages
-RUN yum update -y && yum -y install python3 wget gcc tar make gcc-c++ zlib-devel gzip which
+RUN yum update -y && yum -y install python3 wget gcc tar make gcc-c++ zlib-devel gzip which openbabel
 RUN yum install -y libicu libicu-devel
 RUN pip3 install boto3 pandas pyarrow
 
