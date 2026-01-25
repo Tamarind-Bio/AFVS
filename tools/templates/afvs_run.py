@@ -800,17 +800,20 @@ def summary_process(ctx, summary_queue, upload_queue, metadata):
                 if(single_item['status'] == "success"):
                     summary_key = f"{single_item['ligand_key']}"
 
+                    # Use all_scores if available (multiple poses), otherwise fall back to single score
+                    scores_to_add = single_item.get('all_scores', [single_item['score']])
+
                     if summary_key not in summary_data[single_item['scenario_key']]:
                         summary_data[single_item['scenario_key']][summary_key] = {
                             'ligand': single_item['ligand_key'],
                             'collection_key': single_item['collection_key'],
                             'scenario': single_item['scenario_key'],
-                            'scores': [ single_item['score'] ],
+                            'scores': scores_to_add.copy(),
                             'attrs': single_item['attrs']
                         }
 
                     else:
-                        summary_data[single_item['scenario_key']][summary_key]['scores'].append(single_item['score'])
+                        summary_data[single_item['scenario_key']][summary_key]['scores'].extend(scores_to_add)
                 else:
                     # Log the failure
                     overview_data['failed_list'].append(single_item['log'])
@@ -2220,10 +2223,14 @@ def docking_start_vina(task):
     return cmd
 
 def docking_finish_vina(item, ret):
-    match = re.search(r'^\s+1\s+(?P<value>[-0-9.]+)\s+', ret.stdout, flags=re.MULTILINE)
-    if(match):
-        matches = match.groupdict()
-        item['score'] = float(matches['value'])
+    # Parse all modes/poses from vina output
+    all_scores = []
+    for match in re.finditer(r'^\s+\d+\s+(?P<value>[-0-9.]+)\s+', ret.stdout, flags=re.MULTILINE):
+        all_scores.append(float(match.group('value')))
+
+    if all_scores:
+        item['score'] = min(all_scores)  # Best score
+        item['all_scores'] = all_scores   # All pose scores for true average
         item['status'] = "success"
         # Convert PDBQT pose to SDF format
         if 'output_path' in item and os.path.exists(item['output_path']):
@@ -2251,22 +2258,23 @@ def docking_start_smina(task):
     return cmd
 
 def docking_finish_smina(item, ret):
-    found = 0
-    for line in reversed(ret.stdout.splitlines()):
-        match = re.search(r'^1\s{4}\s*(?P<value>[-0-9.]+)\s*', line)
-        if(match):
-            matches = match.groupdict()
-            item['score'] = float(matches['value'])
-            item['status'] = "success"
-            found = 1
-            break
-    if(found == 0):
-        item['log']['reason'] = f"Could not find score"
-        logging.error(item['log']['reason'])
-    else:
+    # Parse all modes/poses from smina output
+    all_scores = []
+    for line in ret.stdout.splitlines():
+        match = re.search(r'^\d+\s{4}\s*(?P<value>[-0-9.]+)\s*', line)
+        if match:
+            all_scores.append(float(match.group('value')))
+
+    if all_scores:
+        item['score'] = min(all_scores)  # Best score
+        item['all_scores'] = all_scores   # All pose scores for true average
+        item['status'] = "success"
         # Convert PDBQT pose to SDF format
         if 'output_path' in item and os.path.exists(item['output_path']):
             item['output_path'] = convert_pose_to_sdf(item['output_path'])
+    else:
+        item['log']['reason'] = f"Could not find score"
+        logging.error(item['log']['reason'])
 
 
 ## plants
