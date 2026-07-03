@@ -173,6 +173,7 @@ def submit_slurm(config, client, current_workunit, jobline):
     # Slow ourselves down a bit
     time.sleep(0.1)
 
+
 def submit_lsf(config, client, current_workunit, jobline):
 
     # Get the template
@@ -189,66 +190,68 @@ def submit_lsf(config, client, current_workunit, jobline):
     subjobs_count = len(current_workunit['subjobs'])
 
     # Where are we putting this file?
-    batch_workunit_base = Path(config['sharedfs_workunit_path']) / jobline_str
+    batch_workunit_base=Path(config['sharedfs_workunit_path']) / jobline_str
     batch_workunit_base.mkdir(parents=True, exist_ok=True)
+    batch_submit_file = batch_workunit_base / "submit.lsf"
 
-    # LSF doesn't have a good way to submit an array job with a dependency on the previous one,
-    # so we will submit each subjob separately and then track the job IDs here. 
-    job_ids = {}
+    #
+    template_values = {
+        "job_letter": config['job_letter'],
+        "job_name": config['job_name'],
+        "threads_to_use": config['threads_to_use'],
+        "array_start": "1",
+        "array_end": subjobs_count,
+        "lsf_cpus": config['lsf_cpus'],
+        "lsf_queue": config['lsf_queue'],
+        "lsf_walltime": config['lsf_walltime'],
+        "lsf_memory": config['lsf_memory'],
+        "workunit_id": jobline_str,
+        "job_storage_mode": config['job_storage_mode'],
+        "lsf_array_job_throttle": config['lsf_array_job_throttle'],
+        "job_tgz": current_workunit['download_path'],
+        "batch_workunit_base": batch_workunit_base.resolve().as_posix()
+    }
+    render_output = lsf_template.render(template_values)
 
-    for subjob_id in range(subjobs_count):
+    try:
+        with open(batch_submit_file, "w") as f:
+            f.write(render_output)
+    except IOError as error:
+        print(f"Cannot write the workunit lsf file ({batch_submit_file})")
+        raise error
 
-        batch_submit_file = batch_workunit_base / f"submit_{subjob_id}.lsf"
+    # Run the lsf submit command and capture the job ID
+    # information. bsub takes the script on stdin.
 
-        template_values = {
-            "job_letter": config['job_letter'],
-            "job_name": config['job_name'],
-            "threads_to_use": config['threads_to_use'],
-            "subjob_id": subjob_id,
-            "lsf_cpus": config['lsf_cpus'],
-            "lsf_account": config['lsf_account'],
-            "lsf_queue": config['lsf_queue'],
-            "workunit_id": jobline_str,
-            "job_storage_mode": config['job_storage_mode'],
-            "job_tgz": current_workunit['download_path'],
-            "batch_workunit_base": batch_workunit_base.resolve().as_posix()
-        }
-        render_output = lsf_template.render(template_values)
+    cmd = ["bsub"]
 
-        try:
-            with open(batch_submit_file, "w") as f:
-                f.write(render_output)
-        except IOError as error:
-            print(f"Cannot write the workunit lsf file ({batch_submit_file})")
-            raise error
+    try:
+        with open(batch_submit_file, "r") as f:
+            ret = subprocess.run(cmd, stdin=f, capture_output=True,
+                             text=True, timeout=int(config['lsf_job_submission_timeout']))
+    except subprocess.TimeoutExpired as err:
+        raise Exception("timeout on submission to bsub")
 
-        cmd = ["bsub"]
-
-        try:
-            with open(batch_submit_file, "r") as stdin_file:
-                ret = subprocess.run(cmd, stdin=stdin_file, capture_output=True,
-                                     text=True, timeout=int(config['lsf_job_submission_timeout']))
-        except subprocess.TimeoutExpired as err:
-            raise Exception("timeout on submission to bsub")
-
-        if ret.returncode == 0:
-            match = re.search(
-                r'Job <(?P<value>\d+)> is submitted', ret.stdout)
-            if match:
-                job_ids[str(subjob_id)] = int(match.groupdict()['value'])
-            else:
-                raise Exception("bsub returned, but cannot parse output")
+    if ret.returncode == 0:
+        match = re.search(
+                r'^Job <(?P<value>[-0-9]+)> is submitted', ret.stdout, flags=re.MULTILINE)
+        if(match):
+            matches = match.groupdict()
+            job_id = int(matches['value'])
         else:
-            raise Exception(f"bsub did not return successfully: {ret.stderr}")
-
-        # Slow ourselves down a bit
-        time.sleep(0.1)
+            raise Exception("bsub returned, but cannot parse output")
+    else:
+        raise Exception("bsub did not return successfully")
 
     current_workunit['status'] = {
         'af_job_status': 'SUBMITTED',
         'job_name': f"afvs-{config['job_letter']}-{jobline_str}",
-        'job_ids': job_ids
+        'job_id': job_id
     }
+
+    # Slow ourselves down a bit
+    time.sleep(0.1)
+
 
 def submit_aws_batch(config, client, current_workunit, jobline):
 

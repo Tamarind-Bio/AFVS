@@ -221,17 +221,8 @@ def check_parameters(config):
             if(empty_value(config, 'lsf_template')):
                 print("* 'lsf_template' must be set if batchsystem is 'lsf'")
                 error = 1
-            if(empty_value(config, 'lsf_cpus')):
-                print("* 'lsf_cpus' must be set if batchsystem is 'lsf'")
-                error = 1
-            if(empty_value(config, 'lsf_queue')):
-                print("* 'lsf_queue' must be set if batchsystem is 'lsf'")
-                error = 1
-            if(empty_value(config, 'lsf_job_submission_timeout')):
-                print("* 'lsf_job_submission_timeout' must be set if batchsystem is 'lsf'")
-                error = 1
         else:
-            print(f"* batchsystem '{config['batchsystem']}' is not supported. Only awsbatch, slurm, lsf and bash are supported")
+            print(f"* batchsystem '{config['batchsystem']}' is not supported. Only awsbatch, slurm, bash, and lsf are supported")
 
 
     if(empty_value(config, 'ligand_library_format')):

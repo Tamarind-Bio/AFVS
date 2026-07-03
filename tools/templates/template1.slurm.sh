@@ -46,8 +46,13 @@
 # If you are using a virtualenv, make sure the correct one 
 # is being activated
 
-source $HOME/afvs_env/bin/activate
+#source $HOME/afvs_env/bin/activate
+source $HOME/miniforge3/etc/profile.d/conda.sh
+conda activate adaptiveflow_env
 
+export AWS_PROFILE=qai4biolab
+export AWS_SHARED_CREDENTIALS_FILE=/home/jsetiadi/.aws/credentials
+export AWS_CONFIG_FILE=/home/jsetiadi/.aws/config
 
 # Job Information -- generally nothing in this
 # section should be changed

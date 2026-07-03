@@ -1,4 +1,7 @@
 #!/bin/sh
+export AWS_PROFILE=qai4biolab
+export AWS_SHARED_CREDENTIALS_FILE=/home/jsetiadi/.aws/credentials
+export AWS_CONFIG_FILE=/home/jsetiadi/.aws/config
 
 #Checking the input arguments
 usage="Usage: afvs_postprocess_atg-prescreen.sh

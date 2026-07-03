@@ -25,29 +25,30 @@
 # ---------------------------------------------------------------------------
 
 # Update the BSUB section if needed for your particular LSF
-# installation. If a line starts with "##" (two #s) it will be 
+# installation. If a line starts with "##" (two #s) it will be
 # ignored
 
-
-#BSUB -J {{job_letter}}-{{workunit_id}}-{{subjob_id}}
-#BSUB -n {{lsf_cpus}}
-##BSUB -W 12:00
-##BSUB -M 800
-#BSUB -o {{batch_workunit_base}}/{{subjob_id}}.out
-#BSUB -e {{batch_workunit_base}}/{{subjob_id}}.err
+#BSUB -J {{job_letter}}-{{workunit_id}}[{{array_start}}-{{array_end}}]%{{lsf_array_job_throttle}}
 #BSUB -q {{lsf_queue}}
-{% if lsf_account %}#BSUB -P {{lsf_account}}{% endif %}
+#BSUB -n {{lsf_cpus}}
+#BSUB -R "span[hosts=1]"
+#BSUB -R "rusage[mem={{lsf_memory}}]"
+#BSUB -W {{lsf_walltime}}
+#BSUB -o {{batch_workunit_base}}/%J_%I.out
+#BSUB -e {{batch_workunit_base}}/%J_%I.err
 
-
-# If you are using a virtualenv, make sure the correct one
+# If you are using a virtualenv/conda env, make sure the correct one
 # is being activated
 
-source $(conda info --base)/etc/profile.d/conda.sh
 conda activate afvs_env
 
-# Ensure we run from the AFVS tools directory regardless of LSF working dir default
-cd "{{batch_workunit_base}}/../../../tools"
+export AWS_PROFILE=qai4biolab
+export AWS_SHARED_CREDENTIALS_FILE=/home/jsetiadi/.aws/credentials
+export AWS_CONFIG_FILE=/home/jsetiadi/.aws/config
 
+# LSF job array indices start at 1, but AFVS subjobs are numbered
+# starting at 0 -- shift down by one to match
+AFVS_SUBJOB_INDEX=$((LSB_JOBINDEX - 1))
 
 # Job Information -- generally nothing in this
 # section should be changed
@@ -55,7 +56,7 @@ cd "{{batch_workunit_base}}/../../../tools"
 
 export AFVS_WORKUNIT={{workunit_id}}
 export AFVS_JOB_STORAGE_MODE={{job_storage_mode}}
-export AFVS_WORKUNIT_SUBJOB={{subjob_id}}
+export AFVS_WORKUNIT_SUBJOB=${AFVS_SUBJOB_INDEX}
 export AFVS_TMP_PATH=/dev/shm
 export AFVS_CONFIG_JOB_TGZ={{job_tgz}}
 export AFVS_TOOLS_PATH=${PWD}/bin
@@ -63,6 +64,6 @@ export AFVS_VCPUS={{threads_to_use}}
 
 ##################################################################################
 
-date +%s > {{batch_workunit_base}}/{{subjob_id}}.start
+date +%s > {{batch_workunit_base}}/${AFVS_WORKUNIT_SUBJOB}.start
 ./templates/afvs_run.py
-date +%s > {{batch_workunit_base}}/{{subjob_id}}.end
+date +%s > {{batch_workunit_base}}/${AFVS_WORKUNIT_SUBJOB}.end
