@@ -217,8 +217,12 @@ def check_parameters(config):
             if(empty_value(config, 'bash_template')):
                 print("* 'bash_template' must be set if batchsystem is 'bash'")
                 error = 1
+        elif(config['batchsystem'] == "lsf"):
+            if(empty_value(config, 'lsf_template')):
+                print("* 'lsf_template' must be set if batchsystem is 'lsf'")
+                error = 1
         else:
-            print(f"* batchsystem '{config['batchsystem']}' is not supported. Only awsbatch and slurm are supported")
+            print(f"* batchsystem '{config['batchsystem']}' is not supported. Only awsbatch, slurm, bash, and lsf are supported")
 
 
     if(empty_value(config, 'ligand_library_format')):
