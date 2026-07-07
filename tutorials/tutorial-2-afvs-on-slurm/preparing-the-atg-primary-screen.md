@@ -29,3 +29,25 @@ Then we prepare the workflow in the same way as we did for the ATG Prescreen:
 
 The command ./afvs\_prepare\_workunits.py will print the total number of work units. Please remember this number, as it is needed in the next section.&#x20;
 
+## Optional: ML Tranche-Prioritization Classifier
+
+Instead of docking every ligand of every tranche-selected collection, you can optionally train a machine learning classifier on the ATG Prescreen's docking results and use it to keep, within each selected collection, only the ligands it predicts are worth docking. This can substantially reduce the number of ligands actually docked in the ATG Primary Screen.
+
+First, train the classifier on the postprocessed ATG Prescreen results. This is a one-time, host-side command that only takes seconds to run (no Slurm job needed), to be run in the `tools` folder of the ATG Prescreen (not the new Primary Screen folder created above):
+
+```
+./afvs_train_ml_classifier.py --scenario-name gk_ds1 --source slurm --model-out atg-ml-classifier.pt
+```
+
+Unlike the AWS/Athena postprocessing path, the Slurm path has no single combined "ranking.complete" file, so `--source slurm` reads the raw per-collection summary files directly (`../output-files/<docking scenario name>/csv/**/*.csv.gz`, the same files `afvs_postprocess_atg-prescreen.sh` itself reads).
+
+Then pass the trained model to `afvs_prepare_atg-primary-screen-folders.sh` as an additional argument, before creating the Primary Screen folders:
+
+```
+./afvs_prepare_atg-primary-screen-folders.sh screening_sizes:10000 replica_counts:1 qvina02 ml_classifier_model:atg-ml-classifier.pt
+```
+
+This scores every ligand of every tranche-selected collection (not just the sparse sample docked during the ATG Prescreen) and keeps only the ones predicted to have a binding probability greater than 0.5. This cutoff can be adjusted with an additional `ml_classifier_cutoff:<value>` argument. The new Primary Screen folder's `all.ctrl` is automatically configured to dock only the ML-selected ligands (listed in `tools/templates/atg-ml-selected-ligands.csv`) rather than the full tranche-selected todo file that is otherwise used.
+
+Training and applying the classifier both require PyTorch and RDKit installed on this host/login instance. Run `./afvs_train_ml_classifier.py --help` or `./afvs_apply_ml_classifier_atg-primaryscreen.py --help` for the full list of options.
+
