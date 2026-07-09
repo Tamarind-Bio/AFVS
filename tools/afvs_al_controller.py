@@ -155,6 +155,11 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     # guardrail-2 quality = a PROPER held-out Spearman: train a probe on a train split, evaluate on the
     # held-out split. (The earlier estimate evaluated the full-data model on a subset of its OWN training
     # points -- in-sample -- which overstates quality so QUALITY_LOW / explore rarely fired.)
+    # rho stays NaN only when the probe could NOT be measured (no scipy / holdout too small) -> "can't
+    # measure" -> proceed greedy. If the probe RAN but scipy returned NaN, that is NOT "unmeasurable": it
+    # means the probe's predictions (or the held-out scores) had zero variance, i.e. a degenerate/collapsed
+    # surrogate whose ranking is worthless. Treat that as the WORST quality (-1.0), not as trusted, so it
+    # trips explore + the QUALITY_LOW fallback instead of silently exploiting a useless model.
     rho = float("nan")
     if spearmanr is not None and len(ytr) >= 20:
         rng = np.random.RandomState(seed)
@@ -164,6 +169,8 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
         if len(tr) >= 10:
             probe, pmeta = train_on_X(Xtr[tr], ytr[tr], seed=seed)
             rho = spearmanr(predict_on_X(probe, pmeta, Xtr[hold]), ytr[hold]).correlation
+            if rho is None or np.isnan(rho):
+                rho = -1.0                                   # probe ran but degenerate -> worst quality
     if model_out:
         save_regressor(model, meta, model_out)
 
@@ -183,8 +190,8 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     # of giving up we dock a RANDOM (unbiased) batch, retrain, and re-check next round -- NOT full brute
     # force, always bounded by budget_total. Once Spearman recovers we switch to greedy exploitation. If
     # it stays low for max_explore_rounds consecutive rounds the target is effectively unlearnable from
-    # fingerprints, so we stop (QUALITY_LOW). NaN Spearman (no scipy / holdout too small) = can't measure
-    # -> proceed greedy.
+    # fingerprints, so we stop (QUALITY_LOW). NaN Spearman here means ONLY "unmeasurable" (no scipy /
+    # holdout too small) -> proceed greedy; a degenerate probe was already mapped to -1.0 above.
     trusted = np.isnan(rho) or rho >= min_spearman
     bad_streak = 0                              # consecutive low-quality rounds, most-recent first
     for h in reversed(history):
