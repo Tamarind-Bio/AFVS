@@ -347,6 +347,12 @@ def _cmd_round(args):
         patience=args.patience, epsilon_random=args.epsilon_random, min_spearman=args.min_spearman,
         seed=args.seed, history=history, model_out=st["model"], todo_out=args.out,
         attempted_ligands=attempted, max_explore_rounds=args.max_explore_rounds)
+    # Enrich the round entry run_round just appended with mode + terminal status so history.json is the
+    # single source of truth for the website progress panel (the run driver publishes it verbatim to
+    # the DDB ALProgress map). mode/status aren't known inside run_round at append time.
+    if history:
+        history[-1]["mode"] = info.get("mode", "-")
+        history[-1]["status"] = status
     json.dump(history, open(st["history"], "w"))
     print(f"STATUS={status} mode={info.get('mode', '-')} docked_ligands={info['docked_ligands']} "
           f"topk_mean={info['topk_mean']:.3f} spearman={info['spearman']:.3f} "
