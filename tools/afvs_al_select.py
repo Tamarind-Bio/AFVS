@@ -144,18 +144,22 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, epsilon_random
     """
     # coerce both sides to str: manifest ligand_id can be numeric (e.g. from a pre-built --collection-ligands
     # parquet) while the exclusion set is str, and a dtype mismatch would silently re-select docked ligands.
-    avail = manifest_pred[~manifest_pred.ligand_id.astype(str).isin({str(x) for x in docked_ligands})]
+    # reset_index so selection is POSITIONAL: a non-unique manifest index (a future manifest source, a concat)
+    # would make label-based `.loc[picked_idx]` fan out (one label -> many rows), silently over-selecting and
+    # blowing the docking budget. Positional row ids are unique by construction, so this can't over-select.
+    avail = manifest_pred[~manifest_pred.ligand_id.astype(str).isin({str(x) for x in docked_ligands})] \
+        .reset_index(drop=True)
     if avail.empty or budget_ligands <= 0:
         return avail.iloc[0:0]
     rng = np.random.RandomState(seed)
     n_random = min(len(avail), int(round(budget_ligands * epsilon_random)))
-    picked_idx = []
+    picked_pos = []
     if n_random > 0:
-        picked_idx = list(rng.choice(avail.index.to_numpy(), n_random, replace=False))
-    rest = avail.drop(index=picked_idx).sort_values("pred")
-    n_greedy = max(0, budget_ligands - len(picked_idx))
-    picked_idx += list(rest.index[:n_greedy])
-    return manifest_pred.loc[picked_idx]
+        picked_pos = list(rng.choice(avail.index.to_numpy(), n_random, replace=False))
+    rest = avail.drop(index=picked_pos).sort_values("pred")
+    n_greedy = max(0, budget_ligands - len(picked_pos))
+    picked_pos += list(rest.index[:n_greedy])
+    return avail.loc[picked_pos]
 
 
 def write_named_csv(selected, out_path):
