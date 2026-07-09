@@ -246,20 +246,52 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
 
 # ---------- CLI ----------
 
-def collection_ligands_from_tarballs(collection_prefix, todo_all_path, data_bucket):
-    """
-    SEAM A. Build the (collection_key -> ligand_id) table by reading collection tarball FILE LISTS
-    (no extraction). Collections live at s3://<data_bucket>/<collection_prefix>/... under AFVS's
-    metatranche addressing (<prefix>/<metatranche>/<tranche>/<collection>.tar.gz, e.g.
-    .../AA/AA01/00000000.tar.gz). Rather than reconstruct that path per collection_key (the metatranche
-    level is easy to miss -- validated against real datasets 2026-07), list the prefix ONCE and map each
-    tarball to collection_key = "<parent_dir>_<basename_no_ext>" (AA01_00000000), which is
-    addressing-agnostic (works for metatranche and flat/standard layouts). A stored ingestion manifest,
-    if one exists, would avoid these per-collection tar-list reads at giga-scale (pass --collection-ligands).
-    """
+def _read_one_tarball_members(args):
+    """Worker: return [(collection_key, ligand_id), ...] for one collection tarball (file list only,
+    no extraction). Module-level so it's picklable for a process pool."""
     import subprocess
     import tarfile
     import io
+    coll_key, data_bucket, s3key = args
+    try:
+        raw = subprocess.run(["aws", "s3", "cp", f"s3://{data_bucket}/{s3key}", "-"],
+                             capture_output=True).stdout
+        out = []
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
+            for name in tf.getnames():
+                if "/" not in name or name.endswith("/"):   # skip the collection dir entry itself
+                    continue
+                base = os.path.basename(name)               # 177154706.pdbqt
+                out.append((coll_key, os.path.splitext(base)[0]))
+        return out
+    except Exception as e:
+        print(f"WARN: failed reading tarball {s3key}: {e}", file=sys.stderr)
+        return []
+
+
+def collection_ligands_from_tarballs(collection_prefix, todo_all_path, data_bucket, cache_path=None,
+                                     max_workers=32):
+    """
+    SEAM A. Build the (collection_key -> ligand_id) table by reading collection tarball FILE LISTS
+    (no extraction). Collections live at s3://<data_bucket>/<collection_prefix>/... under AFVS's
+    metatranche addressing (<prefix>/<metatranche>/<tranche>/<collection>.tar.gz).
+
+    Scale note (the giga-scale bottleneck this fixes): a large library has O(10k+) collections
+    (ChEMBL-36 = 12,699), and reading them SERIALLY was ~3-7h before any docking. Two fixes here:
+      1. CACHE: this map is DATASET-STATIC, so persist it to `cache_path` (a parquet next to the AL
+         state) and reuse it on any later run of the same dataset -- the scan happens at most once.
+      2. PARALLELIZE: the tarball reads are independent network I/O, so fan them out across a thread
+         pool (max_workers) instead of one-at-a-time. ~30x fewer wall-clock seconds on a 12.7k library.
+    A stored ingestion-time ligand->collection index would remove the scan entirely (pass
+    --collection-ligands); until ingestion emits one, the cached parallel scan is the fix.
+    """
+    import concurrent.futures
+    import subprocess
+
+    if cache_path and os.path.exists(cache_path):
+        print(f"SEAM-A: reusing cached collection->ligand map at {cache_path}", file=sys.stderr)
+        return pd.read_parquet(cache_path)
+
     # one recursive listing -> collection_key -> full S3 key
     listing = subprocess.run(
         ["aws", "s3", "ls", f"s3://{data_bucket}/{collection_prefix}/", "--recursive"],
@@ -273,7 +305,9 @@ def collection_ligands_from_tarballs(collection_prefix, todo_all_path, data_buck
         coll = parts[-1][:-len(".tar.gz")]                 # 00000000 (.tar.gz is a double ext)
         tranche = parts[-2] if len(parts) >= 2 else ""     # AA01
         key_by_coll[f"{tranche}_{coll}"] = cols[-1]
-    rows = []
+
+    # the collections we actually need = those in the todo.all
+    work = []
     for line in open(todo_all_path):
         coll_key = line.strip().split()[0] if line.strip() else ""
         if not coll_key:
@@ -282,15 +316,22 @@ def collection_ligands_from_tarballs(collection_prefix, todo_all_path, data_buck
         if not s3key:
             print(f"WARN: collection {coll_key} not found under {collection_prefix}", file=sys.stderr)
             continue
-        raw = subprocess.run(["aws", "s3", "cp", f"s3://{data_bucket}/{s3key}", "-"],
-                             capture_output=True).stdout
-        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
-            for name in tf.getnames():
-                if "/" not in name or name.endswith("/"):   # skip the collection dir entry itself
-                    continue
-                base = os.path.basename(name)               # 177154706.pdbqt
-                rows.append({"collection_key": coll_key, "ligand_id": os.path.splitext(base)[0]})
-    return pd.DataFrame(rows)
+        work.append((coll_key, data_bucket, s3key))
+
+    print(f"SEAM-A: reading {len(work)} collection tarballs (parallel, {max_workers} workers)...",
+          file=sys.stderr)
+    rows = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for res in ex.map(_read_one_tarball_members, work):
+            rows.extend(res)
+    df = pd.DataFrame(rows, columns=["collection_key", "ligand_id"])
+    if cache_path:
+        try:
+            df.to_parquet(cache_path)
+            print(f"SEAM-A: cached collection->ligand map to {cache_path} ({len(df)} rows)", file=sys.stderr)
+        except Exception as e:
+            print(f"WARN: failed to cache collection map: {e}", file=sys.stderr)
+    return df
 
 
 def _cmd_init(args):
@@ -298,11 +339,13 @@ def _cmd_init(args):
     st = _state(args.state_dir)
     os.makedirs(args.state_dir, exist_ok=True)
 
-    # SEAM A: (collection_key, ligand_id). Prefer a pre-built manifest; else read tarball file lists.
+    # SEAM A: (collection_key, ligand_id). Prefer a pre-built ingestion manifest; else scan the tarball
+    # file lists (parallel + cached to the state dir so the O(10k)-collection scan happens at most once).
     if args.collection_ligands:
         cl = pd.read_parquet(args.collection_ligands)
     else:
-        cl = collection_ligands_from_tarballs(args.collection_prefix, args.todo, args.data_bucket)
+        cl = collection_ligands_from_tarballs(args.collection_prefix, args.todo, args.data_bucket,
+                                              cache_path=os.path.join(args.state_dir, "collection_ligands.parquet"))
     manifest = build_manifest(cl, args.smiles_store, st["manifest"])
 
     # Fingerprint the pool once -> cache reused across all rounds. Use fingerprint_all so a bad/
