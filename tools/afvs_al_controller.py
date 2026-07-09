@@ -287,7 +287,7 @@ def collection_ligands_from_tarballs(collection_prefix, todo_all_path, data_buck
 
 
 def _cmd_init(args):
-    from ml_regressor import smi_to_fingerprint
+    from ml_regressor import fingerprint_all
     st = _state(args.state_dir)
     os.makedirs(args.state_dir, exist_ok=True)
 
@@ -298,13 +298,15 @@ def _cmd_init(args):
         cl = collection_ligands_from_tarballs(args.collection_prefix, args.todo, args.data_bucket)
     manifest = build_manifest(cl, args.smiles_store, st["manifest"])
 
-    # fingerprint the pool once -> cache reused across all rounds
-    smiles = manifest.smiles.astype(str).tolist()
-    X = np.zeros((len(smiles), 1024), dtype=np.float32)
-    for i, s in enumerate(smiles):
-        fp = smi_to_fingerprint(s)
-        if fp is not None:
-            X[i] = fp
+    # Fingerprint the pool once -> cache reused across all rounds. Use fingerprint_all so a bad/
+    # unparseable SMILES is DROPPED from the cache (not stored as an all-zero row): the cache's
+    # smi_to_row is built from these `smiles`, so an unlisted SMILES resolves to row -1 at select
+    # time and sinks to +inf (unscoreable), matching the fingerprint_all fallback path. Storing a
+    # zero-vector row instead would silently score a bad ligand and could waste budget / skew a
+    # collection's predicted-best. Dropping bad rows also shrinks the cached matrix.
+    all_smiles = manifest.smiles.astype(str).tolist()
+    kept, X = fingerprint_all(all_smiles)
+    smiles = [all_smiles[i] for i in kept]
     np.savez(st["fp"], smiles=np.array(smiles, dtype=object), X=X)
 
     # seed: a random subset of LIGANDS, written as an AFVS csv_collection_key_ligand list (named mode).
