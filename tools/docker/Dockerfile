@@ -23,6 +23,12 @@ RUN yum update -y && yum -y install python3 wget gcc tar make gcc-c++ zlib-devel
 RUN yum install -y libicu libicu-devel
 RUN pip3 install boto3 pandas pyarrow
 
+# Dependencies for the optional ML tranche-prioritization classifier (tools/templates/ml_classifier.py).
+# CPU-only torch wheel: this Dockerfile provisions no GPU AWS Batch compute environments, and the
+# default PyPI torch wheel would pull in unneeded CUDA runtime bloat.
+RUN pip3 install torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip3 install rdkit
+
 ADD ./bin /opt/af/tools/bin
 ADD ./templates/*.py /opt/af/tools/templates/
 ADD ./templates/*.sh /opt/af/tools/templates/
