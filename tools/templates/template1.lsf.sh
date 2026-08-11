@@ -20,39 +20,35 @@
 
 # ---------------------------------------------------------------------------
 #
-# Description: Slurm job file.
-#
-# Revision history:
-# 2022-07-21  Original version
+# Description: LSF job file.
 #
 # ---------------------------------------------------------------------------
 
-# Update the SBATCH section if needed for your particular Slurm
-# installation. If a line starts with "##" (two #s) it will be 
+# Update the BSUB section if needed for your particular LSF
+# installation. If a line starts with "##" (two #s) it will be
 # ignored
 
-#SBATCH --job-name={{job_letter}}-{{workunit_id}}
-#SBATCH --array {{array_start}}-{{array_end}}%{{slurm_array_job_throttle}}
-##SBATCH --time=00-12:00:00
-##SBATCH --mem-per-cpu=800M
-##SBATCH --nodes=1
-#SBATCH --cpus-per-task={{slurm_cpus}}
-##SBATCH --partition={{slurm_partition}}
-#SBATCH --output={{batch_workunit_base}}/%A_%a.out
-#SBATCH --error={{batch_workunit_base}}/%A_%a.err
-#SBATCH --account={{slurm_account}}
+#BSUB -J {{job_letter}}-{{workunit_id}}[{{array_start}}-{{array_end}}]%{{lsf_array_job_throttle}}
+#BSUB -q {{lsf_queue}}
+#BSUB -n {{lsf_cpus}}
+#BSUB -R "span[hosts=1]"
+#BSUB -R "rusage[mem={{lsf_memory}}]"
+#BSUB -W {{lsf_walltime}}
+#BSUB -o {{batch_workunit_base}}/%J_%I.out
+#BSUB -e {{batch_workunit_base}}/%J_%I.err
 
-
-# If you are using a virtualenv, make sure the correct one 
+# If you are using a virtualenv/conda env, make sure the correct one
 # is being activated
 
-#source $HOME/afvs_env/bin/activate
-source $HOME/miniforge3/etc/profile.d/conda.sh
-conda activate adaptiveflow_env
+conda activate afvs_env
 
 export AWS_PROFILE=qai4biolab
 export AWS_SHARED_CREDENTIALS_FILE=/home/jsetiadi/.aws/credentials
 export AWS_CONFIG_FILE=/home/jsetiadi/.aws/config
+
+# LSF job array indices start at 1, but AFVS subjobs are numbered
+# starting at 0 -- shift down by one to match
+AFVS_SUBJOB_INDEX=$((LSB_JOBINDEX - 1))
 
 # Job Information -- generally nothing in this
 # section should be changed
@@ -60,7 +56,7 @@ export AWS_CONFIG_FILE=/home/jsetiadi/.aws/config
 
 export AFVS_WORKUNIT={{workunit_id}}
 export AFVS_JOB_STORAGE_MODE={{job_storage_mode}}
-export AFVS_WORKUNIT_SUBJOB=$SLURM_ARRAY_TASK_ID
+export AFVS_WORKUNIT_SUBJOB=${AFVS_SUBJOB_INDEX}
 export AFVS_TMP_PATH=/dev/shm
 export AFVS_CONFIG_JOB_TGZ={{job_tgz}}
 export AFVS_TOOLS_PATH=${PWD}/bin
@@ -71,6 +67,3 @@ export AFVS_VCPUS={{threads_to_use}}
 date +%s > {{batch_workunit_base}}/${AFVS_WORKUNIT_SUBJOB}.start
 ./templates/afvs_run.py
 date +%s > {{batch_workunit_base}}/${AFVS_WORKUNIT_SUBJOB}.end
-
-
-

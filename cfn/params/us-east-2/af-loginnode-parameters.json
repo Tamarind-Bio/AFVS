@@ -1,7 +1,7 @@
 [
   {
     "ParameterKey": "ProjectName",
-    "ParameterValue": "AdaptiveFlow-eu-west-1"
+    "ParameterValue": "AdaptiveFlow-us-east-2"
   },
   {
     "ParameterKey": "MainNodeInstance",
@@ -9,14 +9,14 @@
   },
   {
     "ParameterKey": "KeyName",
-    "ParameterValue": "yourEC2keypairname"
+    "ParameterValue": "useast2"
   },
   {
     "ParameterKey": "S3BucketName",
-    "ParameterValue": "YourS3BucketName"
+    "ParameterValue": "virtual-screening-afvs"
   },
   {
     "ParameterKey": "VPCStackParameter",
-    "ParameterValue": "vf-vpc"
+    "ParameterValue": "af-vpc"
   }
 ]

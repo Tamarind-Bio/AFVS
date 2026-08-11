@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 #Checking the input arguments
 usage="Usage: afvs_prepare_atg-primary-screen-todo-files.sh -m <tranche scoring method> [-r <tranche_filter_regex>] -s <size 1>:<size 2>:...
@@ -36,9 +36,7 @@ fi
 
 # Initial setup
 cd ../output-files
-tranche_scoring_mode=$1
 echo "Tranche scoring mode: ${tranche_scoring_mode}"
-tranche_filter_regex=$2
 
 # Getting the score averages for each tranche
 if [ "${tranche_scoring_mode}" == "dimension_averaging" ]; then

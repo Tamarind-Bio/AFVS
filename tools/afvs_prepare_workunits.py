@@ -96,7 +96,7 @@ def publish_workunit(ctx, index, workunit_subjobs):
     # Generate the tarball
 
     out = tarfile.open(f'{temp_dir_tar.name}/{index}.tar.gz', mode='x:gz')
-    out.add(temp_dir.name, arcname="vf_input")
+    out.add(temp_dir.name, arcname="af_input")
     out.close()
 
     if(ctx['config']['job_storage_mode'] == "s3"):
@@ -334,6 +334,8 @@ def process(ctx):
         max_array_job_size = int(config['slurm_array_job_size'])
     elif(config['batchsystem'] == "bash"):
         max_array_job_size = int(config['bash_array_job_size'])
+    elif(config['batchsystem'] == "lsf"):
+        max_array_job_size = int(config['lsf_array_job_size'])
 
     for collection_key, collection_obj in collections.items():
 
