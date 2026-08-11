@@ -13,7 +13,7 @@ controller writes, then invokes the next `round`). Two subcommands:
          the next batch of collections (afvs_al_select), write the next todo.all, and report whether
          to CONTINUE / CONVERGED / BUDGET. Called once per round by the run driver.
 
-Design decisions (validated in tasks/active-learning/phase1-validation):
+Design decisions (validated against exhaustively-docked ground truth):
   - regress-and-rank surrogate (ml_regressor), retrained from scratch each round (online was worse).
   - greedy acquisition by predicted best-in-collection; optional epsilon-random exploration.
   - convergence: stop when the rolling mean of the top-K docked score stops improving, or the docking

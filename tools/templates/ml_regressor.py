@@ -13,7 +13,7 @@ over early can be selected in a later round if the improved model ranks it up.
 Score convention: more negative = better binder (kcal/mol). Targets are standardized for stable
 training and inverted on predict, so predictions come back in the original score units.
 
-Validated (Phase 1, tasks/active-learning/phase1-validation): 5-round recall of the true top-1% is
+Validated against exhaustively-docked ground truth: 5-round recall of the true top-1% is
 ~0.75-0.96 at 10% docked across Enamine (Vina), ChEMBL (our qvina02), and 58 dockstring targets;
 the held-out Spearman gate reliably flags low-recall targets (guardrail 2).
 
