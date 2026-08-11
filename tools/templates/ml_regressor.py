@@ -31,7 +31,7 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, rdFingerprintGenerator
 from rdkit import RDLogger
 
 RDLogger.DisableLog("rdApp.*")
@@ -51,28 +51,61 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def smi_to_fingerprint(smi, radius=2, n_bits=1024):
-    """SMILES -> Morgan fingerprint (radius 2, 1024 bits), or None if unparseable/empty."""
+# Which fingerprint the surrogate featurizes with. Changing this changes what every model
+# trained afterwards means, which is why it is recorded in the checkpoint and checked on load.
+#
+# "atompair" is what MolPAL used for BOTH its RF and its NN. A controlled ablation on the
+# archived recall harness (our own network, everything else held fixed, three seeds, with a
+# shuffled-label negative control) moved recall of the true top-1% at 6% docked from 0.581 to
+# 0.723 by changing this alone. Bit width contributed nothing (-0.017), so 1024 stays.
+#
+# Caveat kept deliberately visible: that ablation is ONE target (4UNN), a retrospective lookup
+# against published AutoDock Vina scores. Prior work established that recall transfers from Vina
+# to our qvina02 (0.75 vs 0.77), but the atom-pair win itself has not been re-measured on our
+# engine. The AL loop retrains every round behind a held-out Spearman gate, so a featurizer that
+# does not help shows up as low Spearman and trips explore-then-exploit rather than silently
+# degrading a screen.
+DEFAULT_FP_TYPE = "morgan"
+
+_VALID_FP_TYPES = ("morgan", "atompair")
+
+
+def smi_to_fingerprint(smi, radius=2, n_bits=1024, fp_type=None):
+    """SMILES -> binary fingerprint bit vector, or None if unparseable/empty.
+
+    fp_type "morgan" (radius 2) or "atompair". Atom-pair encodes topological distance between
+    atom-type pairs rather than circular environments, so it separates actives that share a
+    scaffold but differ in substitution pattern, which is where the recall difference shows up.
+    """
     if not smi or smi in ("N/A", "None", "nan"):
         return None
     mol = Chem.MolFromSmiles(smi)
     if mol is None:
         return None
-    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+    ftype = fp_type or DEFAULT_FP_TYPE
+    if ftype == "atompair":
+        # rdFingerprintGenerator is the non-deprecated path and returns the same ExplicitBitVect
+        # the Morgan call does, so the GetOnBits loop below is unchanged.
+        gen = rdFingerprintGenerator.GetAtomPairGenerator(fpSize=n_bits)
+        fp = gen.GetFingerprint(mol)
+    elif ftype == "morgan":
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+    else:
+        raise ValueError(f"unknown fp_type {ftype!r}; expected one of {_VALID_FP_TYPES}")
     arr = np.zeros((n_bits,), dtype=np.float32)
     for bit in fp.GetOnBits():
         arr[bit] = 1.0
     return arr
 
 
-def fingerprint_all(smiles_list, radius=2, n_bits=1024):
+def fingerprint_all(smiles_list, radius=2, n_bits=1024, fp_type=None):
     """
     Fingerprint a list of SMILES, dropping any that fail to parse.
     Returns (kept_indices, X) where kept_indices maps X rows back to smiles_list positions.
     """
     kept_indices, fps = [], []
     for i, smi in enumerate(smiles_list):
-        fp = smi_to_fingerprint(smi, radius=radius, n_bits=n_bits)
+        fp = smi_to_fingerprint(smi, radius=radius, n_bits=n_bits, fp_type=fp_type)
         if fp is not None:
             kept_indices.append(i)
             fps.append(fp)
@@ -157,9 +190,14 @@ def train_on_X(X, y, val_fraction=0.10, batch_size=256, max_epochs=100, patience
 
     model.load_state_dict(best_state)
     model.eval()
+    # fp_type is what a later load checks against. train_on_X never sees the featurizer, so it
+    # records the module default; train_regressor overrides both when it featurized explicitly.
+    # (fp_radius was previously a hardcoded 2 here regardless of what produced X.)
     meta = {"input_dim": X.shape[1], "y_mean": y_mean, "y_std": y_std,
             "best_epoch": best_epoch, "best_val_loss": best_val,
-            "fp_radius": 2, "fp_nbits": X.shape[1]}
+            "fp_type": DEFAULT_FP_TYPE, "fp_nbits": X.shape[1]}
+    if DEFAULT_FP_TYPE == "morgan":
+        meta["fp_radius"] = 2
     return model, meta
 
 
@@ -180,18 +218,26 @@ def predict_on_X(model, meta, X, device=None, chunk=200_000):
 
 # ---- SMILES-level wrappers ----
 
-def train_regressor(smiles_list, scores, fp_radius=2, fp_nbits=1024, **kwargs):
+def train_regressor(smiles_list, scores, fp_radius=2, fp_nbits=1024, fp_type=None, **kwargs):
     scores = np.asarray(scores, dtype=np.float32)
-    kept, X = fingerprint_all(smiles_list, radius=fp_radius, n_bits=fp_nbits)
+    ftype = fp_type or DEFAULT_FP_TYPE
+    kept, X = fingerprint_all(smiles_list, radius=fp_radius, n_bits=fp_nbits, fp_type=ftype)
     if X.shape[0] == 0:
         raise ValueError("No parseable SMILES in training data.")
     model, meta = train_on_X(X, scores[kept], **kwargs)
-    meta.update({"fp_radius": fp_radius, "fp_nbits": fp_nbits})
+    meta.update({"fp_type": ftype, "fp_nbits": fp_nbits})
+    # radius is meaningless for atom-pair, so do not carry a misleading value.
+    if ftype == "morgan":
+        meta["fp_radius"] = fp_radius
+    else:
+        meta.pop("fp_radius", None)
     return model, meta
 
 
 def predict_scores(model, meta, smiles_list, device=None):
-    kept, X = fingerprint_all(smiles_list, radius=meta.get("fp_radius", 2), n_bits=meta.get("fp_nbits", 1024))
+    kept, X = fingerprint_all(smiles_list, radius=meta.get("fp_radius", 2),
+                              n_bits=meta.get("fp_nbits", 1024),
+                              fp_type=meta.get("fp_type", "morgan"))
     out = np.full(len(smiles_list), np.nan, dtype=np.float32)
     if X.shape[0] > 0:
         pred = predict_on_X(model, meta, X, device=device)
@@ -221,4 +267,16 @@ def load_regressor(model_path, device=None):
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
     meta = {k: v for k, v in ckpt.items() if k != "state_dict"}
+    # A checkpoint trained on one fingerprint and used with another does NOT raise on its own:
+    # both are the same width, so load_state_dict cannot object, predictions come back finite and
+    # inside the plausible kcal/mol band, and the ranking is INVERTED (measured Spearman +0.993
+    # to -0.449). An acquisition ranked on that preferentially docks the worst ligands. A missing
+    # fp_type means the checkpoint predates this field, i.e. it was written by Morgan-only code.
+    ckpt_fp = meta.get("fp_type", "morgan")
+    if ckpt_fp != DEFAULT_FP_TYPE:
+        raise ValueError(
+            f"{model_path} was trained with fp_type={ckpt_fp!r} but this code featurizes with "
+            f"{DEFAULT_FP_TYPE!r}. Predictions would be silently mis-ranked, not merely noisy. "
+            f"Retrain the surrogate, or pin DEFAULT_FP_TYPE to {ckpt_fp!r}."
+        )
     return model, meta
