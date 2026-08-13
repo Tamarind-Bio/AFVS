@@ -162,6 +162,74 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, epsilon_random
     return avail.loc[picked_pos]
 
 
+def env_setting(name):
+    """
+    Read an optional VS setting from the environment, tolerating how it actually arrives.
+
+    get_inputs.virtual_screening() writes VS settings straight to os.environ and the docking
+    subprocess inherits them, so a website setting reaches this process without any shell edit.
+    Two arrival quirks make a bare `os.environ.get(name)` wrong:
+      - an UNSET optional Sequence field is exported as the literal string "None", because
+        export_vars.build_export_line str()s the value unconditionally, so `if v:` is TRUE for a
+        field nobody set;
+      - a JSON bool arrives capitalized ("True"/"False").
+    Absent, empty, "None" and "null" therefore all mean absent.
+    """
+    v = (os.environ.get(name) or "").strip()
+    return "" if v.lower() in ("", "none", "null") else v
+
+
+def select_ligands_molpal(manifest_pred, docked_ligands, budget_ligands, metric="greedy",
+                          explore=False, seed=42):
+    """
+    Selection step backed by MolPAL's own Acquirer (vendored at tools/vendor/molpal).
+
+    Behaviour-equivalent to select_ligands at metric="greedy": MolPAL's greedy with epsilon=0
+    returns exactly the top-k unexplored by score, element for element. Its value over our
+    selector is the uncertainty-aware metrics (ucb / ei / pi / ts), which only differ once the
+    surrogate supplies real variances; with y_vars all-zero every metric degenerates to greedy.
+
+    Three adaptations, each guarding a failure that would otherwise be silent:
+      - SIGN. `pred` is ascending-is-better (most negative = best binder) and MolPAL MAXIMIZES,
+        so we pass -pred and never the raw column.
+      - EXPLORED IS A MAPPING. acquire_batch does `ys = list(explored.values())`, so a set raises
+        on a non-empty value and, worse, passes SILENTLY when empty: a set-typed caller works in
+        round 1 and dies in round 2. We always pass a dict.
+      - FAILED LIGANDS COUNT AS EXPLORED. `docked_ligands` is the ATTEMPTED set (valid + failed),
+        and every member is mapped to NaN rather than omitted, so a known-failed dock is not
+        re-acquired every round at the budget's expense. NaN is correct here because at this seam
+        we hold predictions, not the true scores of what was already docked.
+
+    The explore round passes metric="random" rather than mapping our eff_epsilon onto MolPAL's
+    `epsilon`: MolPAL draws its epsilon indices over the WHOLE pool including explored ligands, so
+    an epsilon of 1.0 does not mean what eff_epsilon=1.0 means here.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+    from molpal.acquirer import Acquirer  # noqa: E402  (vendored; see tools/vendor/molpal)
+
+    # Same dtype + positional discipline as select_ligands: coerce both sides to str so a numeric
+    # manifest ligand_id cannot silently re-select a docked ligand, and reset_index so selection is
+    # positional and a non-unique manifest index cannot fan out into an over-selection.
+    avail = manifest_pred.reset_index(drop=True)
+    if avail.empty or budget_ligands <= 0:
+        return avail.iloc[0:0]
+
+    xs = [str(x) for x in avail.ligand_id.to_numpy()]
+    y_means = -avail.pred.to_numpy(dtype=float)          # MolPAL maximizes; pred is lower-is-better
+    y_vars = np.zeros(len(xs), dtype=float)
+    explored = {str(x): float("nan") for x in docked_ligands}
+
+    acq = Acquirer(size=len(xs), init_size=budget_ligands, batch_sizes=[budget_ligands],
+                   metric=("random" if explore else metric), epsilon=0.0, seed=seed, verbose=0)
+    picked = acq.acquire_batch(xs=xs, y_means=y_means, y_vars=y_vars, explored=explored, t=1)
+
+    pos_of = {}
+    for i, lid in enumerate(xs):
+        pos_of.setdefault(lid, i)
+    picked_pos = [pos_of[p] for p in picked if p in pos_of]
+    return avail.loc[picked_pos]
+
+
 def write_named_csv(selected, out_path):
     """
     Emit an AFVS `csv_collection_key_ligand` collection list for the selected ligands: header

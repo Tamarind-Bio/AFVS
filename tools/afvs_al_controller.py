@@ -41,7 +41,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tem
 from ml_regressor import (fingerprint_all, train_on_X, predict_on_X, save_regressor,  # noqa: E402
                           load_regressor)
 from afvs_al_select import (per_collection_scores, select_collections, write_todo,  # noqa: E402
-                            predict_ligand_scores, select_ligands, write_named_csv)
+                            predict_ligand_scores, select_ligands, write_named_csv,
+                            select_ligands_molpal, env_setting)
 
 try:
     from scipy.stats import spearmanr
@@ -228,7 +229,17 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
         # PRIMARY path: rank individual ligands, emit an AFVS csv_collection_key_ligand list
         # (named mode). Recall 0.75 vs 0.14 for collection-granular on real qvina02 data.
         mp = predict_ligand_scores(model, meta, manifest, fp_cache=fp_cache)
-        selected = select_ligands(mp, exclude, this_round, eff_epsilon, seed)
+        # MolPAL acquisition is OPT-IN and default OFF: with alAcquirer unset this is byte-for-byte
+        # the previous call. Set it to a MolPAL metric name (greedy / ucb / ei / pi / ts / random)
+        # to route selection through the vendored molpal.acquirer instead. greedy is equivalent to
+        # select_ligands by construction, so the flag is safe to flip on a live screen; the other
+        # metrics only diverge once the surrogate supplies real variances.
+        acquirer = env_setting("alAcquirer")
+        if acquirer:
+            selected = select_ligands_molpal(mp, exclude, this_round, metric=acquirer,
+                                             explore=(eff_epsilon >= 1.0), seed=seed)
+        else:
+            selected = select_ligands(mp, exclude, this_round, eff_epsilon, seed)
         if not len(selected):
             return "EXHAUSTED", [], info          # pool fully attempted -> stop (don't re-dock a stale wave)
         if todo_out:
