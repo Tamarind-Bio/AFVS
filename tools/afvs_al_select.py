@@ -136,32 +136,6 @@ def predict_ligand_scores(model, meta, manifest, fp_cache=None):
     return df
 
 
-def select_ligands(manifest_pred, docked_ligands, budget_ligands, epsilon_random=0.05, seed=42):
-    """
-    Rank un-docked ligands by predicted score (ascending = best binder first), take the top
-    `budget_ligands` (with an optional epsilon-random exploration fraction). Returns the selected
-    sub-DataFrame (collection_key, ligand_id, smiles, pred).
-    """
-    # coerce both sides to str: manifest ligand_id can be numeric (e.g. from a pre-built --collection-ligands
-    # parquet) while the exclusion set is str, and a dtype mismatch would silently re-select docked ligands.
-    # reset_index so selection is POSITIONAL: a non-unique manifest index (a future manifest source, a concat)
-    # would make label-based `.loc[picked_idx]` fan out (one label -> many rows), silently over-selecting and
-    # blowing the docking budget. Positional row ids are unique by construction, so this can't over-select.
-    avail = manifest_pred[~manifest_pred.ligand_id.astype(str).isin({str(x) for x in docked_ligands})] \
-        .reset_index(drop=True)
-    if avail.empty or budget_ligands <= 0:
-        return avail.iloc[0:0]
-    rng = np.random.RandomState(seed)
-    n_random = min(len(avail), int(round(budget_ligands * epsilon_random)))
-    picked_pos = []
-    if n_random > 0:
-        picked_pos = list(rng.choice(avail.index.to_numpy(), n_random, replace=False))
-    rest = avail.drop(index=picked_pos).sort_values("pred")
-    n_greedy = max(0, budget_ligands - len(picked_pos))
-    picked_pos += list(rest.index[:n_greedy])
-    return avail.loc[picked_pos]
-
-
 def env_setting(name):
     """
     Read an optional VS setting from the environment, tolerating how it actually arrives.
@@ -179,15 +153,22 @@ def env_setting(name):
     return "" if v.lower() in ("", "none", "null") else v
 
 
-def select_ligands_molpal(manifest_pred, docked_ligands, budget_ligands, metric="greedy",
-                          explore=False, seed=42):
+def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy",
+                   explore=False, seed=42):
     """
-    Selection step backed by MolPAL's own Acquirer (vendored at tools/vendor/molpal).
+    Ligand acquisition, backed by MolPAL's own Acquirer (vendored at tools/vendor/molpal).
 
-    Behaviour-equivalent to select_ligands at metric="greedy": MolPAL's greedy with epsilon=0
-    returns exactly the top-k unexplored by score, element for element. Its value over our
-    selector is the uncertainty-aware metrics (ucb / ei / pi / ts), which only differ once the
-    surrogate supplies real variances; with y_vars all-zero every metric degenerates to greedy.
+    This is the ONLY ligand selector. The previous hand-rolled greedy-plus-epsilon selector was
+    removed rather than kept behind a flag: MolPAL's greedy at epsilon=0 returns exactly the same
+    top-k unexplored by score, element for element, so there was nothing the old one did that this
+    does not, and carrying two selectors meant two things to keep correct.
+
+    Defaults are MolPAL's own: metric="greedy", epsilon=0.0 (Acquirer.__init__). Note the
+    uncertainty-aware metrics (ucb / ei / pi / ts) are INERT on the current surrogate, which emits
+    point predictions with no variance: at y_vars all-zero they return byte-identical batches to
+    greedy, and pi degenerates to ranking by ligand-id string. They become meaningful only behind a
+    variance-providing surrogate (MolPAL's GP or RF), which is why the website exposes greedy and
+    random and not the full metric list.
 
     Three adaptations, each guarding a failure that would otherwise be silent:
       - SIGN. `pred` is ascending-is-better (most negative = best binder) and MolPAL MAXIMIZES,

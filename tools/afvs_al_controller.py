@@ -15,7 +15,8 @@ controller writes, then invokes the next `round`). Two subcommands:
 
 Design decisions (validated against exhaustively-docked ground truth):
   - regress-and-rank surrogate (ml_regressor), retrained from scratch each round (online was worse).
-  - greedy acquisition by predicted best-in-collection; optional epsilon-random exploration.
+  - acquisition is MolPAL's (vendored molpal.acquirer), at MolPAL's own defaults: greedy,
+    epsilon 0. The explore round uses MolPAL's `random` metric.
   - convergence: stop when the rolling mean of the top-K docked score stops improving, or the docking
     budget is spent, whichever first.
   - guardrail 2: after the seed round, if the held-out surrogate Spearman is below --min-spearman,
@@ -41,8 +42,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tem
 from ml_regressor import (fingerprint_all, train_on_X, predict_on_X, save_regressor,  # noqa: E402
                           load_regressor)
 from afvs_al_select import (per_collection_scores, select_collections, write_todo,  # noqa: E402
-                            predict_ligand_scores, select_ligands, write_named_csv,
-                            select_ligands_molpal, env_setting)
+                            predict_ligand_scores, select_ligands, write_named_csv, env_setting)
 
 try:
     from scipy.stats import spearmanr
@@ -114,7 +114,7 @@ def load_docked_scores(scores_glob):
 # ---------- round logic (testable) ----------
 
 def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac=0.001,
-              patience=3, conv_eps=0.01, epsilon_random=0.05, min_spearman=0.30, seed=42,
+              patience=3, conv_eps=0.01, epsilon_random=0.0, min_spearman=0.30, seed=42,
               history=None, model_out=None, todo_out=None, granularity="molecule",
               attempted_ligands=None, max_explore_rounds=3):
     """
@@ -213,13 +213,13 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     if not trusted:
         if bad_streak >= max_explore_rounds:
             return "QUALITY_LOW", [], info       # surrogate never became reliable -> stop early
-        eff_epsilon = 1.0                        # all-random exploration this round
+        explore = True                           # surrogate not yet trustworthy: sample randomly
     else:
         if converged:
             return "CONVERGED", [], info
-        eff_epsilon = epsilon_random             # greedy + epsilon exploration
+        explore = False
 
-    # acquire the next batch (random when exploring, greedy+epsilon when exploiting)
+    # acquire the next batch (MolPAL `random` when exploring, MolPAL `greedy` when exploiting)
     remaining = budget_total - n_attempted
     this_round = min(per_round, remaining)
     # exclude ALL attempted ligands (valid + failed) so a known-failed dock isn't re-selected.
@@ -229,17 +229,12 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
         # PRIMARY path: rank individual ligands, emit an AFVS csv_collection_key_ligand list
         # (named mode). Recall 0.75 vs 0.14 for collection-granular on real qvina02 data.
         mp = predict_ligand_scores(model, meta, manifest, fp_cache=fp_cache)
-        # MolPAL acquisition is OPT-IN and default OFF: with alAcquirer unset this is byte-for-byte
-        # the previous call. Set it to a MolPAL metric name (greedy / ucb / ei / pi / ts / random)
-        # to route selection through the vendored molpal.acquirer instead. greedy is equivalent to
-        # select_ligands by construction, so the flag is safe to flip on a live screen; the other
-        # metrics only diverge once the surrogate supplies real variances.
-        acquirer = env_setting("alAcquirer")
-        if acquirer:
-            selected = select_ligands_molpal(mp, exclude, this_round, metric=acquirer,
-                                             explore=(eff_epsilon >= 1.0), seed=seed)
-        else:
-            selected = select_ligands(mp, exclude, this_round, eff_epsilon, seed)
+        # Acquisition is MolPAL's, always. alAcquirer only picks WHICH MolPAL metric; unset means
+        # MolPAL's own default, greedy. The explore round is MolPAL's `random` metric rather than
+        # its `epsilon`, which draws over the whole pool including already-explored ligands.
+        selected = select_ligands(mp, exclude, this_round,
+                                  metric=(env_setting("alAcquirer") or "greedy"),
+                                  explore=explore, seed=seed)
         if not len(selected):
             return "EXHAUSTED", [], info          # pool fully attempted -> stop (don't re-dock a stale wave)
         if todo_out:
@@ -247,7 +242,10 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
         return "CONTINUE", list(selected.ligand_id.astype(str)), info
     # collection-granular option (only viable for a genuinely property-tranched giga-library)
     agg = per_collection_scores(model, meta, manifest, fp_cache=fp_cache)
-    selected = select_collections(agg, docked_collections, this_round, eff_epsilon, seed)
+    # collection granularity keeps its own epsilon-random selector: it accumulates until a LIGAND
+    # budget is met rather than taking a fixed top-k, so MolPAL's Acquirer is not a fit for it.
+    selected = select_collections(agg, docked_collections, this_round,
+                                  1.0 if explore else epsilon_random, seed)
     if not selected:
         return "EXHAUSTED", [], info
     if todo_out:
@@ -426,7 +424,7 @@ if __name__ == "__main__":
         r.add_argument("--per-round", type=int, required=True)
         r.add_argument("--k-frac", type=float, default=0.001)
         r.add_argument("--patience", type=int, default=3)
-        r.add_argument("--epsilon-random", type=float, default=0.05)
+        r.add_argument("--epsilon-random", type=float, default=0.0)  # MolPAL default; collection path only
         r.add_argument("--min-spearman", type=float, default=0.30)
         r.add_argument("--max-explore-rounds", type=int, default=3,
                        help="consecutive low-Spearman rounds to random-explore before stopping (QUALITY_LOW)")
