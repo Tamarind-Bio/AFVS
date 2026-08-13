@@ -31,7 +31,8 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, rdMolDescriptors
+from rdkit.DataStructs import ConvertToNumpyArray
 from rdkit import RDLogger
 
 RDLogger.DisableLog("rdApp.*")
@@ -51,28 +52,94 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def smi_to_fingerprint(smi, radius=2, n_bits=1024):
-    """SMILES -> Morgan fingerprint (radius 2, 1024 bits), or None if unparseable/empty."""
+# Featurization is MolPAL's atom-pair, adopted by MEASUREMENT rather than by preference.
+#
+# Gate 1 (2026-08-13, 58 DOCKSTRING targets x 3 seeds, 1,102 campaigns, shuffled-label control
+# passed) compared four featurizers under one FNN, paired per target against the Morgan baseline:
+#   MolPAL pair maxLength 3 @ 2048  +0.0357 top-1% recall, p=3.2e-08, 51/58 targets  <- adopted
+#   our atom-pair maxDistance 30 @ 1024  +0.0333, p=2.9e-08, 48/58
+#   MolPAL pair maxLength 3 @ 1024  +0.0283, p=2.8e-07, 49/58
+# against a seed spread of 0.0270. The first two are statistically indistinguishable (0.0024 apart),
+# so this is MolPAL's parameterization on provenance grounds as much as on the number.
+#
+# The SURROGATE is deliberately NOT MolPAL's: the same run measured MolPAL's RF at -0.1140 and its
+# GP at -0.1037 against this FNN, each winning 0 of 58 targets. Do not "finish the job" by swapping
+# the model too; that was measured and rejected.
+#
+# Provenance: the primary path imports MolPAL's own Featurizer, so "we run MolPAL's featurizer" is a
+# fact about the code and not an argument about equivalence. The rdkit fallback exists because the
+# head-node AL env is a side-install that a box rebuild loses, and an outage is a worse failure than
+# a fallback: it is BIT-IDENTICAL, asserted 200/200 molecules at both widths as a fail-closed gate on
+# every Gate 1 run, and which path ran is stamped into the model metadata rather than left ambiguous.
+DEFAULT_FP_TYPE = "molpal_pair"
+DEFAULT_N_BITS = 2048
+_MOLPAL_MAX_LENGTH = 3          # MolPAL Featurizer(fingerprint="pair", radius=2) => minLength 1, maxLength 1+radius
+
+try:
+    from molpal.featurizer import Featurizer as _MolpalFeaturizer
+    _FEATURIZER_SOURCE = "molpal"
+except Exception:                # noqa: BLE001 - any import failure degrades, never breaks a screen
+    _MolpalFeaturizer = None
+    _FEATURIZER_SOURCE = "rdkit-equivalent"
+
+_molpal_cache = {}
+
+
+def featurizer_source():
+    """Which path produced the fingerprints: 'molpal' or the bit-identical 'rdkit-equivalent'."""
+    return _FEATURIZER_SOURCE
+
+
+def smi_to_fingerprint(smi, radius=2, n_bits=None, fp_type=None):
+    """SMILES -> fingerprint, or None if unparseable/empty.
+
+    fp_type "molpal_pair" (default) is MolPAL's atom-pair; "morgan" is the pre-2026-08-13 default,
+    kept so an old checkpoint can be re-featurized rather than silently mis-scored.
+    """
+    n_bits = DEFAULT_N_BITS if n_bits is None else n_bits
+    fp_type = DEFAULT_FP_TYPE if fp_type is None else fp_type
     if not smi or smi in ("N/A", "None", "nan"):
         return None
     mol = Chem.MolFromSmiles(smi)
     if mol is None:
         return None
-    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+
+    if fp_type == "morgan":
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+        arr = np.zeros((n_bits,), dtype=np.float32)
+        for bit in fp.GetOnBits():
+            arr[bit] = 1.0
+        return arr
+
+    if fp_type != "molpal_pair":
+        raise ValueError("unknown fp_type %r (expected 'molpal_pair' or 'morgan')" % (fp_type,))
+
+    if _MolpalFeaturizer is not None:
+        key = (radius, n_bits)
+        f = _molpal_cache.get(key)
+        if f is None:
+            f = _molpal_cache[key] = _MolpalFeaturizer(
+                fingerprint="pair", radius=radius, length=n_bits)
+        v = f(smi)
+        return None if v is None else np.asarray(v, dtype=np.float32)
+
+    fp = rdMolDescriptors.GetHashedAtomPairFingerprintAsBitVect(
+        mol, minLength=1, maxLength=1 + radius, nBits=n_bits)
     arr = np.zeros((n_bits,), dtype=np.float32)
-    for bit in fp.GetOnBits():
-        arr[bit] = 1.0
+    ConvertToNumpyArray(fp, arr)
     return arr
 
 
-def fingerprint_all(smiles_list, radius=2, n_bits=1024):
+def fingerprint_all(smiles_list, radius=2, n_bits=None, fp_type=None):
     """
     Fingerprint a list of SMILES, dropping any that fail to parse.
     Returns (kept_indices, X) where kept_indices maps X rows back to smiles_list positions.
     """
+    n_bits = DEFAULT_N_BITS if n_bits is None else n_bits
+    fp_type = DEFAULT_FP_TYPE if fp_type is None else fp_type
     kept_indices, fps = [], []
     for i, smi in enumerate(smiles_list):
-        fp = smi_to_fingerprint(smi, radius=radius, n_bits=n_bits)
+        fp = smi_to_fingerprint(smi, radius=radius, n_bits=n_bits, fp_type=fp_type)
         if fp is not None:
             kept_indices.append(i)
             fps.append(fp)
@@ -157,9 +224,14 @@ def train_on_X(X, y, val_fraction=0.10, batch_size=256, max_epochs=100, patience
 
     model.load_state_dict(best_state)
     model.eval()
+    # fp_type is stamped from the module default because train_on_X only ever sees a MATRIX, not
+    # the SMILES that produced it. A caller that featurized with a non-default fp_type must
+    # override it (train_regressor does). Recorded so predict_scores cannot silently re-featurize
+    # a checkpoint with a different fingerprint, which inverts the ranking with no error.
     meta = {"input_dim": X.shape[1], "y_mean": y_mean, "y_std": y_std,
             "best_epoch": best_epoch, "best_val_loss": best_val,
-            "fp_radius": 2, "fp_nbits": X.shape[1]}
+            "fp_radius": 2, "fp_nbits": X.shape[1],
+            "fp_type": DEFAULT_FP_TYPE, "featurizer_source": _FEATURIZER_SOURCE}
     return model, meta
 
 
@@ -180,18 +252,27 @@ def predict_on_X(model, meta, X, device=None, chunk=200_000):
 
 # ---- SMILES-level wrappers ----
 
-def train_regressor(smiles_list, scores, fp_radius=2, fp_nbits=1024, **kwargs):
+def train_regressor(smiles_list, scores, fp_radius=2, fp_nbits=None, fp_type=None, **kwargs):
+    fp_nbits = DEFAULT_N_BITS if fp_nbits is None else fp_nbits
+    fp_type = DEFAULT_FP_TYPE if fp_type is None else fp_type
     scores = np.asarray(scores, dtype=np.float32)
-    kept, X = fingerprint_all(smiles_list, radius=fp_radius, n_bits=fp_nbits)
+    kept, X = fingerprint_all(smiles_list, radius=fp_radius, n_bits=fp_nbits, fp_type=fp_type)
     if X.shape[0] == 0:
         raise ValueError("No parseable SMILES in training data.")
     model, meta = train_on_X(X, scores[kept], **kwargs)
-    meta.update({"fp_radius": fp_radius, "fp_nbits": fp_nbits})
+    # overwrite the module-default stamp with what ACTUALLY featurized X
+    meta.update({"fp_radius": fp_radius, "fp_nbits": fp_nbits, "fp_type": fp_type})
     return model, meta
 
 
 def predict_scores(model, meta, smiles_list, device=None):
-    kept, X = fingerprint_all(smiles_list, radius=meta.get("fp_radius", 2), n_bits=meta.get("fp_nbits", 1024))
+    # A checkpoint written before 2026-08-13 carries no fp_type; it is Morgan by construction, so
+    # defaulting to the CURRENT module default would re-featurize it as atom-pair and silently
+    # invert its ranking (measured on an equivalent swap: spearman +0.993 -> -0.449, every value
+    # finite and in a plausible band, no warning). Absent fp_type therefore means "morgan".
+    kept, X = fingerprint_all(smiles_list, radius=meta.get("fp_radius", 2),
+                              n_bits=meta.get("fp_nbits", 1024),
+                              fp_type=meta.get("fp_type", "morgan"))
     out = np.full(len(smiles_list), np.nan, dtype=np.float32)
     if X.shape[0] > 0:
         pred = predict_on_X(model, meta, X, device=device)
