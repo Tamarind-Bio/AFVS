@@ -114,7 +114,7 @@ def predict_ligand_scores(model, meta, manifest, fp_cache=None):
     Predict a per-LIGAND docking score for every row of the manifest (columns collection_key,
     ligand_id, smiles). Returns the manifest with a 'pred' column (unscoreable ligands -> +inf).
     This is the per-molecule path: rank individual ligands, not collections (recall 0.75 vs the
-    collection-granular 0.14 on real Tamarind qvina02 runs, see notes/collection-granularity-finding.md).
+    collection-granular 0.14 on real qvina02 runs).
     """
     smiles = manifest["smiles"].astype(str).tolist()
     if fp_cache is not None:
@@ -136,6 +136,41 @@ def predict_ligand_scores(model, meta, manifest, fp_cache=None):
     return df
 
 
+def predict_ligand_scores_ensemble(handles, manifest, fp_cache=None):
+    """Ensemble version of predict_ligand_scores: adds a 'pred_var' column.
+
+    'pred' is the ensemble MEAN and 'pred_var' the disagreement between members. Unscoreable
+    ligands sink to +inf pred with 0 variance, so they are never selected and never look uncertain.
+    """
+    from ml_regressor import predict_ensemble_on_X  # local: keeps the module import surface small
+
+    smiles = manifest["smiles"].astype(str).tolist()
+    pred = np.full(len(smiles), np.nan, dtype=np.float64)
+    var = np.zeros(len(smiles), dtype=np.float64)
+    if fp_cache is not None:
+        smi_to_row, X = fp_cache
+        rows = np.array([smi_to_row.get(s, -1) for s in smiles])
+        ok = rows >= 0
+        if ok.any():
+            mu, vr = predict_ensemble_on_X(handles, X[rows[ok]])
+            pred[ok] = mu
+            var[ok] = vr
+    else:
+        meta0 = handles[0][1]
+        kept, X = fingerprint_all(smiles, radius=meta0.get("fp_radius", 2),
+                                  n_bits=meta0.get("fp_nbits", None),
+                                  fp_type=meta0.get("fp_type", "morgan"))
+        if len(kept):
+            mu, vr = predict_ensemble_on_X(handles, X)
+            for li, oi in enumerate(kept):
+                pred[oi] = mu[li]
+                var[oi] = vr[li]
+    df = manifest.copy()
+    df["pred"] = np.where(np.isnan(pred), np.inf, pred)
+    df["pred_var"] = np.where(np.isnan(pred), 0.0, var)
+    return df
+
+
 def env_setting(name):
     """
     Read an optional VS setting from the environment, tolerating how it actually arrives.
@@ -154,7 +189,7 @@ def env_setting(name):
 
 
 def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy",
-                   explore=False, seed=42):
+                   explore=False, seed=42, pred_var=None):
     """
     Ligand acquisition, backed by MolPAL's own Acquirer (vendored at tools/vendor/molpal).
 
@@ -197,7 +232,14 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy
 
     xs = [str(x) for x in avail.ligand_id.to_numpy()]
     y_means = -avail.pred.to_numpy(dtype=float)          # MolPAL maximizes; pred is lower-is-better
-    y_vars = np.zeros(len(xs), dtype=float)
+    # Real per-ligand variance when the caller supplies one (ensemble disagreement), else
+    # zeros, which correctly collapses every uncertainty metric back to greedy rather than
+    # pretending to an uncertainty the surrogate does not have.
+    if pred_var is None:
+        y_vars = np.zeros(len(xs), dtype=float)
+    else:
+        y_vars = np.asarray(pred_var, dtype=float)[avail.index.to_numpy()] \
+            if len(pred_var) != len(xs) else np.asarray(pred_var, dtype=float)
     explored = {str(x): float("nan") for x in docked_ligands}
 
     acq = Acquirer(size=len(xs), init_size=budget_ligands, batch_sizes=[budget_ligands],

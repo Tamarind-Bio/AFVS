@@ -39,10 +39,16 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates"))
-from ml_regressor import (fingerprint_all, train_on_X, predict_on_X, save_regressor,  # noqa: E402
-                          load_regressor)
+from ml_regressor import (fingerprint_all, train_on_X, train_ensemble_on_X,  # noqa: E402
+                          predict_on_X, save_regressor, load_regressor)
 from afvs_al_select import (per_collection_scores, select_collections, write_todo,  # noqa: E402
-                            predict_ligand_scores, select_ligands, write_named_csv, env_setting)
+                            predict_ligand_scores, predict_ligand_scores_ensemble,
+                            select_ligands, write_named_csv, env_setting)
+
+# MolPAL metrics that actually READ y_vars. greedy and random ignore it, so an ensemble
+# would be pure cost for them (verified: at all-zero variance every metric returns
+# greedy's batch, so a metric outside this set gains nothing from the extra training).
+VAR_METRICS = {"ucb", "lcb", "ei", "pi", "ts"}
 
 try:
     from scipy.stats import spearmanr
@@ -228,13 +234,23 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     if granularity == "molecule":
         # PRIMARY path: rank individual ligands, emit an AFVS csv_collection_key_ligand list
         # (named mode). Recall 0.75 vs 0.14 for collection-granular on real qvina02 data.
-        mp = predict_ligand_scores(model, meta, manifest, fp_cache=fp_cache)
         # Acquisition is MolPAL's, always. alAcquirer only picks WHICH MolPAL metric; unset means
         # MolPAL's own default, greedy. The explore round is MolPAL's `random` metric rather than
         # its `epsilon`, which draws over the whole pool including already-explored ligands.
-        selected = select_ligands(mp, exclude, this_round,
-                                  metric=(env_setting("alAcquirer") or "greedy"),
-                                  explore=explore, seed=seed)
+        acq_metric = env_setting("alAcquirer") or "greedy"
+        # MolPAL's uncertainty metrics need a per-ligand variance. Our FNN is a point predictor, so
+        # without an ensemble they all silently collapse to greedy. Train one only when a metric
+        # actually consumes the variance: it costs n_models x training for no benefit otherwise.
+        n_ens = max(1, int(env_setting("alEnsemble") or 1))
+        if acq_metric in VAR_METRICS and n_ens > 1 and not explore:
+            handles = train_ensemble_on_X(Xtr, ytr, n_models=n_ens, seed=seed)
+            mp = predict_ligand_scores_ensemble(handles, manifest, fp_cache=fp_cache)
+            pred_var = mp["pred_var"].to_numpy()
+        else:
+            mp = predict_ligand_scores(model, meta, manifest, fp_cache=fp_cache)
+            pred_var = None
+        selected = select_ligands(mp, exclude, this_round, metric=acq_metric,
+                                  explore=explore, seed=seed, pred_var=pred_var)
         if not len(selected):
             return "EXHAUSTED", [], info          # pool fully attempted -> stop (don't re-dock a stale wave)
         if todo_out:

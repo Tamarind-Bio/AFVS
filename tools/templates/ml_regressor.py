@@ -250,6 +250,49 @@ def predict_on_X(model, meta, X, device=None, chunk=200_000):
     return out
 
 
+# ---- uncertainty ----
+
+# MolPAL's acquisition metrics beyond greedy (ucb / ei / pi / ts) need a per-ligand VARIANCE, and a
+# point-prediction network has none: at all-zero variance every one of them returns greedy's batch.
+# MolPAL solves this with NN conf_methods (dropout / mve / ensemble). We take the ENSEMBLE one, and
+# deliberately not the other two, because Gate 1 measured THIS network with THIS loss as the best
+# surrogate of the five tried (0 of 58 targets lost to MolPAL's RF or GP). `mve` would replace Huber
+# with a Gaussian NLL and `dropout` would regularize training, and both change the model we just
+# validated. An ensemble leaves the architecture and the loss untouched and gets the variance from
+# disagreement between seeds.
+#
+# Cost is n_models x training. Training is the cheap half of a round (the expensive half is
+# featurizing and predicting over the undocked pool, which is shared across the ensemble), so this
+# is roughly linear in n_models on a small term.
+
+DEFAULT_ENSEMBLE = 5
+
+
+def train_ensemble_on_X(X, y, n_models=DEFAULT_ENSEMBLE, seed=42, **kwargs):
+    """Train n_models independent FNNs on the same data, differing only by seed.
+
+    Returns a list of (model, meta). Element 0 uses `seed` exactly, so a 1-model ensemble is
+    bit-identical to train_on_X and the uncertainty path degrades cleanly to the measured one.
+    """
+    out = []
+    for i in range(max(1, int(n_models))):
+        out.append(train_on_X(X, y, seed=seed + i, **kwargs))
+    return out
+
+
+def predict_ensemble_on_X(handles, X, device=None, chunk=200_000):
+    """Return (mean, var) over an ensemble, both in the ORIGINAL score units.
+
+    var is the population variance of the members' predictions, i.e. how much the ensemble disagrees
+    about a ligand. It is an uncertainty SIGNAL for acquisition, not a calibrated posterior, and it
+    is documented that way so nobody reads a confidence interval off it. A 1-member ensemble returns
+    all-zero variance, which correctly degrades every uncertainty metric back to greedy.
+    """
+    preds = np.stack([predict_on_X(m, meta, X, device=device, chunk=chunk)
+                      for m, meta in handles], axis=0)
+    return preds.mean(axis=0), preds.var(axis=0)
+
+
 # ---- SMILES-level wrappers ----
 
 def train_regressor(smiles_list, scores, fp_radius=2, fp_nbits=None, fp_type=None, **kwargs):
