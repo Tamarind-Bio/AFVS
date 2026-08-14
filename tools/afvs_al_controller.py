@@ -40,7 +40,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates"))
 from ml_regressor import (fingerprint_all, train_on_X, train_ensemble_on_X,  # noqa: E402
-                          predict_on_X, save_regressor, load_regressor)
+                          predict_on_X, save_regressor, load_regressor,
+                          load_packed_npy)
 from afvs_al_select import (per_collection_scores, select_collections, write_todo,  # noqa: E402
                             predict_ligand_scores, predict_ligand_scores_ensemble,
                             select_ligands, write_named_csv, env_setting)
@@ -68,15 +69,33 @@ except Exception:  # scipy optional; quality gate degrades to "unknown" without 
 def _state(state_dir):
     return {
         "manifest": os.path.join(state_dir, "manifest.parquet"),
-        "fp": os.path.join(state_dir, "fp_cache.npz"),
+        # PACKED cache (current): a plain .npy so it memory-maps for real, plus a parquet sidecar
+        # for the SMILES. The old single-file .npz is still READ (see _load_fp_cache) so a state
+        # dir written by the previous version resumes rather than re-fingerprinting.
+        "fp_npy": os.path.join(state_dir, "fp_cache.npy"),
+        "fp_smiles": os.path.join(state_dir, "fp_cache_smiles.parquet"),
+        "fp": os.path.join(state_dir, "fp_cache.npz"),   # legacy, read-only
         "docked": os.path.join(state_dir, "docked_collections.txt"),
         "model": os.path.join(state_dir, "model.pt"),
         "history": os.path.join(state_dir, "history.json"),
     }
 
 
-def _load_fp_cache(path):
-    d = np.load(path, allow_pickle=True)
+def _load_fp_cache(st):
+    """Return (smi_to_row, X). X is a memory-mapped PACKED matrix on the current format.
+
+    Accepts either the packed .npy + parquet pair or a legacy .npz, so an in-flight run whose
+    state dir predates the packed format still resumes. predict_on_X unpacks per chunk, so the
+    caller does not care which it got; the only observable difference is resident memory.
+    """
+    if os.path.exists(st["fp_npy"]) and os.path.exists(st["fp_smiles"]):
+        smi = pd.read_parquet(st["fp_smiles"], columns=["smiles"]).smiles.astype(str).tolist()
+        X = load_packed_npy(st["fp_npy"], mmap=True)
+        # The .npy is allocated for the pre-drop row count and sliced to the kept rows, so trust
+        # the SMILES sidecar for the length rather than X.shape[0].
+        return {s: i for i, s in enumerate(smi)}, X[:len(smi)]
+
+    d = np.load(st["fp"], allow_pickle=True)
     smi = list(d["smiles"])
     return {s: i for i, s in enumerate(smi)}, d["X"]
 
@@ -379,7 +398,7 @@ def collection_ligands_from_tarballs(collection_prefix, todo_all_path, data_buck
 
 
 def _cmd_init(args):
-    from ml_regressor import fingerprint_all
+    from ml_regressor import fingerprint_to_packed_npy
     st = _state(args.state_dir)
     os.makedirs(args.state_dir, exist_ok=True)
 
@@ -392,16 +411,25 @@ def _cmd_init(args):
                                               cache_path=os.path.join(args.state_dir, "collection_ligands.parquet"))
     manifest = build_manifest(cl, args.smiles_store, st["manifest"])
 
-    # Fingerprint the pool once -> cache reused across all rounds. Use fingerprint_all so a bad/
-    # unparseable SMILES is DROPPED from the cache (not stored as an all-zero row): the cache's
-    # smi_to_row is built from these `smiles`, so an unlisted SMILES resolves to row -1 at select
-    # time and sinks to +inf (unscoreable), matching the fingerprint_all fallback path. Storing a
-    # zero-vector row instead would silently score a bad ligand and could waste budget / skew a
-    # collection's predicted-best. Dropping bad rows also shrinks the cached matrix.
+    # Fingerprint the pool once -> cache reused across all rounds. A bad/unparseable SMILES is
+    # DROPPED from the cache (not stored as an all-zero row): the cache's smi_to_row is built from
+    # these `smiles`, so an unlisted SMILES resolves to row -1 at select time and sinks to +inf
+    # (unscoreable). Storing a zero-vector row instead would silently score a bad ligand and could
+    # waste budget / skew a collection's predicted-best.
+    #
+    # STREAMED and PACKED rather than fingerprint_all: that built a Python list of one float32
+    # array per molecule and then np.stack'd it, so peak was ~2x the full matrix at 8,192 B per
+    # molecule, which is what capped the pool just under 1e6 on this 16 GiB box. The packed .npy
+    # is 256 B/molecule and never fully resident. The representation is bit-identical either way:
+    # np.packbits round-trips exactly, so this is a change of storage and not of value, and the
+    # cache's row order is still the kept order. To re-check that yourself, compare
+    # unpack_fp(fingerprint_to_packed_npy(s)[1]) against fingerprint_all(s)[1] with np.array_equal.
     all_smiles = manifest.smiles.astype(str).tolist()
-    kept, X = fingerprint_all(all_smiles)
+    kept, X = fingerprint_to_packed_npy(all_smiles, st["fp_npy"], progress_every=1_000_000)
     smiles = [all_smiles[i] for i in kept]
-    np.savez(st["fp"], smiles=np.array(smiles, dtype=object), X=X)
+    pd.DataFrame({"smiles": smiles}).to_parquet(st["fp_smiles"], index=False)
+    print(f"INIT fingerprint cache: {len(smiles):,} molecules packed to {st['fp_npy']} "
+          f"({X.nbytes / 1e9:.2f} GB on disk, {X.nbytes / max(len(smiles), 1):.0f} B/molecule)")
 
     # seed: a random subset of LIGANDS, written as an AFVS csv_collection_key_ligand list (named mode).
     # Per-molecule is the primary path (recall 0.78 vs 0.14 collection-granular; collection-granularity-finding.md).
@@ -426,7 +454,7 @@ def _cmd_init(args):
 def _cmd_round(args):
     st = _state(args.state_dir)
     manifest = pd.read_parquet(st["manifest"])
-    fp_cache = _load_fp_cache(st["fp"])
+    fp_cache = _load_fp_cache(st)
     docked, attempted = load_docked_scores(args.scores_glob)
     history = json.load(open(st["history"])) if os.path.exists(st["history"]) else []
     status, selected, info = run_round(
