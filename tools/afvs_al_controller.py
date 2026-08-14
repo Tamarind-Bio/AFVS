@@ -45,10 +45,17 @@ from afvs_al_select import (per_collection_scores, select_collections, write_tod
                             predict_ligand_scores, predict_ligand_scores_ensemble,
                             select_ligands, write_named_csv, env_setting)
 
-# MolPAL metrics that actually READ y_vars. greedy and random ignore it, so an ensemble
-# would be pure cost for them (verified: at all-zero variance every metric returns
-# greedy's batch, so a metric outside this set gains nothing from the extra training).
-VAR_METRICS = {"ucb", "lcb", "ei", "pi", "ts"}
+# MolPAL metrics that actually READ y_vars. greedy and random ignore it, so an ensemble would be
+# pure cost for them. Both spellings of Thompson sampling are listed because MolPAL's get_metric
+# maps "thompson" and "ts" to the same function: listing only one made the alias skip the ensemble
+# and then run on all-zero variance, which is the silent-degradation this set exists to prevent.
+VAR_METRICS = {"ucb", "lcb", "ei", "pi", "ts", "thompson"}
+
+# What we are willing to run, which is deliberately NARROWER than MolPAL's get_metric table.
+# Excluded on purpose: "threshold" takes a threshold= we never pass, so MolPAL's default -inf makes
+# it return a constant, i.e. a fully RANDOM screen billed at full docking cost; and "noisy" wraps a
+# base metric we never configure. Both are accepted by get_metric and neither would raise.
+SUPPORTED_METRICS = {"greedy", "random"} | VAR_METRICS
 
 try:
     from scipy.stats import spearmanr
@@ -237,7 +244,14 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
         # Acquisition is MolPAL's, always. alAcquirer only picks WHICH MolPAL metric; unset means
         # MolPAL's own default, greedy. The explore round is MolPAL's `random` metric rather than
         # its `epsilon`, which draws over the whole pool including already-explored ligands.
-        acq_metric = env_setting("alAcquirer") or "greedy"
+        # Validate BEFORE spending anything. An unsupported metric otherwise raises inside MolPAL's
+        # metrics.calc on the first EXPLOIT round, i.e. after the seed and every explore round of the
+        # customer's docking budget is already spent, and `threshold` does not raise at all: it
+        # returns a constant, which is a fully random screen at full cost.
+        if acq_metric not in SUPPORTED_METRICS:
+            raise ValueError(
+                "alAcquirer=%r is not supported. Use one of: %s"
+                % (acq_metric, ", ".join(sorted(SUPPORTED_METRICS))))
         # MolPAL's uncertainty metrics need a per-ligand variance. Our FNN is a point predictor, so
         # without an ensemble they all silently collapse to greedy. Train one only when a metric
         # actually consumes the variance: it costs n_models x training for no benefit otherwise.
@@ -249,8 +263,12 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
         else:
             mp = predict_ligand_scores(model, meta, manifest, fp_cache=fp_cache)
             pred_var = None
+        # Thread the REAL docked scores through: ei and pi read them as the incumbent to improve on.
+        # Passing only the exclusion set leaves that incumbent at -inf and silently inverts them.
         selected = select_ligands(mp, exclude, this_round, metric=acq_metric,
-                                  explore=explore, seed=seed, pred_var=pred_var)
+                                  explore=explore, seed=seed, pred_var=pred_var,
+                                  docked_scores=dict(zip(docked_scores.ligand.astype(str),
+                                                         docked_scores.score_min.astype(float))))
         if not len(selected):
             return "EXHAUSTED", [], info          # pool fully attempted -> stop (don't re-dock a stale wave)
         if todo_out:

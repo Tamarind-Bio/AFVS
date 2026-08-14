@@ -189,7 +189,7 @@ def env_setting(name):
 
 
 def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy",
-                   explore=False, seed=42, pred_var=None):
+                   explore=False, seed=42, pred_var=None, docked_scores=None):
     """
     Ligand acquisition, backed by MolPAL's own Acquirer (vendored at tools/vendor/molpal).
 
@@ -198,23 +198,30 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy
     top-k unexplored by score, element for element, so there was nothing the old one did that this
     does not, and carrying two selectors meant two things to keep correct.
 
-    Defaults are MolPAL's own: metric="greedy", epsilon=0.0 (Acquirer.__init__). Note the
-    uncertainty-aware metrics (ucb / ei / pi / ts) are INERT on the current surrogate, which emits
-    point predictions with no variance: at y_vars all-zero they return byte-identical batches to
-    greedy, and pi degenerates to ranking by ligand-id string. They become meaningful only behind a
-    variance-providing surrogate (MolPAL's GP or RF), which is why the website exposes greedy and
-    random and not the full metric list.
+    Defaults are MolPAL's own: metric="greedy", epsilon=0.0 (Acquirer.__init__). On a point-predicting
+    surrogate (no ensemble, y_vars all zero) ucb, lcb, ts and ei reduce to greedy; pi does NOT, it
+    becomes a binary improves-or-not mask tie-broken by ligand-id, so it is not a safe stand-in for
+    greedy at zero variance. The uncertainty metrics only carry information behind a variance-providing
+    surrogate, which is why the website exposes greedy and random rather than the full metric list.
 
-    Three adaptations, each guarding a failure that would otherwise be silent:
+    Four adaptations, each guarding a failure that would otherwise be silent:
       - SIGN. `pred` is ascending-is-better (most negative = best binder) and MolPAL MAXIMIZES,
         so we pass -pred and never the raw column.
       - EXPLORED IS A MAPPING. acquire_batch does `ys = list(explored.values())`, so a set raises
         on a non-empty value and, worse, passes SILENTLY when empty: a set-typed caller works in
         round 1 and dies in round 2. We always pass a dict.
       - FAILED LIGANDS COUNT AS EXPLORED. `docked_ligands` is the ATTEMPTED set (valid + failed),
-        and every member is mapped to NaN rather than omitted, so a known-failed dock is not
-        re-acquired every round at the budget's expense. NaN is correct here because at this seam
-        we hold predictions, not the true scores of what was already docked.
+        so every member appears as a key and a known-failed dock is not re-acquired every round at
+        the budget's expense.
+      - EXPLORED VALUES ARE REAL SCORES, NOT NaN. acquire_batch reads `explored` for TWO things,
+        and an earlier version of this function saw only the first: membership (the exclusion test)
+        and `current_max = np.nan_to_num(values, nan=-inf).max()`, which ei and pi use as the
+        incumbent to improve on. Mapping every attempted ligand to NaN drove current_max to -inf,
+        which made ei return +inf and pi return 1.0 for the WHOLE pool, a total tie that fell
+        through to ligand-id string order and selected the worst ligands with every log line
+        healthy. So we pass -score for a valid dock (mirroring the sign flip above, since these are
+        observed objective values in the same space as y_means) and keep NaN only for a genuinely
+        failed one, which is the minority-sentinel meaning MolPAL's own Explorer gives it.
 
     The explore round passes metric="random" rather than mapping our eff_epsilon onto MolPAL's
     `epsilon`: MolPAL draws its epsilon indices over the WHOLE pool including explored ligands, so
@@ -240,7 +247,12 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy
     else:
         y_vars = np.asarray(pred_var, dtype=float)[avail.index.to_numpy()] \
             if len(pred_var) != len(xs) else np.asarray(pred_var, dtype=float)
-    explored = {str(x): float("nan") for x in docked_ligands}
+    scores = {} if docked_scores is None else {str(kk): vv for kk, vv in docked_scores.items()}
+    explored = {}
+    for x in docked_ligands:
+        lid = str(x)
+        s = scores.get(lid)
+        explored[lid] = float("nan") if s is None else -float(s)
 
     acq = Acquirer(size=len(xs), init_size=budget_ligands, batch_sizes=[budget_ligands],
                    metric=("random" if explore else metric), epsilon=0.0, seed=seed, verbose=0)

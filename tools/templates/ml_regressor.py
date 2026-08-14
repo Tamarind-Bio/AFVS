@@ -66,28 +66,17 @@ def set_seed(seed):
 # GP at -0.1037 against this FNN, each winning 0 of 58 targets. Do not "finish the job" by swapping
 # the model too; that was measured and rejected.
 #
-# Provenance: the primary path imports MolPAL's own Featurizer, so "we run MolPAL's featurizer" is a
-# fact about the code and not an argument about equivalence. The rdkit fallback exists because the
-# head-node AL env is a side-install that a box rebuild loses, and an outage is a worse failure than
-# a fallback: it is BIT-IDENTICAL, asserted 200/200 molecules at both widths as a fail-closed gate on
-# every Gate 1 run, and which path ran is stamped into the model metadata rather than left ambiguous.
+# Provenance, stated honestly: this is an rdkit atom-pair fingerprint parameterized to be
+# BIT-IDENTICAL to MolPAL's, asserted 200/200 molecules at both widths as a fail-closed gate on every
+# Gate 1 run. It is NOT MolPAL's code executing. An earlier version imported MolPAL's own Featurizer
+# with this as a fallback and stamped which path ran into the model metadata, but that import can
+# never resolve in any deployed configuration: molpal is not installed on the head node and cannot be
+# (its dependency set conflicts with the box's numpy), and it is not vendorable either because
+# molpal/featurizer.py imports ray, which is the exact dependency vendoring the Acquirer exists to
+# keep off this machine. So the stamp could only ever emit one value and certified nothing. The
+# equivalence argument is the real claim; do not dress it up as a provenance fact.
 DEFAULT_FP_TYPE = "molpal_pair"
 DEFAULT_N_BITS = 2048
-_MOLPAL_MAX_LENGTH = 3          # MolPAL Featurizer(fingerprint="pair", radius=2) => minLength 1, maxLength 1+radius
-
-try:
-    from molpal.featurizer import Featurizer as _MolpalFeaturizer
-    _FEATURIZER_SOURCE = "molpal"
-except Exception:                # noqa: BLE001 - any import failure degrades, never breaks a screen
-    _MolpalFeaturizer = None
-    _FEATURIZER_SOURCE = "rdkit-equivalent"
-
-_molpal_cache = {}
-
-
-def featurizer_source():
-    """Which path produced the fingerprints: 'molpal' or the bit-identical 'rdkit-equivalent'."""
-    return _FEATURIZER_SOURCE
 
 
 def smi_to_fingerprint(smi, radius=2, n_bits=None, fp_type=None):
@@ -114,15 +103,9 @@ def smi_to_fingerprint(smi, radius=2, n_bits=None, fp_type=None):
     if fp_type != "molpal_pair":
         raise ValueError("unknown fp_type %r (expected 'molpal_pair' or 'morgan')" % (fp_type,))
 
-    if _MolpalFeaturizer is not None:
-        key = (radius, n_bits)
-        f = _molpal_cache.get(key)
-        if f is None:
-            f = _molpal_cache[key] = _MolpalFeaturizer(
-                fingerprint="pair", radius=radius, length=n_bits)
-        v = f(smi)
-        return None if v is None else np.asarray(v, dtype=np.float32)
-
+    # minLength/maxLength here ARE the equivalence: MolPAL builds its "pair" fingerprint as
+    # GetHashedAtomPairFingerprintAsBitVect(minLength=1, maxLength=1+radius), so these two bounds
+    # are what make the bit-identity claim true. Changing either silently breaks it.
     fp = rdMolDescriptors.GetHashedAtomPairFingerprintAsBitVect(
         mol, minLength=1, maxLength=1 + radius, nBits=n_bits)
     arr = np.zeros((n_bits,), dtype=np.float32)
@@ -231,7 +214,7 @@ def train_on_X(X, y, val_fraction=0.10, batch_size=256, max_epochs=100, patience
     meta = {"input_dim": X.shape[1], "y_mean": y_mean, "y_std": y_std,
             "best_epoch": best_epoch, "best_val_loss": best_val,
             "fp_radius": 2, "fp_nbits": X.shape[1],
-            "fp_type": DEFAULT_FP_TYPE, "featurizer_source": _FEATURIZER_SOURCE}
+            "fp_type": DEFAULT_FP_TYPE}
     return model, meta
 
 
