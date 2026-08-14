@@ -244,6 +244,7 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
         # Acquisition is MolPAL's, always. alAcquirer only picks WHICH MolPAL metric; unset means
         # MolPAL's own default, greedy. The explore round is MolPAL's `random` metric rather than
         # its `epsilon`, which draws over the whole pool including already-explored ligands.
+        acq_metric = env_setting("alAcquirer") or "greedy"
         # Validate BEFORE spending anything. An unsupported metric otherwise raises inside MolPAL's
         # metrics.calc on the first EXPLOIT round, i.e. after the seed and every explore round of the
         # customer's docking budget is already spent, and `threshold` does not raise at all: it
@@ -500,8 +501,11 @@ if __name__ == "__main__":
         rows.append({"collection_key": ck, "ligand_id": f"L{i}", "smiles": s})
     manifest = pd.DataFrame(rows).drop_duplicates("ligand_id")
 
-    from ml_regressor import smi_to_fingerprint
-    Xfull = np.zeros((len(manifest), 1024), dtype=np.float32)
+    # Width comes from the module default, never a literal: a hardcoded 1024 here silently broke
+    # this whole branch the moment the default featurizer moved to 2048, and because this is the
+    # self-test path nothing else caught it.
+    from ml_regressor import DEFAULT_N_BITS, smi_to_fingerprint
+    Xfull = np.zeros((len(manifest), DEFAULT_N_BITS), dtype=np.float32)
     smi_to_row = {}
     for i, s in enumerate(manifest.smiles.tolist()):
         fp = smi_to_fingerprint(s)
