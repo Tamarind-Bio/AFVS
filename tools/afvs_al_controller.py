@@ -15,7 +15,8 @@ controller writes, then invokes the next `round`). Two subcommands:
 
 Design decisions (validated against exhaustively-docked ground truth):
   - regress-and-rank surrogate (ml_regressor), retrained from scratch each round (online was worse).
-  - greedy acquisition by predicted best-in-collection; optional epsilon-random exploration.
+  - acquisition is MolPAL's (vendored molpal.acquirer), at MolPAL's own defaults: greedy,
+    epsilon 0. The explore round uses MolPAL's `random` metric.
   - convergence: stop when the rolling mean of the top-K docked score stops improving, or the docking
     budget is spent, whichever first.
   - guardrail 2: after the seed round, if the held-out surrogate Spearman is below --min-spearman,
@@ -38,10 +39,24 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates"))
-from ml_regressor import (fingerprint_all, train_on_X, predict_on_X, save_regressor,  # noqa: E402
-                          load_regressor)
+from ml_regressor import (fingerprint_all, train_on_X, train_ensemble_on_X,  # noqa: E402
+                          predict_on_X, save_regressor, load_regressor,
+                          load_packed_npy)
 from afvs_al_select import (per_collection_scores, select_collections, write_todo,  # noqa: E402
-                            predict_ligand_scores, select_ligands, write_named_csv)
+                            predict_ligand_scores, predict_ligand_scores_ensemble,
+                            select_ligands, write_named_csv, env_setting)
+
+# MolPAL metrics that actually READ y_vars. greedy and random ignore it, so an ensemble would be
+# pure cost for them. Both spellings of Thompson sampling are listed because MolPAL's get_metric
+# maps "thompson" and "ts" to the same function: listing only one made the alias skip the ensemble
+# and then run on all-zero variance, which is the silent-degradation this set exists to prevent.
+VAR_METRICS = {"ucb", "lcb", "ei", "pi", "ts", "thompson"}
+
+# What we are willing to run, which is deliberately NARROWER than MolPAL's get_metric table.
+# Excluded on purpose: "threshold" takes a threshold= we never pass, so MolPAL's default -inf makes
+# it return a constant, i.e. a fully RANDOM screen billed at full docking cost; and "noisy" wraps a
+# base metric we never configure. Both are accepted by get_metric and neither would raise.
+SUPPORTED_METRICS = {"greedy", "random"} | VAR_METRICS
 
 try:
     from scipy.stats import spearmanr
@@ -54,15 +69,33 @@ except Exception:  # scipy optional; quality gate degrades to "unknown" without 
 def _state(state_dir):
     return {
         "manifest": os.path.join(state_dir, "manifest.parquet"),
-        "fp": os.path.join(state_dir, "fp_cache.npz"),
+        # PACKED cache (current): a plain .npy so it memory-maps for real, plus a parquet sidecar
+        # for the SMILES. The old single-file .npz is still READ (see _load_fp_cache) so a state
+        # dir written by the previous version resumes rather than re-fingerprinting.
+        "fp_npy": os.path.join(state_dir, "fp_cache.npy"),
+        "fp_smiles": os.path.join(state_dir, "fp_cache_smiles.parquet"),
+        "fp": os.path.join(state_dir, "fp_cache.npz"),   # legacy, read-only
         "docked": os.path.join(state_dir, "docked_collections.txt"),
         "model": os.path.join(state_dir, "model.pt"),
         "history": os.path.join(state_dir, "history.json"),
     }
 
 
-def _load_fp_cache(path):
-    d = np.load(path, allow_pickle=True)
+def _load_fp_cache(st):
+    """Return (smi_to_row, X). X is a memory-mapped PACKED matrix on the current format.
+
+    Accepts either the packed .npy + parquet pair or a legacy .npz, so an in-flight run whose
+    state dir predates the packed format still resumes. predict_on_X unpacks per chunk, so the
+    caller does not care which it got; the only observable difference is resident memory.
+    """
+    if os.path.exists(st["fp_npy"]) and os.path.exists(st["fp_smiles"]):
+        smi = pd.read_parquet(st["fp_smiles"], columns=["smiles"]).smiles.astype(str).tolist()
+        X = load_packed_npy(st["fp_npy"], mmap=True)
+        # The .npy is allocated for the pre-drop row count and sliced to the kept rows, so trust
+        # the SMILES sidecar for the length rather than X.shape[0].
+        return {s: i for i, s in enumerate(smi)}, X[:len(smi)]
+
+    d = np.load(st["fp"], allow_pickle=True)
     smi = list(d["smiles"])
     return {s: i for i, s in enumerate(smi)}, d["X"]
 
@@ -113,7 +146,7 @@ def load_docked_scores(scores_glob):
 # ---------- round logic (testable) ----------
 
 def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac=0.001,
-              patience=3, conv_eps=0.01, epsilon_random=0.05, min_spearman=0.30, seed=42,
+              patience=3, conv_eps=0.01, epsilon_random=0.0, min_spearman=0.30, seed=42,
               history=None, model_out=None, todo_out=None, granularity="molecule",
               attempted_ligands=None, max_explore_rounds=3):
     """
@@ -212,13 +245,13 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     if not trusted:
         if bad_streak >= max_explore_rounds:
             return "QUALITY_LOW", [], info       # surrogate never became reliable -> stop early
-        eff_epsilon = 1.0                        # all-random exploration this round
+        explore = True                           # surrogate not yet trustworthy: sample randomly
     else:
         if converged:
             return "CONVERGED", [], info
-        eff_epsilon = epsilon_random             # greedy + epsilon exploration
+        explore = False
 
-    # acquire the next batch (random when exploring, greedy+epsilon when exploiting)
+    # acquire the next batch (MolPAL `random` when exploring, MolPAL `greedy` when exploiting)
     remaining = budget_total - n_attempted
     this_round = min(per_round, remaining)
     # exclude ALL attempted ligands (valid + failed) so a known-failed dock isn't re-selected.
@@ -227,8 +260,35 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     if granularity == "molecule":
         # PRIMARY path: rank individual ligands, emit an AFVS csv_collection_key_ligand list
         # (named mode). Recall 0.75 vs 0.14 for collection-granular on real qvina02 data.
-        mp = predict_ligand_scores(model, meta, manifest, fp_cache=fp_cache)
-        selected = select_ligands(mp, exclude, this_round, eff_epsilon, seed)
+        # Acquisition is MolPAL's, always. alAcquirer only picks WHICH MolPAL metric; unset means
+        # MolPAL's own default, greedy. The explore round is MolPAL's `random` metric rather than
+        # its `epsilon`, which draws over the whole pool including already-explored ligands.
+        acq_metric = env_setting("alAcquirer") or "greedy"
+        # Validate BEFORE spending anything. An unsupported metric otherwise raises inside MolPAL's
+        # metrics.calc on the first EXPLOIT round, i.e. after the seed and every explore round of the
+        # customer's docking budget is already spent, and `threshold` does not raise at all: it
+        # returns a constant, which is a fully random screen at full cost.
+        if acq_metric not in SUPPORTED_METRICS:
+            raise ValueError(
+                "alAcquirer=%r is not supported. Use one of: %s"
+                % (acq_metric, ", ".join(sorted(SUPPORTED_METRICS))))
+        # MolPAL's uncertainty metrics need a per-ligand variance. Our FNN is a point predictor, so
+        # without an ensemble they all silently collapse to greedy. Train one only when a metric
+        # actually consumes the variance: it costs n_models x training for no benefit otherwise.
+        n_ens = max(1, int(env_setting("alEnsemble") or 1))
+        if acq_metric in VAR_METRICS and n_ens > 1 and not explore:
+            handles = train_ensemble_on_X(Xtr, ytr, n_models=n_ens, seed=seed)
+            mp = predict_ligand_scores_ensemble(handles, manifest, fp_cache=fp_cache)
+            pred_var = mp["pred_var"].to_numpy()
+        else:
+            mp = predict_ligand_scores(model, meta, manifest, fp_cache=fp_cache)
+            pred_var = None
+        # Thread the REAL docked scores through: ei and pi read them as the incumbent to improve on.
+        # Passing only the exclusion set leaves that incumbent at -inf and silently inverts them.
+        selected = select_ligands(mp, exclude, this_round, metric=acq_metric,
+                                  explore=explore, seed=seed, pred_var=pred_var,
+                                  docked_scores=dict(zip(docked_scores.ligand.astype(str),
+                                                         docked_scores.score_min.astype(float))))
         if not len(selected):
             return "EXHAUSTED", [], info          # pool fully attempted -> stop (don't re-dock a stale wave)
         if todo_out:
@@ -236,7 +296,10 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
         return "CONTINUE", list(selected.ligand_id.astype(str)), info
     # collection-granular option (only viable for a genuinely property-tranched giga-library)
     agg = per_collection_scores(model, meta, manifest, fp_cache=fp_cache)
-    selected = select_collections(agg, docked_collections, this_round, eff_epsilon, seed)
+    # collection granularity keeps its own epsilon-random selector: it accumulates until a LIGAND
+    # budget is met rather than taking a fixed top-k, so MolPAL's Acquirer is not a fit for it.
+    selected = select_collections(agg, docked_collections, this_round,
+                                  1.0 if explore else epsilon_random, seed)
     if not selected:
         return "EXHAUSTED", [], info
     if todo_out:
@@ -335,7 +398,7 @@ def collection_ligands_from_tarballs(collection_prefix, todo_all_path, data_buck
 
 
 def _cmd_init(args):
-    from ml_regressor import fingerprint_all
+    from ml_regressor import fingerprint_to_packed_npy
     st = _state(args.state_dir)
     os.makedirs(args.state_dir, exist_ok=True)
 
@@ -348,16 +411,25 @@ def _cmd_init(args):
                                               cache_path=os.path.join(args.state_dir, "collection_ligands.parquet"))
     manifest = build_manifest(cl, args.smiles_store, st["manifest"])
 
-    # Fingerprint the pool once -> cache reused across all rounds. Use fingerprint_all so a bad/
-    # unparseable SMILES is DROPPED from the cache (not stored as an all-zero row): the cache's
-    # smi_to_row is built from these `smiles`, so an unlisted SMILES resolves to row -1 at select
-    # time and sinks to +inf (unscoreable), matching the fingerprint_all fallback path. Storing a
-    # zero-vector row instead would silently score a bad ligand and could waste budget / skew a
-    # collection's predicted-best. Dropping bad rows also shrinks the cached matrix.
+    # Fingerprint the pool once -> cache reused across all rounds. A bad/unparseable SMILES is
+    # DROPPED from the cache (not stored as an all-zero row): the cache's smi_to_row is built from
+    # these `smiles`, so an unlisted SMILES resolves to row -1 at select time and sinks to +inf
+    # (unscoreable). Storing a zero-vector row instead would silently score a bad ligand and could
+    # waste budget / skew a collection's predicted-best.
+    #
+    # STREAMED and PACKED rather than fingerprint_all: that built a Python list of one float32
+    # array per molecule and then np.stack'd it, so peak was ~2x the full matrix at 8,192 B per
+    # molecule, which is what capped the pool just under 1e6 on this 16 GiB box. The packed .npy
+    # is 256 B/molecule and never fully resident. The representation is bit-identical either way:
+    # np.packbits round-trips exactly, so this is a change of storage and not of value, and the
+    # cache's row order is still the kept order. To re-check that yourself, compare
+    # unpack_fp(fingerprint_to_packed_npy(s)[1]) against fingerprint_all(s)[1] with np.array_equal.
     all_smiles = manifest.smiles.astype(str).tolist()
-    kept, X = fingerprint_all(all_smiles)
+    kept, X = fingerprint_to_packed_npy(all_smiles, st["fp_npy"], progress_every=1_000_000)
     smiles = [all_smiles[i] for i in kept]
-    np.savez(st["fp"], smiles=np.array(smiles, dtype=object), X=X)
+    pd.DataFrame({"smiles": smiles}).to_parquet(st["fp_smiles"], index=False)
+    print(f"INIT fingerprint cache: {len(smiles):,} molecules packed to {st['fp_npy']} "
+          f"({X.nbytes / 1e9:.2f} GB on disk, {X.nbytes / max(len(smiles), 1):.0f} B/molecule)")
 
     # seed: a random subset of LIGANDS, written as an AFVS csv_collection_key_ligand list (named mode).
     # Per-molecule is the primary path (recall 0.78 vs 0.14 collection-granular; collection-granularity-finding.md).
@@ -382,7 +454,7 @@ def _cmd_init(args):
 def _cmd_round(args):
     st = _state(args.state_dir)
     manifest = pd.read_parquet(st["manifest"])
-    fp_cache = _load_fp_cache(st["fp"])
+    fp_cache = _load_fp_cache(st)
     docked, attempted = load_docked_scores(args.scores_glob)
     history = json.load(open(st["history"])) if os.path.exists(st["history"]) else []
     status, selected, info = run_round(
@@ -415,7 +487,7 @@ if __name__ == "__main__":
         r.add_argument("--per-round", type=int, required=True)
         r.add_argument("--k-frac", type=float, default=0.001)
         r.add_argument("--patience", type=int, default=3)
-        r.add_argument("--epsilon-random", type=float, default=0.05)
+        r.add_argument("--epsilon-random", type=float, default=0.0)  # MolPAL default; collection path only
         r.add_argument("--min-spearman", type=float, default=0.30)
         r.add_argument("--max-explore-rounds", type=int, default=3,
                        help="consecutive low-Spearman rounds to random-explore before stopping (QUALITY_LOW)")
@@ -457,8 +529,11 @@ if __name__ == "__main__":
         rows.append({"collection_key": ck, "ligand_id": f"L{i}", "smiles": s})
     manifest = pd.DataFrame(rows).drop_duplicates("ligand_id")
 
-    from ml_regressor import smi_to_fingerprint
-    Xfull = np.zeros((len(manifest), 1024), dtype=np.float32)
+    # Width comes from the module default, never a literal: a hardcoded 1024 here silently broke
+    # this whole branch the moment the default featurizer moved to 2048, and because this is the
+    # self-test path nothing else caught it.
+    from ml_regressor import DEFAULT_N_BITS, smi_to_fingerprint
+    Xfull = np.zeros((len(manifest), DEFAULT_N_BITS), dtype=np.float32)
     smi_to_row = {}
     for i, s in enumerate(manifest.smiles.tolist()):
         fp = smi_to_fingerprint(s)

@@ -114,7 +114,7 @@ def predict_ligand_scores(model, meta, manifest, fp_cache=None):
     Predict a per-LIGAND docking score for every row of the manifest (columns collection_key,
     ligand_id, smiles). Returns the manifest with a 'pred' column (unscoreable ligands -> +inf).
     This is the per-molecule path: rank individual ligands, not collections (recall 0.75 vs the
-    collection-granular 0.14 on real Tamarind qvina02 runs, see notes/collection-granularity-finding.md).
+    collection-granular 0.14 on real qvina02 runs).
     """
     smiles = manifest["smiles"].astype(str).tolist()
     if fp_cache is not None:
@@ -136,29 +136,132 @@ def predict_ligand_scores(model, meta, manifest, fp_cache=None):
     return df
 
 
-def select_ligands(manifest_pred, docked_ligands, budget_ligands, epsilon_random=0.05, seed=42):
+def predict_ligand_scores_ensemble(handles, manifest, fp_cache=None):
+    """Ensemble version of predict_ligand_scores: adds a 'pred_var' column.
+
+    'pred' is the ensemble MEAN and 'pred_var' the disagreement between members. Unscoreable
+    ligands sink to +inf pred with 0 variance, so they are never selected and never look uncertain.
     """
-    Rank un-docked ligands by predicted score (ascending = best binder first), take the top
-    `budget_ligands` (with an optional epsilon-random exploration fraction). Returns the selected
-    sub-DataFrame (collection_key, ligand_id, smiles, pred).
+    from ml_regressor import predict_ensemble_on_X  # local: keeps the module import surface small
+
+    smiles = manifest["smiles"].astype(str).tolist()
+    pred = np.full(len(smiles), np.nan, dtype=np.float64)
+    var = np.zeros(len(smiles), dtype=np.float64)
+    if fp_cache is not None:
+        smi_to_row, X = fp_cache
+        rows = np.array([smi_to_row.get(s, -1) for s in smiles])
+        ok = rows >= 0
+        if ok.any():
+            mu, vr = predict_ensemble_on_X(handles, X[rows[ok]])
+            pred[ok] = mu
+            var[ok] = vr
+    else:
+        meta0 = handles[0][1]
+        kept, X = fingerprint_all(smiles, radius=meta0.get("fp_radius", 2),
+                                  n_bits=meta0.get("fp_nbits", None),
+                                  fp_type=meta0.get("fp_type", "morgan"))
+        if len(kept):
+            mu, vr = predict_ensemble_on_X(handles, X)
+            for li, oi in enumerate(kept):
+                pred[oi] = mu[li]
+                var[oi] = vr[li]
+    df = manifest.copy()
+    df["pred"] = np.where(np.isnan(pred), np.inf, pred)
+    df["pred_var"] = np.where(np.isnan(pred), 0.0, var)
+    return df
+
+
+def env_setting(name):
     """
-    # coerce both sides to str: manifest ligand_id can be numeric (e.g. from a pre-built --collection-ligands
-    # parquet) while the exclusion set is str, and a dtype mismatch would silently re-select docked ligands.
-    # reset_index so selection is POSITIONAL: a non-unique manifest index (a future manifest source, a concat)
-    # would make label-based `.loc[picked_idx]` fan out (one label -> many rows), silently over-selecting and
-    # blowing the docking budget. Positional row ids are unique by construction, so this can't over-select.
-    avail = manifest_pred[~manifest_pred.ligand_id.astype(str).isin({str(x) for x in docked_ligands})] \
-        .reset_index(drop=True)
+    Read an optional VS setting from the environment, tolerating how it actually arrives.
+
+    get_inputs.virtual_screening() writes VS settings straight to os.environ and the docking
+    subprocess inherits them, so a website setting reaches this process without any shell edit.
+    Two arrival quirks make a bare `os.environ.get(name)` wrong:
+      - an UNSET optional Sequence field is exported as the literal string "None", because
+        export_vars.build_export_line str()s the value unconditionally, so `if v:` is TRUE for a
+        field nobody set;
+      - a JSON bool arrives capitalized ("True"/"False").
+    Absent, empty, "None" and "null" therefore all mean absent.
+    """
+    v = (os.environ.get(name) or "").strip()
+    return "" if v.lower() in ("", "none", "null") else v
+
+
+def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy",
+                   explore=False, seed=42, pred_var=None, docked_scores=None):
+    """
+    Ligand acquisition, backed by MolPAL's own Acquirer (vendored at tools/vendor/molpal).
+
+    This is the ONLY ligand selector. The previous hand-rolled greedy-plus-epsilon selector was
+    removed rather than kept behind a flag: MolPAL's greedy at epsilon=0 returns exactly the same
+    top-k unexplored by score, element for element, so there was nothing the old one did that this
+    does not, and carrying two selectors meant two things to keep correct.
+
+    Defaults are MolPAL's own: metric="greedy", epsilon=0.0 (Acquirer.__init__). On a point-predicting
+    surrogate (no ensemble, y_vars all zero) ucb, lcb, ts and ei reduce to greedy; pi does NOT, it
+    becomes a binary improves-or-not mask tie-broken by ligand-id, so it is not a safe stand-in for
+    greedy at zero variance. The uncertainty metrics only carry information behind a variance-providing
+    surrogate, which is why the website exposes greedy and random rather than the full metric list.
+
+    Four adaptations, each guarding a failure that would otherwise be silent:
+      - SIGN. `pred` is ascending-is-better (most negative = best binder) and MolPAL MAXIMIZES,
+        so we pass -pred and never the raw column.
+      - EXPLORED IS A MAPPING. acquire_batch does `ys = list(explored.values())`, so a set raises
+        on a non-empty value and, worse, passes SILENTLY when empty: a set-typed caller works in
+        round 1 and dies in round 2. We always pass a dict.
+      - FAILED LIGANDS COUNT AS EXPLORED. `docked_ligands` is the ATTEMPTED set (valid + failed),
+        so every member appears as a key and a known-failed dock is not re-acquired every round at
+        the budget's expense.
+      - EXPLORED VALUES ARE REAL SCORES, NOT NaN. acquire_batch reads `explored` for TWO things,
+        and an earlier version of this function saw only the first: membership (the exclusion test)
+        and `current_max = np.nan_to_num(values, nan=-inf).max()`, which ei and pi use as the
+        incumbent to improve on. Mapping every attempted ligand to NaN drove current_max to -inf,
+        which made ei return +inf and pi return 1.0 for the WHOLE pool, a total tie that fell
+        through to ligand-id string order and selected the worst ligands with every log line
+        healthy. So we pass -score for a valid dock (mirroring the sign flip above, since these are
+        observed objective values in the same space as y_means) and keep NaN only for a genuinely
+        failed one, which is the minority-sentinel meaning MolPAL's own Explorer gives it.
+
+    The explore round passes metric="random" rather than mapping our eff_epsilon onto MolPAL's
+    `epsilon`: MolPAL draws its epsilon indices over the WHOLE pool including explored ligands, so
+    an epsilon of 1.0 does not mean what eff_epsilon=1.0 means here.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+    from molpal.acquirer import Acquirer  # noqa: E402  (vendored; see tools/vendor/molpal)
+
+    # Same dtype + positional discipline as select_ligands: coerce both sides to str so a numeric
+    # manifest ligand_id cannot silently re-select a docked ligand, and reset_index so selection is
+    # positional and a non-unique manifest index cannot fan out into an over-selection.
+    avail = manifest_pred.reset_index(drop=True)
     if avail.empty or budget_ligands <= 0:
         return avail.iloc[0:0]
-    rng = np.random.RandomState(seed)
-    n_random = min(len(avail), int(round(budget_ligands * epsilon_random)))
-    picked_pos = []
-    if n_random > 0:
-        picked_pos = list(rng.choice(avail.index.to_numpy(), n_random, replace=False))
-    rest = avail.drop(index=picked_pos).sort_values("pred")
-    n_greedy = max(0, budget_ligands - len(picked_pos))
-    picked_pos += list(rest.index[:n_greedy])
+
+    xs = [str(x) for x in avail.ligand_id.to_numpy()]
+    y_means = -avail.pred.to_numpy(dtype=float)          # MolPAL maximizes; pred is lower-is-better
+    # Real per-ligand variance when the caller supplies one (ensemble disagreement), else
+    # zeros, which correctly collapses every uncertainty metric back to greedy rather than
+    # pretending to an uncertainty the surrogate does not have.
+    if pred_var is None:
+        y_vars = np.zeros(len(xs), dtype=float)
+    else:
+        y_vars = np.asarray(pred_var, dtype=float)[avail.index.to_numpy()] \
+            if len(pred_var) != len(xs) else np.asarray(pred_var, dtype=float)
+    scores = {} if docked_scores is None else {str(kk): vv for kk, vv in docked_scores.items()}
+    explored = {}
+    for x in docked_ligands:
+        lid = str(x)
+        s = scores.get(lid)
+        explored[lid] = float("nan") if s is None else -float(s)
+
+    acq = Acquirer(size=len(xs), init_size=budget_ligands, batch_sizes=[budget_ligands],
+                   metric=("random" if explore else metric), epsilon=0.0, seed=seed, verbose=0)
+    picked = acq.acquire_batch(xs=xs, y_means=y_means, y_vars=y_vars, explored=explored, t=1)
+
+    pos_of = {}
+    for i, lid in enumerate(xs):
+        pos_of.setdefault(lid, i)
+    picked_pos = [pos_of[p] for p in picked if p in pos_of]
     return avail.loc[picked_pos]
 
 
