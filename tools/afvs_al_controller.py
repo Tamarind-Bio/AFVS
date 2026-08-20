@@ -74,6 +74,10 @@ def _state(state_dir):
         # dir written by the previous version resumes rather than re-fingerprinting.
         "fp_npy": os.path.join(state_dir, "fp_cache.npy"),
         "fp_smiles": os.path.join(state_dir, "fp_cache_smiles.parquet"),
+        # Manifest row index of each kept cache row, strictly increasing. Written at init so a
+        # reader can searchsorted into it instead of rebuilding a SMILES-keyed dict, which was
+        # measured at 93 B/molecule against 8 here.
+        "fp_keep": os.path.join(state_dir, "fp_keep.npy"),
         "fp": os.path.join(state_dir, "fp_cache.npz"),   # legacy, read-only
         "docked": os.path.join(state_dir, "docked_collections.txt"),
         "model": os.path.join(state_dir, "model.pt"),
@@ -98,6 +102,25 @@ def _load_fp_cache(st):
     d = np.load(st["fp"], allow_pickle=True)
     smi = list(d["smiles"])
     return {s: i for i, s in enumerate(smi)}, d["X"]
+
+
+def iter_parquet_column(path, column, batch_size=100_000):
+    """Yield one parquet column's values without materializing it.
+
+    The pool-scaled alternative is `pd.read_parquet(...).col.astype(str).tolist()`, measured at
+    117 B/molecule of resident Python str, which is 117 GB at a 1e9 pool. Peak here is one batch.
+    """
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(path)
+    for batch in pf.iter_batches(batch_size=batch_size, columns=[column]):
+        for v in batch.column(0).to_pylist():
+            yield v
+
+
+def parquet_num_rows(path):
+    """Row count from parquet metadata, without reading a single row group."""
+    import pyarrow.parquet as pq
+    return pq.ParquetFile(path).metadata.num_rows
 
 
 # ---------- SEAM A: manifest ----------
@@ -428,12 +451,24 @@ def _cmd_init(args):
     # np.packbits round-trips exactly, so this is a change of storage and not of value, and the
     # cache's row order is still the kept order. To re-check that yourself, compare
     # unpack_fp(fingerprint_to_packed_npy(s)[1]) against fingerprint_all(s)[1] with np.array_equal.
-    all_smiles = manifest.smiles.astype(str).tolist()
-    kept, X = fingerprint_to_packed_npy(all_smiles, st["fp_npy"], progress_every=1_000_000)
-    smiles = [all_smiles[i] for i in kept]
-    pd.DataFrame({"smiles": smiles}).to_parquet(st["fp_smiles"], index=False)
-    print(f"INIT fingerprint cache: {len(smiles):,} molecules packed to {st['fp_npy']} "
-          f"({X.nbytes / 1e9:.2f} GB on disk, {X.nbytes / max(len(smiles), 1):.0f} B/molecule)")
+    # STREAMED off the manifest parquet rather than through Python lists. The previous shape held
+    # THREE full-pool structures at once: all_smiles (117 B/molecule of resident str), the kept
+    # index list (~40 B/element against 8 for int64), and the [all_smiles[i] for i in kept] copy.
+    # That is roughly 274 GB at a 1e9 pool, before the fingerprints themselves. The generator, the
+    # int64 kept array and the incremental sidecar writer make all three bounded by one batch.
+    n_rows = parquet_num_rows(st["manifest"])
+    kept, X = fingerprint_to_packed_npy(
+        iter_parquet_column(st["manifest"], "smiles"),
+        st["fp_npy"],
+        progress_every=1_000_000,
+        n_total=n_rows,
+        keep_out=st["fp_keep"],
+        smiles_out=st["fp_smiles"],
+    )
+    n_kept = int(kept.shape[0])
+    print(f"INIT fingerprint cache: {n_kept:,} molecules packed to {st['fp_npy']} "
+          f"({X.nbytes / 1e9:.2f} GB on disk, {X.nbytes / max(n_kept, 1):.0f} B/molecule); "
+          f"{n_rows - n_kept:,} unparseable dropped")
 
     # seed: a random subset of LIGANDS, written as an AFVS csv_collection_key_ligand list (named mode).
     # Per-molecule is the primary path (recall 0.78 vs 0.14 collection-granular; collection-granularity-finding.md).

@@ -182,24 +182,45 @@ def is_packed(X, n_bits):
 
 
 def fingerprint_to_packed_npy(smiles_list, out_path, radius=2, n_bits=None, fp_type=None,
-                              chunk=50_000, progress_every=0):
+                              chunk=50_000, progress_every=0, n_total=None,
+                              keep_out=None, smiles_out=None):
     """
     Stream SMILES -> a packed uint8 .npy on disk, never holding the full matrix in RAM.
 
-    Returns (kept_indices, X) where X is a memory-mapped VIEW of just the kept rows, so callers
-    index it exactly like the fingerprint_all result. Peak RAM is one chunk (chunk * n_bits/8
-    bytes, ~12.8 MB at the default) plus kept_indices, instead of ~2x the whole float32 matrix.
+    Returns (kept_indices, X). `kept_indices` is an np.int64 ARRAY, not a Python list: at 1e9 a
+    list of ints is ~40 B/element against 8, and the list was one of three full-pool Python
+    structures the init path used to hold at once.
 
-    Unparseable SMILES are DROPPED, matching fingerprint_all: the cache's row order is the kept
-    order, and an unlisted SMILES resolves to row -1 at select time and sinks to +inf. The file is
-    allocated for len(smiles_list) rows and returned sliced to the kept count, so a parse-failure
-    rate f leaves f of the file unused rather than paying a full second copy to trim it; at the
-    sub-1% rates observed that is cheaper than the rewrite.
+    `smiles_list` may be any ITERABLE, including a generator that streams a parquet column, so the
+    caller never has to materialize the pool as a Python list of str (~117 B/molecule measured).
+    An iterable with no len() needs `n_total`, which sizes the output file; pass the parquet's
+    metadata.num_rows, which costs no read.
+
+    `smiles_out` writes the KEPT smiles to a parquet sidecar incrementally as chunks flush. That
+    exists so the caller does not do `[all_smiles[i] for i in kept]`, which was a second full-pool
+    list on top of the first.
+
+    `keep_out` persists `kept_indices` as an .npy. The row order is the kept order and the indices
+    are strictly increasing, so a later reader can np.searchsorted into it rather than rebuilding a
+    string-keyed dict.
+
+    Unparseable SMILES are DROPPED, matching fingerprint_all: an unlisted SMILES resolves to row -1
+    at select time and sinks to +inf. The file is allocated for the total row count and returned
+    sliced to the kept count, so a parse-failure rate f leaves f of the file unused rather than
+    paying a full second copy to trim it; at the sub-1% rates observed that is cheaper.
     """
     n_bits = DEFAULT_N_BITS if n_bits is None else n_bits
     fp_type = DEFAULT_FP_TYPE if fp_type is None else fp_type
     width = packed_width(n_bits)
-    n = len(smiles_list)
+    if n_total is None:
+        try:
+            n_total = len(smiles_list)
+        except TypeError:
+            raise ValueError(
+                "smiles_list has no len(); pass n_total so the output file can be sized. "
+                "For a parquet column that is ParquetFile(path).metadata.num_rows, which costs no read."
+            )
+    n = int(n_total)
 
     out_dir = os.path.dirname(out_path)
     if out_dir and not os.path.exists(out_dir):
@@ -207,33 +228,58 @@ def fingerprint_to_packed_npy(smiles_list, out_path, radius=2, n_bits=None, fp_t
 
     mm = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.uint8,
                                    shape=(max(n, 1), width))
-    kept_indices = []
+    # Grown geometrically rather than appended to a list: same amortized cost, 8 B/element.
+    kept = np.empty(max(1024, min(n, 1 << 20)), dtype=np.int64)
+    n_kept = 0
     buf = np.zeros((chunk, width), dtype=np.uint8)
+    smi_buf = [] if smiles_out else None
+    writer = None
     b = 0   # rows buffered
     k = 0   # rows written
 
     def _flush():
-        nonlocal b, k
-        if b:
-            mm[k:k + b] = buf[:b]
-            k += b
-            b = 0
+        nonlocal b, k, writer
+        if not b:
+            return
+        mm[k:k + b] = buf[:b]
+        k += b
+        b = 0
+        if smiles_out:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            tbl = pa.table({"smiles": pa.array(smi_buf, type=pa.string())})
+            if writer is None:
+                writer = pq.ParquetWriter(smiles_out, tbl.schema)
+            writer.write_table(tbl)
+            smi_buf.clear()
 
-    for i, smi in enumerate(smiles_list):
-        fp = smi_to_fingerprint(smi, radius=radius, n_bits=n_bits, fp_type=fp_type)
-        if fp is None:
-            continue
-        buf[b] = np.packbits(fp.astype(np.uint8))
-        b += 1
-        kept_indices.append(i)
-        if b == chunk:
-            _flush()
-            if progress_every and k % progress_every == 0:
-                print(f"  fingerprinted {k:,}/{n:,}", flush=True)
-    _flush()
+    try:
+        for i, smi in enumerate(smiles_list):
+            fp = smi_to_fingerprint(smi, radius=radius, n_bits=n_bits, fp_type=fp_type)
+            if fp is None:
+                continue
+            buf[b] = np.packbits(fp.astype(np.uint8))
+            b += 1
+            if n_kept == kept.shape[0]:
+                kept = np.resize(kept, kept.shape[0] * 2)
+            kept[n_kept] = i
+            n_kept += 1
+            if smiles_out:
+                smi_buf.append(smi)
+            if b == chunk:
+                _flush()
+                if progress_every and k % progress_every == 0:
+                    print(f"  fingerprinted {k:,}/{n:,}", flush=True)
+        _flush()
+    finally:
+        if writer is not None:
+            writer.close()
 
     mm.flush()
-    return kept_indices, mm[:k]
+    kept = kept[:n_kept]
+    if keep_out:
+        np.save(keep_out, kept)
+    return kept, mm[:k]
 
 
 def load_packed_npy(path, mmap=True):
