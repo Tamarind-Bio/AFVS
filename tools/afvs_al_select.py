@@ -51,7 +51,7 @@ def per_collection_scores(model, meta, manifest, fp_cache=None):
         pred = np.full(len(smiles), np.nan, dtype=np.float32)
         ok = rows >= 0
         if ok.any():
-            pred[ok] = predict_on_X(model, meta, X[rows[ok]])
+            pred[ok] = predict_on_X(model, meta, X, rows=rows[ok])
     else:
         kept, X = fingerprint_all(smiles, radius=meta.get("fp_radius", 2), n_bits=meta.get("fp_nbits", 1024))
         pred = np.full(len(smiles), np.nan, dtype=np.float32)
@@ -123,7 +123,7 @@ def predict_ligand_scores(model, meta, manifest, fp_cache=None):
         pred = np.full(len(smiles), np.nan, dtype=np.float32)
         ok = rows >= 0
         if ok.any():
-            pred[ok] = predict_on_X(model, meta, X[rows[ok]])
+            pred[ok] = predict_on_X(model, meta, X, rows=rows[ok])
     else:
         kept, X = fingerprint_all(smiles, radius=meta.get("fp_radius", 2), n_bits=meta.get("fp_nbits", 1024))
         pred = np.full(len(smiles), np.nan, dtype=np.float32)
@@ -152,7 +152,7 @@ def predict_ligand_scores_ensemble(handles, manifest, fp_cache=None):
         rows = np.array([smi_to_row.get(s, -1) for s in smiles])
         ok = rows >= 0
         if ok.any():
-            mu, vr = predict_ensemble_on_X(handles, X[rows[ok]])
+            mu, vr = predict_ensemble_on_X(handles, X, rows=rows[ok])
             pred[ok] = mu
             var[ok] = vr
     else:

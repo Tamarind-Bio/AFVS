@@ -336,7 +336,19 @@ def train_on_X(X, y, val_fraction=0.10, batch_size=256, max_epochs=100, patience
     return model, meta
 
 
-def predict_on_X(model, meta, X, device=None, chunk=200_000):
+# Bounded in bytes of the unpacked block, not rows: the safe row count depends on the fingerprint
+# width, and that width has already moved once (1024 -> 2048) without the row-count default moving.
+DEFAULT_CHUNK_BYTES = 128 << 20  # 128 MB unpacked float32 -> 16,384 rows at 2048 bits
+
+
+def _rows_per_chunk(n_bits, chunk):
+    """Rows per chunk: an explicit caller-supplied `chunk` wins, else bound the block by bytes."""
+    if chunk is not None:
+        return int(chunk)
+    return max(1, DEFAULT_CHUNK_BYTES // (int(n_bits) * 4))
+
+
+def predict_on_X(model, meta, X, device=None, chunk=None, rows=None):
     """Predict docking scores (original units) for a precomputed fingerprint matrix X, chunked.
 
     X may be a float32 matrix OR the packed uint8 representation (including a memory-mapped one),
@@ -345,21 +357,50 @@ def predict_on_X(model, meta, X, device=None, chunk=200_000):
     pool into RAM before the first chunk, which silently defeated any memory-mapped cache handed
     to it (a memmap goes in with OWNDATA False and comes out of asarray with OWNDATA True), so the
     chunking bounded only tensor memory and not the array it was chunking.
+
+    `rows` is an optional integer index array selecting a SUBSET of X, and it exists because the
+    obvious caller-side spelling defeats everything the paragraph above buys. `X[rows]` is a
+    fancy-index gather, so numpy materializes the whole selection as a new array BEFORE this
+    function is entered; the chunk loop then bounds nothing, because the peak already happened in
+    the caller. Passing the indices instead keeps the gather per-chunk, so peak memory is
+    O(chunk) rather than O(len(rows)). At a 1e9 pool the difference is a 256 GB allocation on a
+    123 GB box versus a few hundred MB. Duplicate and unsorted indices are both fine.
     """
     device = get_device(device)
     model = model.to(device)
     model.eval()
     n_bits = int(meta.get("input_dim") or meta.get("fp_nbits") or DEFAULT_N_BITS)
+    chunk = _rows_per_chunk(n_bits, chunk)
     packed = is_packed(X, n_bits)
-    n = X.shape[0]
+    if rows is None:
+        n = X.shape[0]
+    else:
+        rows = np.asarray(rows)
+        if rows.ndim != 1:
+            raise ValueError(f"rows must be a 1-D index array, got shape {rows.shape}")
+        n = int(rows.shape[0])
     out = np.empty(n, dtype=np.float32)
     with torch.no_grad():
         for start in range(0, n, chunk):
-            blk = X[start:start + chunk]
+            if rows is None:
+                blk = X[start:start + chunk]
+                order = None
+            else:
+                idx = rows[start:start + chunk]
+                # Sorted gather, inverted on the way out: on a memmap an arbitrary index order is
+                # a random-page read. Duplicates are fine (gathered and scattered back twice).
+                order = np.argsort(idx, kind="stable")
+                blk = X[idx[order]]
             blk = (unpack_fp(blk, n_bits) if packed
                    else np.ascontiguousarray(blk, dtype=np.float32))
             z = model(torch.from_numpy(blk).to(device)).squeeze(1).cpu().numpy()
-            out[start:start + chunk] = z * meta["y_std"] + meta["y_mean"]
+            z = z * meta["y_std"] + meta["y_mean"]
+            # Basic slicing, so `dest` is a view into out and the scatter writes through.
+            dest = out[start:start + chunk]
+            if order is None:
+                dest[:] = z
+            else:
+                dest[order] = z
     return out
 
 
@@ -393,15 +434,19 @@ def train_ensemble_on_X(X, y, n_models=DEFAULT_ENSEMBLE, seed=42, **kwargs):
     return out
 
 
-def predict_ensemble_on_X(handles, X, device=None, chunk=200_000):
+def predict_ensemble_on_X(handles, X, device=None, chunk=None, rows=None):
     """Return (mean, var) over an ensemble, both in the ORIGINAL score units.
 
     var is the population variance of the members' predictions, i.e. how much the ensemble disagrees
     about a ligand. It is an uncertainty SIGNAL for acquisition, not a calibrated posterior, and it
     is documented that way so nobody reads a confidence interval off it. A 1-member ensemble returns
     all-zero variance, which correctly degrades every uncertainty metric back to greedy.
+
+    `rows` is forwarded to predict_on_X unchanged; see its docstring for why passing indices beats
+    passing X[rows]. Forwarding matters more here than on the single-model path, because without it
+    the caller's one materialized gather is paid once and then read by every ensemble member.
     """
-    preds = np.stack([predict_on_X(m, meta, X, device=device, chunk=chunk)
+    preds = np.stack([predict_on_X(m, meta, X, device=device, chunk=chunk, rows=rows)
                       for m, meta in handles], axis=0)
     return preds.mean(axis=0), preds.var(axis=0)
 
