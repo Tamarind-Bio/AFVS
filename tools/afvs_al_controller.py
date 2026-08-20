@@ -201,7 +201,11 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
         hold, tr = perm[:n_hold], perm[n_hold:]
         if len(tr) >= 10:
             probe, pmeta = train_on_X(Xtr[tr], ytr[tr], seed=seed)
-            rho = spearmanr(predict_on_X(probe, pmeta, Xtr[hold]), ytr[hold]).correlation
+            # rows=hold, not Xtr[hold]: the gather would materialize before predict_on_X chunks it.
+            # Budget-scaled rather than pool-scaled, so this one is small at an explicit alBudget,
+            # but it is the same shape as the three in afvs_al_select.py and the default budget is
+            # a fraction of the pool, which makes it grow with N after all.
+            rho = spearmanr(predict_on_X(probe, pmeta, Xtr, rows=hold), ytr[hold]).correlation
             if rho is None or np.isnan(rho):
                 rho = -1.0                                   # probe ran but degenerate -> worst quality
     if model_out:
