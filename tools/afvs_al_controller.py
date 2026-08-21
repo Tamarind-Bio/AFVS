@@ -168,6 +168,39 @@ def load_docked_scores(scores_glob):
 
 # ---------- round logic (testable) ----------
 
+def resolve_smiles_for(manifest, wanted_ids, block=1_000_000):
+    """smiles for ONLY the ligand ids in `wanted_ids`, resolved a block at a time.
+
+    Replaces `dict(zip(manifest.ligand_id.astype(str), manifest.smiles.astype(str)))`, which built
+    one entry per POOL molecule to answer lookups for the DOCKED set alone. The docked set is bounded
+    by the docking budget, so on a real screen it is 3 to 4 orders of magnitude smaller than the pool
+    (measured: 80,635 docked against a 103,535,252 pool, 0.078%).
+
+    This matters much more on the deployed stack than a local measurement suggests. pandas 3.0 keeps
+    string columns in Arrow buffers, so `.astype(str)` MINTS a fresh Python str per element instead of
+    handing back one that already exists. Measured marginal cost of the old line: 90.9 B/molecule on
+    pandas 2.3.3 (object dtype, strings reused) against 255.5 B/molecule on the deployed pandas 3.0.3.
+
+    Equivalence: dict(zip(...)) is LAST-WINS on a duplicate ligand_id, so blocks are walked in
+    manifest order and `out.update` reproduces that exactly. An id absent from the manifest is absent
+    here too, which is what makes the caller's `.map()` yield NaN and its dropna() behave unchanged.
+    The transient is one block of strings, not the pool.
+    """
+    out = {}
+    if not wanted_ids:
+        return out
+    n = len(manifest)
+    for start in range(0, n, block):
+        blk = manifest.iloc[start:start + block]
+        ids = blk.ligand_id.astype(str)
+        hit = ids.isin(wanted_ids).to_numpy()
+        if not hit.any():
+            continue
+        sub = blk[hit]
+        out.update(zip(sub.ligand_id.astype(str), sub.smiles.astype(str)))
+    return out
+
+
 def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac=0.001,
               patience=3, conv_eps=0.01, epsilon_random=0.0, min_spearman=0.30, seed=42,
               history=None, model_out=None, todo_out=None, granularity="molecule",
@@ -189,9 +222,11 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     smi_to_row, X = fp_cache
     total_ligands = manifest.ligand_id.nunique()
 
-    # join docked ligand scores to fingerprints (via manifest smiles)
-    lig2smi = dict(zip(manifest.ligand_id.astype(str), manifest.smiles.astype(str)))
+    # join docked ligand scores to fingerprints (via manifest smiles). Resolve only the ids we are
+    # about to look up: the full-pool dict this replaces was the second-largest allocation in the
+    # round path, and it existed to answer at most `budget` lookups. See resolve_smiles_for.
     d = docked_scores.copy()
+    lig2smi = resolve_smiles_for(manifest, set(d.ligand.astype(str)))
     d["smiles"] = d.ligand.astype(str).map(lig2smi)
     d = d.dropna(subset=["smiles"]).drop_duplicates("ligand")
     rows = d.smiles.map(smi_to_row)
