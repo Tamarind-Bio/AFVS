@@ -281,8 +281,17 @@ class Acquirer:
             self.stochastic_preds,
         )
 
-        idxs = np.random.choice(U.size, math.ceil(batch_size * self.epsilon), False)
-        U[idxs] = np.inf
+        n_explore = math.ceil(batch_size * self.epsilon)
+        if n_explore:  # TAMARIND VENDOR EDIT: was an unconditional np.random.choice(...).
+            # `replace=False` takes numpy's permutation(pop_size)[:size] branch, which allocates a
+            # full int64 permutation of the POOL regardless of how many indices are wanted. AFVS
+            # always runs epsilon=0.0, so this asked for zero indices and paid the whole allocation
+            # to get them: measured 8.0 B per molecule, exactly linear (8.0MB at 1e6, 40.0MB at 5e6,
+            # 160.0MB at 2e7), which is ~830MB per round on a 100M-molecule library and ~8GB at 1e9,
+            # every round, to produce an empty array. Guarding on the count is behaviour-preserving
+            # for every epsilon: at 0 the old code assigned np.inf to nothing at all.
+            idxs = np.random.choice(U.size, n_explore, False)
+            U[idxs] = np.inf
 
         if self.verbose > 1:
             print("Done!")
