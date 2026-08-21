@@ -237,8 +237,23 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     # convergence on the rolling mean of the top-K docked score
     k = max(1, int(round(total_ligands * k_frac)))
     topk_mean = float(np.sort(ytr)[:k].mean())
+    # k above is scaled against the POOL, so it exceeds len(ytr) whenever the docked fraction is at
+    # or below k_frac, which is every large-pool screen: a 1e8 pool at a 1e5 budget docks 0.08%, and
+    # a 1e9 pool at a 1e6 budget docks exactly 0.1%. Past the end, np.sort(ytr)[:k] returns the WHOLE
+    # array, so topk_mean silently degenerates to the mean of every docked score. It is not a bug on
+    # small pools (a 2.5M run at this budget gets a genuine top-2,550), which is why the meaning
+    # flips with run shape rather than being uniformly wrong.
+    # topk_docked_mean rescales the same fraction against what was actually docked, so it is a real
+    # top-K on every run shape. Clamping k to len(ytr) instead would be a BITWISE no-op: the slice
+    # already truncates. Convergence below deliberately keeps reading topk_mean, because replaying
+    # this run's history with the honest value as the convergence input converges a round early and
+    # silently strips an authorized acquisition round off the customer's budget. Changing the
+    # stopping rule is a separate decision from reporting an honest number.
+    k_docked = max(1, min(len(ytr), int(round(len(ytr) * k_frac))))
+    topk_docked_mean = float(np.sort(ytr)[:k_docked].mean())
     history.append({"round": len(history), "docked_ligands": docked_ligands,
-                    "topk_mean": topk_mean, "spearman": rho})
+                    "topk_mean": topk_mean, "topk_docked_mean": topk_docked_mean,
+                    "k_docked": k_docked, "spearman": rho})
     converged = False
     if len(history) > patience:
         prev = np.mean([h["topk_mean"] for h in history[-patience - 1:-1]])
@@ -264,6 +279,7 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     # so dock failures don't let the loop overspend the customer's docking budget.
     n_attempted = len(attempted_ligands) if attempted_ligands is not None else docked_ligands
     info = {"docked_ligands": docked_ligands, "attempted": n_attempted, "topk_mean": topk_mean,
+            "topk_docked_mean": topk_docked_mean, "k_docked": k_docked,
             "spearman": rho, "n_docked_collections": len(docked_collections),
             "mode": "exploit" if trusted else "explore"}
 
