@@ -44,15 +44,19 @@ def per_collection_scores(model, meta, manifest, fp_cache=None):
     Returns:
         DataFrame: collection_key, pred_best, ligand_count.
     """
-    smiles = manifest["smiles"].astype(str).tolist()
+    n = len(manifest)
     if fp_cache is not None:
-        smi_to_row, X = fp_cache
-        rows = np.array([smi_to_row.get(s, -1) for s in smiles])
-        pred = np.full(len(smiles), np.nan, dtype=np.float32)
+        # row_of is indexed by MANIFEST ROW, so this function's rows ARE row_of. The old shape
+        # materialised manifest["smiles"] as a full-pool Python list purely to re-derive, one
+        # dict lookup at a time, an array the fingerprint cache already carries.
+        row_of, X = fp_cache
+        rows = np.asarray(row_of)
+        pred = np.full(n, np.nan, dtype=np.float32)
         ok = rows >= 0
         if ok.any():
             pred[ok] = predict_on_X(model, meta, X, rows=rows[ok])
     else:
+        smiles = manifest["smiles"].astype(str).tolist()
         kept, X = fingerprint_all(smiles, radius=meta.get("fp_radius", 2), n_bits=meta.get("fp_nbits", 1024))
         pred = np.full(len(smiles), np.nan, dtype=np.float32)
         if len(kept):
@@ -116,15 +120,19 @@ def predict_ligand_scores(model, meta, manifest, fp_cache=None):
     This is the per-molecule path: rank individual ligands, not collections (recall 0.75 vs the
     collection-granular 0.14 on real qvina02 runs).
     """
-    smiles = manifest["smiles"].astype(str).tolist()
+    n = len(manifest)
     if fp_cache is not None:
-        smi_to_row, X = fp_cache
-        rows = np.array([smi_to_row.get(s, -1) for s in smiles])
-        pred = np.full(len(smiles), np.nan, dtype=np.float32)
+        # row_of is indexed by MANIFEST ROW, so this function's rows ARE row_of. The old shape
+        # materialised manifest["smiles"] as a full-pool Python list purely to re-derive, one
+        # dict lookup at a time, an array the fingerprint cache already carries.
+        row_of, X = fp_cache
+        rows = np.asarray(row_of)
+        pred = np.full(n, np.nan, dtype=np.float32)
         ok = rows >= 0
         if ok.any():
             pred[ok] = predict_on_X(model, meta, X, rows=rows[ok])
     else:
+        smiles = manifest["smiles"].astype(str).tolist()
         kept, X = fingerprint_all(smiles, radius=meta.get("fp_radius", 2), n_bits=meta.get("fp_nbits", 1024))
         pred = np.full(len(smiles), np.nan, dtype=np.float32)
         if len(kept):
@@ -144,18 +152,22 @@ def predict_ligand_scores_ensemble(handles, manifest, fp_cache=None):
     """
     from ml_regressor import predict_ensemble_on_X  # local: keeps the module import surface small
 
-    smiles = manifest["smiles"].astype(str).tolist()
-    pred = np.full(len(smiles), np.nan, dtype=np.float64)
-    var = np.zeros(len(smiles), dtype=np.float64)
+    n = len(manifest)
+    pred = np.full(n, np.nan, dtype=np.float64)
+    var = np.zeros(n, dtype=np.float64)
     if fp_cache is not None:
-        smi_to_row, X = fp_cache
-        rows = np.array([smi_to_row.get(s, -1) for s in smiles])
+        # row_of is indexed by MANIFEST ROW, so this function's rows ARE row_of. The old shape
+        # materialised manifest["smiles"] as a full-pool Python list purely to re-derive, one
+        # dict lookup at a time, an array the fingerprint cache already carries.
+        row_of, X = fp_cache
+        rows = np.asarray(row_of)
         ok = rows >= 0
         if ok.any():
             mu, vr = predict_ensemble_on_X(handles, X, rows=rows[ok])
             pred[ok] = mu
             var[ok] = vr
     else:
+        smiles = manifest["smiles"].astype(str).tolist()
         meta0 = handles[0][1]
         kept, X = fingerprint_all(smiles, radius=meta0.get("fp_radius", 2),
                                   n_bits=meta0.get("fp_nbits", None),

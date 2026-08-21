@@ -85,23 +85,68 @@ def _state(state_dir):
     }
 
 
-def _load_fp_cache(st):
-    """Return (smi_to_row, X). X is a memory-mapped PACKED matrix on the current format.
+def _load_fp_cache(st, n_manifest):
+    """Return (row_of, X). X is a memory-mapped PACKED matrix on the current format.
 
-    Accepts either the packed .npy + parquet pair or a legacy .npz, so an in-flight run whose
-    state dir predates the packed format still resumes. predict_on_X unpacks per chunk, so the
-    caller does not care which it got; the only observable difference is resident memory.
+    row_of is an int32 array indexed by MANIFEST ROW holding that row's cache row, or -1 if the row
+    was dropped at fingerprint time (unparseable SMILES). It replaces a full-pool {smiles: row} dict.
+
+    That dict was reconstructing, from one Python str per pool molecule, an array the INIT step
+    already writes to disk. `fp_keep.npy` is the kept-row index: kept[r] is the manifest row that
+    produced cache row r, so its inverse IS row_of and building it is a scatter, not a scan.
+    Measured cost of the dict it replaces: 46.4 B/molecule locally, 88.4 B/molecule on the deployed
+    pandas 3.0.3 stack (where .astype(str) mints fresh strings). row_of is 4 B/molecule flat.
+
+    Three of the four consumers resolved EVERY manifest row in manifest order, so they can now index
+    row_of directly and skip materialising manifest["smiles"] at all, which is the larger half of the
+    saving at those call sites.
+
+    EQUIVALENCE, and the one case where indices legitimately differ: when the SAME smiles appears at
+    two manifest rows, the old dict comprehension kept the LAST cache row for that string, so both
+    manifest rows resolved to one shared cache row; row_of gives each manifest row the cache row
+    built FROM it. The row NUMBERS differ, the PREDICTIONS cannot: identical SMILES fingerprint
+    identically, so predict_on_X returns the same value from either row. Unparseable SMILES resolve
+    to -1 under both.
     """
     if os.path.exists(st["fp_npy"]) and os.path.exists(st["fp_smiles"]):
-        smi = pd.read_parquet(st["fp_smiles"], columns=["smiles"]).smiles.astype(str).tolist()
         X = load_packed_npy(st["fp_npy"], mmap=True)
-        # The .npy is allocated for the pre-drop row count and sliced to the kept rows, so trust
-        # the SMILES sidecar for the length rather than X.shape[0].
-        return {s: i for i, s in enumerate(smi)}, X[:len(smi)]
+        if os.path.exists(st["fp_keep"]):
+            kept = np.load(st["fp_keep"])
+            row_of = np.full(n_manifest, -1, dtype=np.int32)
+            # kept holds manifest rows; a state dir from a LARGER manifest than the one passed would
+            # scatter out of bounds, so fail loud rather than silently truncating the cache.
+            if len(kept) and int(kept.max()) >= n_manifest:
+                raise ValueError(
+                    f"fp_keep references manifest row {int(kept.max())} but the manifest has "
+                    f"{n_manifest} rows; the state dir and the manifest disagree")
+            row_of[kept] = np.arange(len(kept), dtype=np.int32)
+            return row_of, X[:len(kept)]
+        # No keep index (a state dir written before fp_keep existed). Fall back to the sidecar, which
+        # is the only other record of the kept order. This path is O(pool) in strings by necessity.
+        smi = pd.read_parquet(st["fp_smiles"], columns=["smiles"]).smiles.astype(str).tolist()
+        return _row_of_from_smiles(st, smi, n_manifest), X[:len(smi)]
 
     d = np.load(st["fp"], allow_pickle=True)
     smi = list(d["smiles"])
-    return {s: i for i, s in enumerate(smi)}, d["X"]
+    return _row_of_from_smiles(st, smi, n_manifest), d["X"]
+
+
+def _row_of_from_smiles(st, cache_smiles, n_manifest):
+    """Legacy bridge: rebuild row_of by matching the cache's SMILES order against the manifest.
+
+    Only reached for a state dir with no fp_keep.npy, i.e. one written before that index existed.
+    Streams the manifest so this fallback does not reintroduce the full-pool structure the caller
+    exists to remove; the cache-side dict is bounded by the cache, not by the pool.
+    """
+    pos = {s: i for i, s in enumerate(cache_smiles)}
+    row_of = np.full(n_manifest, -1, dtype=np.int32)
+    for at, s in enumerate(iter_parquet_column(st["manifest"], "smiles")):
+        if at >= n_manifest:
+            break
+        r = pos.get(s, -1)
+        if r >= 0:
+            row_of[at] = r
+    return row_of
 
 
 def iter_parquet_column(path, column, batch_size=100_000):
@@ -168,8 +213,8 @@ def load_docked_scores(scores_glob):
 
 # ---------- round logic (testable) ----------
 
-def resolve_smiles_for(manifest, wanted_ids, block=1_000_000):
-    """smiles for ONLY the ligand ids in `wanted_ids`, resolved a block at a time.
+def resolve_manifest_positions(manifest, wanted_ids, block=1_000_000):
+    """manifest ROW POSITION for ONLY the ligand ids in `wanted_ids`, resolved a block at a time.
 
     Replaces `dict(zip(manifest.ligand_id.astype(str), manifest.smiles.astype(str)))`, which built
     one entry per POOL molecule to answer lookups for the DOCKED set alone. The docked set is bounded
@@ -185,6 +230,11 @@ def resolve_smiles_for(manifest, wanted_ids, block=1_000_000):
     manifest order and `out.update` reproduces that exactly. An id absent from the manifest is absent
     here too, which is what makes the caller's `.map()` yield NaN and its dropna() behave unchanged.
     The transient is one block of strings, not the pool.
+
+    Positions rather than smiles: the caller's only use for the smiles was to look up a fingerprint
+    row, and the fingerprint cache is addressable by manifest POSITION directly (see _load_fp_cache),
+    so the smiles round-trip is removable. Positions are also int, which keeps this dict's values off
+    the Python-string heap entirely.
     """
     out = {}
     if not wanted_ids:
@@ -196,8 +246,8 @@ def resolve_smiles_for(manifest, wanted_ids, block=1_000_000):
         hit = ids.isin(wanted_ids).to_numpy()
         if not hit.any():
             continue
-        sub = blk[hit]
-        out.update(zip(sub.ligand_id.astype(str), sub.smiles.astype(str)))
+        idx = np.flatnonzero(hit) + start
+        out.update(zip(ids[hit], idx.tolist()))
     return out
 
 
@@ -219,17 +269,21 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     # persisted history would stay [] forever, silently killing the explore-cap + convergence early-stops.
     if history is None:
         history = []
-    smi_to_row, X = fp_cache
+    row_of, X = fp_cache
     total_ligands = manifest.ligand_id.nunique()
 
-    # join docked ligand scores to fingerprints (via manifest smiles). Resolve only the ids we are
-    # about to look up: the full-pool dict this replaces was the second-largest allocation in the
-    # round path, and it existed to answer at most `budget` lookups. See resolve_smiles_for.
+    # Join docked ligand scores to fingerprints by manifest POSITION. Resolve only the ids we are
+    # about to look up: the full-pool dict this replaces existed to answer at most `budget` lookups.
+    # The smiles round-trip is gone with it, since a position indexes the fingerprint cache directly.
     d = docked_scores.copy()
-    lig2smi = resolve_smiles_for(manifest, set(d.ligand.astype(str)))
-    d["smiles"] = d.ligand.astype(str).map(lig2smi)
-    d = d.dropna(subset=["smiles"]).drop_duplicates("ligand")
-    rows = d.smiles.map(smi_to_row)
+    lig2pos = resolve_manifest_positions(manifest, set(d.ligand.astype(str)))
+    d["_mrow"] = d.ligand.astype(str).map(lig2pos)
+    d = d.dropna(subset=["_mrow"]).drop_duplicates("ligand")
+    # -1 means the manifest row exists but its SMILES was dropped at fingerprint time. Mapping it to
+    # NaN keeps the two "unscoreable" cases (absent from the manifest, present but unfingerprintable)
+    # on the same downstream path they were on when both came back NaN from a dict miss.
+    cache_rows = row_of[d._mrow.to_numpy(dtype=np.int64)] if len(d) else np.empty(0, dtype=np.int32)
+    rows = pd.Series(np.where(cache_rows >= 0, cache_rows, np.nan), index=d.index, dtype="float64")
     d = d[rows.notna()]
     Xtr = X[rows.dropna().astype(int).to_numpy()]
     ytr = d.score_min.to_numpy(dtype=np.float32)
@@ -490,7 +544,7 @@ def _cmd_init(args):
     manifest = build_manifest(cl, args.smiles_store, st["manifest"])
 
     # Fingerprint the pool once -> cache reused across all rounds. A bad/unparseable SMILES is
-    # DROPPED from the cache (not stored as an all-zero row): the cache's smi_to_row is built from
+    # DROPPED from the cache (not stored as an all-zero row): the cache's row_of is built from
     # these `smiles`, so an unlisted SMILES resolves to row -1 at select time and sinks to +inf
     # (unscoreable). Storing a zero-vector row instead would silently score a bad ligand and could
     # waste budget / skew a collection's predicted-best.
@@ -544,7 +598,7 @@ def _cmd_init(args):
 def _cmd_round(args):
     st = _state(args.state_dir)
     manifest = pd.read_parquet(st["manifest"])
-    fp_cache = _load_fp_cache(st)
+    fp_cache = _load_fp_cache(st, len(manifest))
     docked, attempted = load_docked_scores(args.scores_glob)
     history = json.load(open(st["history"])) if os.path.exists(st["history"]) else []
     status, selected, info = run_round(
@@ -624,13 +678,13 @@ if __name__ == "__main__":
     # self-test path nothing else caught it.
     from ml_regressor import DEFAULT_N_BITS, smi_to_fingerprint
     Xfull = np.zeros((len(manifest), DEFAULT_N_BITS), dtype=np.float32)
-    smi_to_row = {}
+    row_of = np.full(len(manifest), -1, dtype=np.int32)
     for i, s in enumerate(manifest.smiles.tolist()):
         fp = smi_to_fingerprint(s)
         if fp is not None:
             Xfull[i] = fp
-        smi_to_row[s] = i
-    fp_cache = (smi_to_row, Xfull)
+        row_of[i] = i
+    fp_cache = (row_of, Xfull)
 
     # "dock" the first 8 collections (40 ligands) -> synthetic scores (enough for a >2 holdout)
     docked_ck = [f"AA_{c:07d}" for c in range(8)]
