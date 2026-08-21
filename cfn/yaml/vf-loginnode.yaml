@@ -45,6 +45,24 @@ Resources:
       Roles:
         - !Ref MainNodeRole
 
+  # The job launcher injects a molecules-API key fetch into every dispatch to this node and
+  # aborts the run script if it fails. The key lives in us-west-2, so the region is pinned here
+  # rather than !Ref AWS::Region: a stack deployed elsewhere still reads the same us-west-2 secret.
+  MoleculesApiKeyPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: MoleculesApiKeyRead
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: !Sub 'arn:aws:secretsmanager:us-west-2:${AWS::AccountId}:secret:tamarind/molecules-api-key-*'
+      Roles:
+        - !Ref MainNodeRole
+
   MainNodeRole:
     Type: AWS::IAM::Role
     Properties:
