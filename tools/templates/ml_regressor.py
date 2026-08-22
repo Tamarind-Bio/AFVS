@@ -243,6 +243,20 @@ def _iter_fingerprints_parallel(smiles_list, radius, n_bits, fp_type,
     from collections import deque
     from concurrent.futures import ProcessPoolExecutor
 
+    # EXPLICIT start method rather than the platform default, because the default differs on the two
+    # platforms this code meets and the difference is not cosmetic. Linux defaults to fork and macOS
+    # to spawn; under spawn each worker re-imports this module and therefore torch, measured at 1.35s
+    # per worker, while under fork that is inherited for free. Naming it here means the production
+    # path is the path a developer can actually run and test, instead of production being the only
+    # place fork is ever exercised. AL_FP_START_METHOD overrides, and an unavailable method falls
+    # back to the platform default rather than raising.
+    import multiprocessing as mp
+    _want = os.environ.get("AL_FP_START_METHOD") or "fork"
+    try:
+        ctx = mp.get_context(_want)
+    except ValueError:
+        ctx = mp.get_context()
+
     def batches():
         buf = []
         for smi in smiles_list:
@@ -254,7 +268,7 @@ def _iter_fingerprints_parallel(smiles_list, radius, n_bits, fp_type,
             yield buf
 
     src = batches()
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
         inflight = deque()
         base = 0
         while True:
