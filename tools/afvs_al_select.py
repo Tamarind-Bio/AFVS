@@ -46,15 +46,9 @@ def per_collection_scores(model, meta, manifest, fp_cache=None):
     """
     n = len(manifest)
     if fp_cache is not None:
-        # row_of is indexed by MANIFEST ROW, so this function's rows ARE row_of. The old shape
-        # materialised manifest["smiles"] as a full-pool Python list purely to re-derive, one
-        # dict lookup at a time, an array the fingerprint cache already carries.
         row_of, X = fp_cache
         rows = np.asarray(row_of)
-        # row_of is POSITIONAL: rows[i] is the cache row for manifest row i. The old SMILES-keyed
-        # lookup was agnostic to both the manifest's length and its order; this is not. A manifest
-        # with the same rows in a different order raises nothing and silently attaches every
-        # prediction to another molecule. Assert the contract at the point of USE, not only at load.
+        # POSITIONAL contract, asserted at the point of USE. See _load_fp_cache.
         if len(rows) != n:
             raise ValueError(
                 f"fp_cache was built for {len(rows):,} manifest rows but this manifest has {n:,}; "
@@ -131,15 +125,9 @@ def predict_ligand_scores(model, meta, manifest, fp_cache=None):
     """
     n = len(manifest)
     if fp_cache is not None:
-        # row_of is indexed by MANIFEST ROW, so this function's rows ARE row_of. The old shape
-        # materialised manifest["smiles"] as a full-pool Python list purely to re-derive, one
-        # dict lookup at a time, an array the fingerprint cache already carries.
         row_of, X = fp_cache
         rows = np.asarray(row_of)
-        # row_of is POSITIONAL: rows[i] is the cache row for manifest row i. The old SMILES-keyed
-        # lookup was agnostic to both the manifest's length and its order; this is not. A manifest
-        # with the same rows in a different order raises nothing and silently attaches every
-        # prediction to another molecule. Assert the contract at the point of USE, not only at load.
+        # POSITIONAL contract, asserted at the point of USE. See _load_fp_cache.
         if len(rows) != n:
             raise ValueError(
                 f"fp_cache was built for {len(rows):,} manifest rows but this manifest has {n:,}; "
@@ -174,15 +162,9 @@ def predict_ligand_scores_ensemble(handles, manifest, fp_cache=None):
     pred = np.full(n, np.nan, dtype=np.float64)
     var = np.zeros(n, dtype=np.float64)
     if fp_cache is not None:
-        # row_of is indexed by MANIFEST ROW, so this function's rows ARE row_of. The old shape
-        # materialised manifest["smiles"] as a full-pool Python list purely to re-derive, one
-        # dict lookup at a time, an array the fingerprint cache already carries.
         row_of, X = fp_cache
         rows = np.asarray(row_of)
-        # row_of is POSITIONAL: rows[i] is the cache row for manifest row i. The old SMILES-keyed
-        # lookup was agnostic to both the manifest's length and its order; this is not. A manifest
-        # with the same rows in a different order raises nothing and silently attaches every
-        # prediction to another molecule. Assert the contract at the point of USE, not only at load.
+        # POSITIONAL contract, asserted at the point of USE. See _load_fp_cache.
         if len(rows) != n:
             raise ValueError(
                 f"fp_cache was built for {len(rows):,} manifest rows but this manifest has {n:,}; "
