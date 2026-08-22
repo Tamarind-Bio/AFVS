@@ -577,6 +577,30 @@ def collection_ligands_from_tarballs(collection_prefix, todo_all_path, data_buck
     return df
 
 
+def _resolve_fp_workers(args):
+    """How many processes to fingerprint with. Explicit flag wins, then env, then serial.
+
+    Defaults to 1, i.e. today's exact serial path, so this cannot change behaviour for a caller that
+    does not opt in. The head node is ALWAYS-ON and SHARED with live virtual-screening customers, so
+    saturating all 16 vCPUs is an operational choice for the wrapper to make, not a library default.
+
+    0 or a negative value means "all cores", resolved with os.cpu_count(). The result is clamped to
+    32: this reads a job setting that a customer can influence, and an unclamped value would let a
+    submission spawn an arbitrary number of processes on a shared production box.
+    """
+    raw = getattr(args, "n_workers", None)
+    if raw is None:
+        raw = os.environ.get("AL_FP_WORKERS", "")
+    try:
+        n = int(str(raw).strip() or 1)
+    except ValueError:
+        print(f"INIT ignoring unparseable worker count {raw!r}, using serial", flush=True)
+        return 1
+    if n <= 0:
+        n = os.cpu_count() or 1
+    return max(1, min(n, 32))
+
+
 def _cmd_init(args):
     from ml_regressor import fingerprint_to_packed_npy
     st = _state(args.state_dir)
@@ -609,7 +633,15 @@ def _cmd_init(args):
     # index list (~40 B/element against 8 for int64), and the [all_smiles[i] for i in kept] copy.
     # That is roughly 274 GB at a 1e9 pool, before the fingerprints themselves. The generator, the
     # int64 kept array and the incremental sidecar writer make all three bounded by one batch.
+    # PARALLEL when asked. Fingerprinting was 40.5% of a real 103.5M screen and ran on 1.04 of the
+    # box's 16 vCPUs, so this is the only cheap capacity win left on the init path. n_workers=1 is
+    # the untouched serial path, and the parallel path is byte-identical to it, verified including
+    # unparseable drops landing on batch boundaries and at the final position.
     n_rows = parquet_num_rows(st["manifest"])
+    n_workers = _resolve_fp_workers(args)
+    if n_workers > 1:
+        print(f"INIT fingerprinting with {n_workers} worker processes "
+              f"(serial path is n_workers=1)", flush=True)
     kept, X = fingerprint_to_packed_npy(
         iter_parquet_column(st["manifest"], "smiles"),
         st["fp_npy"],
@@ -617,6 +649,7 @@ def _cmd_init(args):
         n_total=n_rows,
         keep_out=st["fp_keep"],
         smiles_out=st["fp_smiles"],
+        n_workers=n_workers,
     )
     n_kept = int(kept.shape[0])
     print(f"INIT fingerprint cache: {n_kept:,} molecules packed to {st['fp_npy']} "
@@ -702,6 +735,9 @@ if __name__ == "__main__":
         i.add_argument("--min-seed", type=int, default=30, help="floor on the seed size for small libraries")
         i.add_argument("--budget", type=int, default=0, help="docking budget; caps the seed so it can't overspend (0 = no cap)")
         i.add_argument("--seed", type=int, default=42)
+        i.add_argument("--n-workers", dest="n_workers", default=None,
+                       help="processes to fingerprint with; 1 = serial (default), 0 = all cores. "
+                            "Falls back to the AL_FP_WORKERS env var when unset.")
         args = ap.parse_args()
         if args.cmd == "round":
             _cmd_round(args)
