@@ -645,7 +645,13 @@ def _cmd_init(args):
 
 def _cmd_round(args):
     st = _state(args.state_dir)
-    manifest = pd.read_parquet(st["manifest"])
+    # Read only the two columns this path uses. `smiles` is the whole reason a round is RAM-bound:
+    # ~97 B/molecule of resident Python str, and nothing downstream of here reads it now that the
+    # cache is addressed by manifest row. The consumers that DO need it (the `fp_cache is None`
+    # branches in afvs_al_select) are unreachable from this entry point, because _load_fp_cache
+    # either returns a cache or raises. At 1e9 this is the difference between ~205 GB and ~96 GB
+    # against a 122 GB box, so it is load-bearing, not a tidy-up.
+    manifest = pd.read_parquet(st["manifest"], columns=["collection_key", "ligand_id"])
     fp_cache = _load_fp_cache(st, len(manifest))
     docked, attempted = load_docked_scores(args.scores_glob)
     history = json.load(open(st["history"])) if os.path.exists(st["history"]) else []
