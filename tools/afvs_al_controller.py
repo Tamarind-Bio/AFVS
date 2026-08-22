@@ -85,23 +85,117 @@ def _state(state_dir):
     }
 
 
-def _load_fp_cache(st):
-    """Return (smi_to_row, X). X is a memory-mapped PACKED matrix on the current format.
+def _load_fp_cache(st, n_manifest):
+    """Return (row_of, X). X is a memory-mapped PACKED matrix on the current format.
 
-    Accepts either the packed .npy + parquet pair or a legacy .npz, so an in-flight run whose
-    state dir predates the packed format still resumes. predict_on_X unpacks per chunk, so the
-    caller does not care which it got; the only observable difference is resident memory.
+    row_of is an int32 array indexed by MANIFEST ROW holding that row's cache row, or -1 if the row
+    was dropped at fingerprint time (unparseable SMILES). It replaces a full-pool {smiles: row} dict.
+
+    That dict was reconstructing, from one Python str per pool molecule, an array the INIT step
+    already writes to disk. `fp_keep.npy` is the kept-row index: kept[r] is the manifest row that
+    produced cache row r, so its inverse IS row_of and building it is a scatter, not a scan.
+    Measured cost of the dict it replaces: 46.4 B/molecule locally, 88.4 B/molecule on the deployed
+    pandas 3.0.3 stack (where .astype(str) mints fresh strings). row_of is 4 B/molecule flat.
+
+    Three of the four consumers resolved EVERY manifest row in manifest order, so they can now index
+    row_of directly and skip materialising manifest["smiles"] at all, which is the larger half of the
+    saving at those call sites.
+
+    EQUIVALENCE, and the one case where indices legitimately differ: when the SAME smiles appears at
+    two manifest rows, the old dict comprehension kept the LAST cache row for that string, so both
+    manifest rows resolved to one shared cache row; row_of gives each manifest row the cache row
+    built FROM it. The row NUMBERS differ, the PREDICTIONS cannot: identical SMILES fingerprint
+    identically, so predict_on_X returns the same value from either row. Unparseable SMILES resolve
+    to -1 under both.
     """
     if os.path.exists(st["fp_npy"]) and os.path.exists(st["fp_smiles"]):
-        smi = pd.read_parquet(st["fp_smiles"], columns=["smiles"]).smiles.astype(str).tolist()
         X = load_packed_npy(st["fp_npy"], mmap=True)
-        # The .npy is allocated for the pre-drop row count and sliced to the kept rows, so trust
-        # the SMILES sidecar for the length rather than X.shape[0].
-        return {s: i for i, s in enumerate(smi)}, X[:len(smi)]
+        if os.path.exists(st["fp_keep"]):
+            kept = np.load(st["fp_keep"])
+            _assert_cache_consistent(st, kept, n_manifest)
+            row_of = np.full(n_manifest, -1, dtype=np.int32)
+            row_of[kept] = np.arange(len(kept), dtype=np.int32)
+            return row_of, X[:len(kept)]
+        # No keep index (a state dir written before fp_keep existed). Fall back to the sidecar, which
+        # is the only other record of the kept order. This path is O(pool) in strings by necessity.
+        smi = pd.read_parquet(st["fp_smiles"], columns=["smiles"]).smiles.astype(str).tolist()
+        return _row_of_from_smiles(st, smi, n_manifest), X[:len(smi)]
 
     d = np.load(st["fp"], allow_pickle=True)
     smi = list(d["smiles"])
-    return {s: i for i, s in enumerate(smi)}, d["X"]
+    return _row_of_from_smiles(st, smi, n_manifest), d["X"]
+
+
+def _assert_cache_consistent(st, kept, n_manifest):
+    """Fail loud when the fingerprint cache and the manifest disagree. Positive check, not a bound.
+
+    Addressing the cache by manifest POSITION is what makes the streaming rewrites possible, but it
+    removed the safety property the old SMILES-keyed dict had for free: a content-addressed lookup
+    either found the right row or returned -1, so a stale cache degraded to "unscoreable". A
+    positional lookup cannot notice anything, so the check has to be explicit and it has to be
+    POSITIVE. A bound like `kept.max() < n_manifest` is not enough: it only catches a cache built
+    from a LARGER manifest, and a stale cache whose max happens to fall in range sails through while
+    22% of rows carry another molecule's fingerprint.
+
+    Two independent tears, both measured, both silent before this existed:
+
+      1. TORN INIT. `fingerprint_to_packed_npy` writes the SMILES sidecar per flush but saves
+         fp_keep ONCE at the end, and open_memmap(mode="w+") truncates and zero-fills the .npy at
+         the start of a run. So a completed init followed by a KILLED re-init leaves a long fp_keep
+         from run 1 beside a short sidecar and a mostly-empty .npy from run 2. Slicing X to
+         len(kept) then hands the tail of the pool ALL-ZERO fingerprints and the round completes
+         normally. Comparing kept against the sidecar's row count catches exactly this, and it is
+         cheap because parquet carries the count in its footer.
+      2. STALE KEEP. A crash between the sidecar close and the keep save leaves the npy and sidecar
+         current while fp_keep describes a different pool.
+
+    Reachable, not theoretical: al_state lives on the persistent head node, is created with mkdir -p
+    and no clean, and the only cleanup does not run when a job is killed.
+    """
+    n_sidecar = parquet_num_rows(st["fp_smiles"])
+    if len(kept) != n_sidecar:
+        raise ValueError(
+            f"fingerprint cache is TORN: fp_keep has {len(kept):,} rows but the SMILES sidecar has "
+            f"{n_sidecar:,}. This is the signature of an init that was killed and restarted, which "
+            f"leaves a stale fp_keep beside a truncated cache. Delete {os.path.dirname(st['fp_keep'])} "
+            f"and re-run init; do NOT proceed, the tail of the pool would score on zero vectors.")
+    if len(kept) and int(kept.max()) >= n_manifest:
+        raise ValueError(
+            f"fp_keep references manifest row {int(kept.max()):,} but the manifest has "
+            f"{n_manifest:,} rows; the state dir and the manifest disagree.")
+    if len(kept) > n_manifest:
+        raise ValueError(
+            f"fingerprint cache has {len(kept):,} kept rows for a {n_manifest:,}-row manifest; the "
+            f"cache was built from a different (larger) manifest than the one being scored.")
+    # kept must be STRICTLY INCREASING, which is the invariant the whole positional design rests on
+    # and the one nothing above actually checks. row_of[kept] = arange(len(kept)) is a scatter, so a
+    # duplicated entry silently resolves last-wins and a permuted one silently shuffles the mapping:
+    # no error, finite plausible predictions, attached to the wrong molecules. That is precisely the
+    # shape an incremental or resumable fp_keep writer would produce, and the docstring above records
+    # that design as tempting. One bool temp on an array already in memory.
+    if len(kept) > 1 and not np.all(kept[1:] > kept[:-1]):
+        raise ValueError(
+            f"fp_keep is not strictly increasing ({len(kept):,} rows). Cache row r must mean "
+            f"manifest row kept[r], so a duplicated or reordered index maps predictions onto the "
+            f"wrong molecules without raising. Delete {os.path.dirname(st['fp_keep'])} and re-run init.")
+
+
+def _row_of_from_smiles(st, cache_smiles, n_manifest):
+    """Legacy bridge: rebuild row_of by matching the cache's SMILES order against the manifest.
+
+    Only reached for a state dir with no fp_keep.npy, i.e. one written before that index existed.
+    Streams the manifest so this fallback does not reintroduce the full-pool structure the caller
+    exists to remove; the cache-side dict is bounded by the cache, not by the pool.
+    """
+    pos = {s: i for i, s in enumerate(cache_smiles)}
+    row_of = np.full(n_manifest, -1, dtype=np.int32)
+    for at, s in enumerate(iter_parquet_column(st["manifest"], "smiles")):
+        if at >= n_manifest:
+            break
+        r = pos.get(s, -1)
+        if r >= 0:
+            row_of[at] = r
+    return row_of
 
 
 def iter_parquet_column(path, column, batch_size=100_000):
@@ -168,6 +262,44 @@ def load_docked_scores(scores_glob):
 
 # ---------- round logic (testable) ----------
 
+def resolve_manifest_positions(manifest, wanted_ids, block=1_000_000):
+    """manifest ROW POSITION for ONLY the ligand ids in `wanted_ids`, resolved a block at a time.
+
+    Replaces `dict(zip(manifest.ligand_id.astype(str), manifest.smiles.astype(str)))`, which built
+    one entry per POOL molecule to answer lookups for the DOCKED set alone. The docked set is bounded
+    by the docking budget, so on a real screen it is 3 to 4 orders of magnitude smaller than the pool
+    (measured: 80,635 docked against a 103,535,252 pool, 0.078%).
+
+    This matters much more on the deployed stack than a local measurement suggests. pandas 3.0 keeps
+    string columns in Arrow buffers, so `.astype(str)` MINTS a fresh Python str per element instead of
+    handing back one that already exists. Measured marginal cost of the old line: 90.9 B/molecule on
+    pandas 2.3.3 (object dtype, strings reused) against 255.5 B/molecule on the deployed pandas 3.0.3.
+
+    Equivalence: dict(zip(...)) is LAST-WINS on a duplicate ligand_id, so blocks are walked in
+    manifest order and `out.update` reproduces that exactly. An id absent from the manifest is absent
+    here too, which is what makes the caller's `.map()` yield NaN and its dropna() behave unchanged.
+    The transient is one block of strings, not the pool.
+
+    Positions rather than smiles: the caller's only use for the smiles was to look up a fingerprint
+    row, and the fingerprint cache is addressable by manifest POSITION directly (see _load_fp_cache),
+    so the smiles round-trip is removable. Positions are also int, which keeps this dict's values off
+    the Python-string heap entirely.
+    """
+    out = {}
+    if not wanted_ids:
+        return out
+    n = len(manifest)
+    for start in range(0, n, block):
+        blk = manifest.iloc[start:start + block]
+        ids = blk.ligand_id.astype(str)
+        hit = ids.isin(wanted_ids).to_numpy()
+        if not hit.any():
+            continue
+        idx = np.flatnonzero(hit) + start
+        out.update(zip(ids[hit], idx.tolist()))
+    return out
+
+
 def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac=0.001,
               patience=3, conv_eps=0.01, epsilon_random=0.0, min_spearman=0.30, seed=42,
               history=None, model_out=None, todo_out=None, granularity="molecule",
@@ -186,15 +318,31 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     # persisted history would stay [] forever, silently killing the explore-cap + convergence early-stops.
     if history is None:
         history = []
-    smi_to_row, X = fp_cache
+    row_of, X = fp_cache
+    # Same positional contract as the select consumers: row_of is indexed by manifest row, so a
+    # manifest that is not the one the cache was built for silently trains on the wrong fingerprints.
+    if len(row_of) != len(manifest):
+        raise ValueError(
+            f"fp_cache was built for {len(row_of):,} manifest rows but this manifest has "
+            f"{len(manifest):,}; row_of is positional and the two cannot be used together.")
     total_ligands = manifest.ligand_id.nunique()
 
-    # join docked ligand scores to fingerprints (via manifest smiles)
-    lig2smi = dict(zip(manifest.ligand_id.astype(str), manifest.smiles.astype(str)))
+    # Join docked ligand scores to fingerprints by manifest POSITION. Resolve only the ids we are
+    # about to look up: the full-pool dict this replaces existed to answer at most `budget` lookups.
+    # The smiles round-trip is gone with it, since a position indexes the fingerprint cache directly.
     d = docked_scores.copy()
-    d["smiles"] = d.ligand.astype(str).map(lig2smi)
-    d = d.dropna(subset=["smiles"]).drop_duplicates("ligand")
-    rows = d.smiles.map(smi_to_row)
+    lig2pos = resolve_manifest_positions(manifest, set(d.ligand.astype(str)))
+    d["_mrow"] = d.ligand.astype(str).map(lig2pos)
+    d = d.dropna(subset=["_mrow"]).drop_duplicates("ligand")
+    # -1 means the manifest row exists but its SMILES was dropped at fingerprint time. Mapping it to
+    # NaN keeps the two "unscoreable" cases (absent from the manifest, present but unfingerprintable)
+    # on the same downstream path they were on when both came back NaN from a dict miss.
+    # d["_mrow"], not d._mrow: attribute access falls through pandas' __getattr__, which checks
+    # _internal_names_set / _metadata / _accessors BEFORE the column, and an underscore-prefixed name
+    # sits in exactly the namespace pandas reserves for itself. It resolves correctly on 2.3.3 and
+    # 3.0.3 today; it is one pandas internal-name addition away from silently returning something else.
+    cache_rows = row_of[d["_mrow"].to_numpy(dtype=np.int64)] if len(d) else np.empty(0, dtype=np.int32)
+    rows = pd.Series(np.where(cache_rows >= 0, cache_rows, np.nan), index=d.index, dtype="float64")
     d = d[rows.notna()]
     Xtr = X[rows.dropna().astype(int).to_numpy()]
     ytr = d.score_min.to_numpy(dtype=np.float32)
@@ -237,8 +385,17 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     # convergence on the rolling mean of the top-K docked score
     k = max(1, int(round(total_ligands * k_frac)))
     topk_mean = float(np.sort(ytr)[:k].mean())
+    # k is scaled against the POOL, so on any screen whose docked fraction is at or below k_frac it
+    # runs past the end of ytr and np.sort(ytr)[:k] returns the WHOLE array, degenerating topk_mean
+    # to the mean of everything docked. topk_docked_mean rescales the fraction against what was
+    # actually docked. Convergence below deliberately still reads topk_mean: switching the stopping
+    # rule to the honest value converges a round early and costs the customer an authorized round,
+    # which is a separate decision from reporting an honest number.
+    k_docked = max(1, min(len(ytr), int(round(len(ytr) * k_frac))))
+    topk_docked_mean = float(np.sort(ytr)[:k_docked].mean())
     history.append({"round": len(history), "docked_ligands": docked_ligands,
-                    "topk_mean": topk_mean, "spearman": rho})
+                    "topk_mean": topk_mean, "topk_docked_mean": topk_docked_mean,
+                    "k_docked": k_docked, "spearman": rho})
     converged = False
     if len(history) > patience:
         prev = np.mean([h["topk_mean"] for h in history[-patience - 1:-1]])
@@ -264,6 +421,7 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     # so dock failures don't let the loop overspend the customer's docking budget.
     n_attempted = len(attempted_ligands) if attempted_ligands is not None else docked_ligands
     info = {"docked_ligands": docked_ligands, "attempted": n_attempted, "topk_mean": topk_mean,
+            "topk_docked_mean": topk_docked_mean, "k_docked": k_docked,
             "spearman": rho, "n_docked_collections": len(docked_collections),
             "mode": "exploit" if trusted else "explore"}
 
@@ -424,6 +582,30 @@ def collection_ligands_from_tarballs(collection_prefix, todo_all_path, data_buck
     return df
 
 
+def _resolve_fp_workers(args):
+    """How many processes to fingerprint with. Explicit flag wins, then env, then serial.
+
+    Defaults to 1, i.e. today's exact serial path, so this cannot change behaviour for a caller that
+    does not opt in. The head node is ALWAYS-ON and SHARED with live virtual-screening customers, so
+    saturating all 16 vCPUs is an operational choice for the wrapper to make, not a library default.
+
+    0 or a negative value means "all cores", resolved with os.cpu_count(). The result is clamped to
+    32: this reads a job setting that a customer can influence, and an unclamped value would let a
+    submission spawn an arbitrary number of processes on a shared production box.
+    """
+    raw = getattr(args, "n_workers", None)
+    if raw is None:
+        raw = os.environ.get("AL_FP_WORKERS", "")
+    try:
+        n = int(str(raw).strip() or 1)
+    except ValueError:
+        print(f"INIT ignoring unparseable worker count {raw!r}, using serial", flush=True)
+        return 1
+    if n <= 0:
+        n = os.cpu_count() or 1
+    return max(1, min(n, 32))
+
+
 def _cmd_init(args):
     from ml_regressor import fingerprint_to_packed_npy
     st = _state(args.state_dir)
@@ -439,7 +621,7 @@ def _cmd_init(args):
     manifest = build_manifest(cl, args.smiles_store, st["manifest"])
 
     # Fingerprint the pool once -> cache reused across all rounds. A bad/unparseable SMILES is
-    # DROPPED from the cache (not stored as an all-zero row): the cache's smi_to_row is built from
+    # DROPPED from the cache (not stored as an all-zero row): the cache's row_of is built from
     # these `smiles`, so an unlisted SMILES resolves to row -1 at select time and sinks to +inf
     # (unscoreable). Storing a zero-vector row instead would silently score a bad ligand and could
     # waste budget / skew a collection's predicted-best.
@@ -456,7 +638,15 @@ def _cmd_init(args):
     # index list (~40 B/element against 8 for int64), and the [all_smiles[i] for i in kept] copy.
     # That is roughly 274 GB at a 1e9 pool, before the fingerprints themselves. The generator, the
     # int64 kept array and the incremental sidecar writer make all three bounded by one batch.
+    # PARALLEL when asked. Fingerprinting was 40.5% of a real 103.5M screen and ran on 1.04 of the
+    # box's 16 vCPUs, so this is the only cheap capacity win left on the init path. n_workers=1 is
+    # the untouched serial path, and the parallel path is byte-identical to it, verified including
+    # unparseable drops landing on batch boundaries and at the final position.
     n_rows = parquet_num_rows(st["manifest"])
+    n_workers = _resolve_fp_workers(args)
+    if n_workers > 1:
+        print(f"INIT fingerprinting with {n_workers} worker processes "
+              f"(serial path is n_workers=1)", flush=True)
     kept, X = fingerprint_to_packed_npy(
         iter_parquet_column(st["manifest"], "smiles"),
         st["fp_npy"],
@@ -464,6 +654,7 @@ def _cmd_init(args):
         n_total=n_rows,
         keep_out=st["fp_keep"],
         smiles_out=st["fp_smiles"],
+        n_workers=n_workers,
     )
     n_kept = int(kept.shape[0])
     print(f"INIT fingerprint cache: {n_kept:,} molecules packed to {st['fp_npy']} "
@@ -492,8 +683,14 @@ def _cmd_init(args):
 
 def _cmd_round(args):
     st = _state(args.state_dir)
-    manifest = pd.read_parquet(st["manifest"])
-    fp_cache = _load_fp_cache(st)
+    # Read only the two columns this path uses. `smiles` is the whole reason a round is RAM-bound:
+    # ~97 B/molecule of resident Python str, and nothing downstream of here reads it now that the
+    # cache is addressed by manifest row. The consumers that DO need it (the `fp_cache is None`
+    # branches in afvs_al_select) are unreachable from this entry point, because _load_fp_cache
+    # either returns a cache or raises. At 1e9 this is the difference between ~205 GB and ~96 GB
+    # against a 122 GB box, so it is load-bearing, not a tidy-up.
+    manifest = pd.read_parquet(st["manifest"], columns=["collection_key", "ligand_id"])
+    fp_cache = _load_fp_cache(st, len(manifest))
     docked, attempted = load_docked_scores(args.scores_glob)
     history = json.load(open(st["history"])) if os.path.exists(st["history"]) else []
     status, selected, info = run_round(
@@ -543,6 +740,9 @@ if __name__ == "__main__":
         i.add_argument("--min-seed", type=int, default=30, help="floor on the seed size for small libraries")
         i.add_argument("--budget", type=int, default=0, help="docking budget; caps the seed so it can't overspend (0 = no cap)")
         i.add_argument("--seed", type=int, default=42)
+        i.add_argument("--n-workers", dest="n_workers", default=None,
+                       help="processes to fingerprint with; 1 = serial (default), 0 = all cores. "
+                            "Falls back to the AL_FP_WORKERS env var when unset.")
         args = ap.parse_args()
         if args.cmd == "round":
             _cmd_round(args)
@@ -573,13 +773,13 @@ if __name__ == "__main__":
     # self-test path nothing else caught it.
     from ml_regressor import DEFAULT_N_BITS, smi_to_fingerprint
     Xfull = np.zeros((len(manifest), DEFAULT_N_BITS), dtype=np.float32)
-    smi_to_row = {}
+    row_of = np.full(len(manifest), -1, dtype=np.int32)
     for i, s in enumerate(manifest.smiles.tolist()):
         fp = smi_to_fingerprint(s)
         if fp is not None:
             Xfull[i] = fp
-        smi_to_row[s] = i
-    fp_cache = (smi_to_row, Xfull)
+        row_of[i] = i
+    fp_cache = (row_of, Xfull)
 
     # "dock" the first 8 collections (40 ligands) -> synthetic scores (enough for a >2 holdout)
     docked_ck = [f"AA_{c:07d}" for c in range(8)]
