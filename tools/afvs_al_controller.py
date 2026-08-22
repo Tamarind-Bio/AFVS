@@ -167,6 +167,17 @@ def _assert_cache_consistent(st, kept, n_manifest):
         raise ValueError(
             f"fingerprint cache has {len(kept):,} kept rows for a {n_manifest:,}-row manifest; the "
             f"cache was built from a different (larger) manifest than the one being scored.")
+    # kept must be STRICTLY INCREASING, which is the invariant the whole positional design rests on
+    # and the one nothing above actually checks. row_of[kept] = arange(len(kept)) is a scatter, so a
+    # duplicated entry silently resolves last-wins and a permuted one silently shuffles the mapping:
+    # no error, finite plausible predictions, attached to the wrong molecules. That is precisely the
+    # shape an incremental or resumable fp_keep writer would produce, and the docstring above records
+    # that design as tempting. One bool temp on an array already in memory.
+    if len(kept) > 1 and not np.all(kept[1:] > kept[:-1]):
+        raise ValueError(
+            f"fp_keep is not strictly increasing ({len(kept):,} rows). Cache row r must mean "
+            f"manifest row kept[r], so a duplicated or reordered index maps predictions onto the "
+            f"wrong molecules without raising. Delete {os.path.dirname(st['fp_keep'])} and re-run init.")
 
 
 def _row_of_from_smiles(st, cache_smiles, n_manifest):

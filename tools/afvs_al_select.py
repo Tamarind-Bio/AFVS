@@ -39,7 +39,8 @@ def per_collection_scores(model, meta, manifest, fp_cache=None):
     Args:
         model, meta: trained surrogate (ml_regressor).
         manifest (DataFrame): columns collection_key, ligand_id, smiles.
-        fp_cache (dict smiles->row-index, np.ndarray X) optional precomputed fingerprint cache.
+        fp_cache ((row_of, X)) optional. row_of is an int32 array indexed by MANIFEST ROW
+            holding that row's cache row, or -1 if the row was dropped at fingerprint time.
 
     Returns:
         DataFrame: collection_key, pred_best, ligand_count.

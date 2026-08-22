@@ -267,8 +267,25 @@ def _iter_fingerprints_parallel(smiles_list, radius, n_bits, fp_type,
         if buf:
             yield buf
 
+    if window < 1 or task_size < 1:
+        raise ValueError(
+            f"window and task_size must be >= 1, got window={window} task_size={task_size}. "
+            "Both fail SILENTLY rather than loudly: a window below 1 makes the refill loop never "
+            "run, so the generator yields nothing and the caller writes an EMPTY cache that then "
+            "satisfies the consistency check (0 == 0), surfacing a dock wave later as 'too few "
+            "docked scores to train'. A task_size below 1 makes the batch-full test unreachable, "
+            "collapsing the whole pool into one batch and silently defeating the bounded-window "
+            "memory guarantee this function exists to provide.")
+
     src = batches()
-    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
+    # try/finally with cancel_futures rather than a bare `with`. The context manager calls
+    # shutdown(wait=True, cancel_futures=False), so a CONSUMER-side failure (a MemoryError in the
+    # kept resize, a pyarrow error inside _flush, a SIGINT) waits for every task already submitted
+    # before the process can die. At the shipped defaults that is window * task_size molecules of
+    # fingerprinting nobody is waiting for, and a reaper that SIGKILLs during the wait leaves the
+    # torn cache this design otherwise avoids.
+    ex = ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx)
+    try:
         inflight = deque()
         base = 0
         while True:
@@ -287,6 +304,8 @@ def _iter_fingerprints_parallel(smiles_list, radius, n_bits, fp_type,
             keep, packed = fut.result()
             for j, k in enumerate(keep):
                 yield offset + int(k), packed[j], batch[int(k)]
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 def fingerprint_to_packed_npy(smiles_list, out_path, radius=2, n_bits=None, fp_type=None,
