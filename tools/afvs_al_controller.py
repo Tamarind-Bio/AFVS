@@ -112,13 +112,8 @@ def _load_fp_cache(st, n_manifest):
         X = load_packed_npy(st["fp_npy"], mmap=True)
         if os.path.exists(st["fp_keep"]):
             kept = np.load(st["fp_keep"])
+            _assert_cache_consistent(st, kept, n_manifest)
             row_of = np.full(n_manifest, -1, dtype=np.int32)
-            # kept holds manifest rows; a state dir from a LARGER manifest than the one passed would
-            # scatter out of bounds, so fail loud rather than silently truncating the cache.
-            if len(kept) and int(kept.max()) >= n_manifest:
-                raise ValueError(
-                    f"fp_keep references manifest row {int(kept.max())} but the manifest has "
-                    f"{n_manifest} rows; the state dir and the manifest disagree")
             row_of[kept] = np.arange(len(kept), dtype=np.int32)
             return row_of, X[:len(kept)]
         # No keep index (a state dir written before fp_keep existed). Fall back to the sidecar, which
@@ -129,6 +124,49 @@ def _load_fp_cache(st, n_manifest):
     d = np.load(st["fp"], allow_pickle=True)
     smi = list(d["smiles"])
     return _row_of_from_smiles(st, smi, n_manifest), d["X"]
+
+
+def _assert_cache_consistent(st, kept, n_manifest):
+    """Fail loud when the fingerprint cache and the manifest disagree. Positive check, not a bound.
+
+    Addressing the cache by manifest POSITION is what makes the streaming rewrites possible, but it
+    removed the safety property the old SMILES-keyed dict had for free: a content-addressed lookup
+    either found the right row or returned -1, so a stale cache degraded to "unscoreable". A
+    positional lookup cannot notice anything, so the check has to be explicit and it has to be
+    POSITIVE. A bound like `kept.max() < n_manifest` is not enough: it only catches a cache built
+    from a LARGER manifest, and a stale cache whose max happens to fall in range sails through while
+    22% of rows carry another molecule's fingerprint.
+
+    Two independent tears, both measured, both silent before this existed:
+
+      1. TORN INIT. `fingerprint_to_packed_npy` writes the SMILES sidecar per flush but saves
+         fp_keep ONCE at the end, and open_memmap(mode="w+") truncates and zero-fills the .npy at
+         the start of a run. So a completed init followed by a KILLED re-init leaves a long fp_keep
+         from run 1 beside a short sidecar and a mostly-empty .npy from run 2. Slicing X to
+         len(kept) then hands the tail of the pool ALL-ZERO fingerprints and the round completes
+         normally. Comparing kept against the sidecar's row count catches exactly this, and it is
+         cheap because parquet carries the count in its footer.
+      2. STALE KEEP. A crash between the sidecar close and the keep save leaves the npy and sidecar
+         current while fp_keep describes a different pool.
+
+    Reachable, not theoretical: al_state lives on the persistent head node, is created with mkdir -p
+    and no clean, and the only cleanup does not run when a job is killed.
+    """
+    n_sidecar = parquet_num_rows(st["fp_smiles"])
+    if len(kept) != n_sidecar:
+        raise ValueError(
+            f"fingerprint cache is TORN: fp_keep has {len(kept):,} rows but the SMILES sidecar has "
+            f"{n_sidecar:,}. This is the signature of an init that was killed and restarted, which "
+            f"leaves a stale fp_keep beside a truncated cache. Delete {os.path.dirname(st['fp_keep'])} "
+            f"and re-run init; do NOT proceed, the tail of the pool would score on zero vectors.")
+    if len(kept) and int(kept.max()) >= n_manifest:
+        raise ValueError(
+            f"fp_keep references manifest row {int(kept.max()):,} but the manifest has "
+            f"{n_manifest:,} rows; the state dir and the manifest disagree.")
+    if len(kept) > n_manifest:
+        raise ValueError(
+            f"fingerprint cache has {len(kept):,} kept rows for a {n_manifest:,}-row manifest; the "
+            f"cache was built from a different (larger) manifest than the one being scored.")
 
 
 def _row_of_from_smiles(st, cache_smiles, n_manifest):
@@ -270,6 +308,12 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     if history is None:
         history = []
     row_of, X = fp_cache
+    # Same positional contract as the select consumers: row_of is indexed by manifest row, so a
+    # manifest that is not the one the cache was built for silently trains on the wrong fingerprints.
+    if len(row_of) != len(manifest):
+        raise ValueError(
+            f"fp_cache was built for {len(row_of):,} manifest rows but this manifest has "
+            f"{len(manifest):,}; row_of is positional and the two cannot be used together.")
     total_ligands = manifest.ligand_id.nunique()
 
     # Join docked ligand scores to fingerprints by manifest POSITION. Resolve only the ids we are

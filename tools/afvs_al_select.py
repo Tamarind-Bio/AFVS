@@ -51,6 +51,15 @@ def per_collection_scores(model, meta, manifest, fp_cache=None):
         # dict lookup at a time, an array the fingerprint cache already carries.
         row_of, X = fp_cache
         rows = np.asarray(row_of)
+        # row_of is POSITIONAL: rows[i] is the cache row for manifest row i. The old SMILES-keyed
+        # lookup was agnostic to both the manifest's length and its order; this is not. A manifest
+        # with the same rows in a different order raises nothing and silently attaches every
+        # prediction to another molecule. Assert the contract at the point of USE, not only at load.
+        if len(rows) != n:
+            raise ValueError(
+                f"fp_cache was built for {len(rows):,} manifest rows but this manifest has {n:,}; "
+                f"row_of is positional, so scoring them together would attach predictions to the "
+                f"wrong molecules.")
         pred = np.full(n, np.nan, dtype=np.float32)
         ok = rows >= 0
         if ok.any():
@@ -127,6 +136,15 @@ def predict_ligand_scores(model, meta, manifest, fp_cache=None):
         # dict lookup at a time, an array the fingerprint cache already carries.
         row_of, X = fp_cache
         rows = np.asarray(row_of)
+        # row_of is POSITIONAL: rows[i] is the cache row for manifest row i. The old SMILES-keyed
+        # lookup was agnostic to both the manifest's length and its order; this is not. A manifest
+        # with the same rows in a different order raises nothing and silently attaches every
+        # prediction to another molecule. Assert the contract at the point of USE, not only at load.
+        if len(rows) != n:
+            raise ValueError(
+                f"fp_cache was built for {len(rows):,} manifest rows but this manifest has {n:,}; "
+                f"row_of is positional, so scoring them together would attach predictions to the "
+                f"wrong molecules.")
         pred = np.full(n, np.nan, dtype=np.float32)
         ok = rows >= 0
         if ok.any():
@@ -161,6 +179,15 @@ def predict_ligand_scores_ensemble(handles, manifest, fp_cache=None):
         # dict lookup at a time, an array the fingerprint cache already carries.
         row_of, X = fp_cache
         rows = np.asarray(row_of)
+        # row_of is POSITIONAL: rows[i] is the cache row for manifest row i. The old SMILES-keyed
+        # lookup was agnostic to both the manifest's length and its order; this is not. A manifest
+        # with the same rows in a different order raises nothing and silently attaches every
+        # prediction to another molecule. Assert the contract at the point of USE, not only at load.
+        if len(rows) != n:
+            raise ValueError(
+                f"fp_cache was built for {len(rows):,} manifest rows but this manifest has {n:,}; "
+                f"row_of is positional, so scoring them together would attach predictions to the "
+                f"wrong molecules.")
         ok = rows >= 0
         if ok.any():
             mu, vr = predict_ensemble_on_X(handles, X, rows=rows[ok])
