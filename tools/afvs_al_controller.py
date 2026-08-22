@@ -282,7 +282,11 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
     # -1 means the manifest row exists but its SMILES was dropped at fingerprint time. Mapping it to
     # NaN keeps the two "unscoreable" cases (absent from the manifest, present but unfingerprintable)
     # on the same downstream path they were on when both came back NaN from a dict miss.
-    cache_rows = row_of[d._mrow.to_numpy(dtype=np.int64)] if len(d) else np.empty(0, dtype=np.int32)
+    # d["_mrow"], not d._mrow: attribute access falls through pandas' __getattr__, which checks
+    # _internal_names_set / _metadata / _accessors BEFORE the column, and an underscore-prefixed name
+    # sits in exactly the namespace pandas reserves for itself. It resolves correctly on 2.3.3 and
+    # 3.0.3 today; it is one pandas internal-name addition away from silently returning something else.
+    cache_rows = row_of[d["_mrow"].to_numpy(dtype=np.int64)] if len(d) else np.empty(0, dtype=np.int32)
     rows = pd.Series(np.where(cache_rows >= 0, cache_rows, np.nan), index=d.index, dtype="float64")
     d = d[rows.notna()]
     Xtr = X[rows.dropna().astype(int).to_numpy()]
