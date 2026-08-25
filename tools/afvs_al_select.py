@@ -210,6 +210,39 @@ def env_setting(name):
     return "" if v.lower() in ("", "none", "null") else v
 
 
+DEFAULT_SELECT_CHUNK_ROWS = 1_000_000
+
+# Metrics safe to chunk: utility is pointwise in the row's own (y_mean, y_var) and `current_max`,
+# which acquire_batch derives from `explored` and so is identical in every chunk. Do NOT add the
+# others: random/ts/thompson/threshold draw from metrics.RG, and noisy also uses np.std over the
+# rows in hand, so their utilities are not reproducible across passes.
+CHUNKABLE_METRICS = frozenset({"greedy", "ucb", "lcb", "ei", "pi"})
+
+
+def select_chunk_rows(budget_ligands):
+    """
+    Rows per acquisition chunk, overridable with `alSelectChunkRows`.
+
+    Floored at 2x the budget because a chunk keeps at most `budget_ligands` rows, so a smaller one
+    discards nothing and costs a second traversal for no memory saved. A bad value warns and falls
+    back rather than raising: unlike alAcquirer, a wrong value here is behaviour-identical.
+    """
+    rows = DEFAULT_SELECT_CHUNK_ROWS
+    raw = env_setting("alSelectChunkRows")
+    if raw:
+        try:
+            parsed = int(float(raw))          # OverflowError, not ValueError, on inf/-inf/1e400
+        except (TypeError, ValueError, OverflowError):
+            parsed = 0
+        if parsed > 0:
+            rows = parsed
+        else:
+            # stderr: the wrapper greps this process's stdout for the controller's STATUS line.
+            print(f"WARN alSelectChunkRows={raw!r} is not a positive integer; "
+                  f"using {DEFAULT_SELECT_CHUNK_ROWS:,}", file=sys.stderr)
+    return max(rows, 2 * int(budget_ligands))
+
+
 def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy",
                    explore=False, seed=42, pred_var=None, docked_scores=None):
     """
@@ -248,27 +281,30 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy
     The explore round passes metric="random" rather than mapping our eff_epsilon onto MolPAL's
     `epsilon`: MolPAL draws its epsilon indices over the WHOLE pool including explored ligands, so
     an epsilon of 1.0 does not mean what eff_epsilon=1.0 means here.
+
+    Above `select_chunk_rows(budget)` rows, and for a metric in CHUNKABLE_METRICS, the pool is fed
+    to that same acquirer in CHUNKS, which bounds this function's peak allocation at O(chunk) rather
+    than O(pool) without changing the selection. Both qualifiers bind: a stochastic metric, which
+    includes every explore round, takes the single pass at any size and stays O(pool). See the block
+    comment below for the top-B argument and CHUNKABLE_METRICS for the per-metric mechanism.
+
+    The returned frame keeps every column of `manifest_pred`, so a caller reading `smiles` or `pred`
+    off the selection still can, and its index is each row's POSITION in the pool.
     """
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
     from molpal.acquirer import Acquirer  # noqa: E402  (vendored; see tools/vendor/molpal)
 
-    # Same dtype + positional discipline as select_ligands: coerce both sides to str so a numeric
-    # manifest ligand_id cannot silently re-select a docked ligand, and reset_index so selection is
-    # positional and a non-unique manifest index cannot fan out into an over-selection.
-    avail = manifest_pred.reset_index(drop=True)
+    # Everything below needs index == position. reset_index(drop=True) delivers that but COPIES the
+    # block pointers (28 B/molecule), and a RangeIndex(0, n, 1) already satisfies it, so alias
+    # instead for those callers. `avail` is only ever read and .iloc'd, never assigned into.
+    idx = manifest_pred.index
+    if isinstance(idx, pd.RangeIndex) and idx.start == 0 and idx.step == 1:
+        avail = manifest_pred
+    else:
+        avail = manifest_pred.reset_index(drop=True)
     if avail.empty or budget_ligands <= 0:
         return avail.iloc[0:0]
 
-    xs = [str(x) for x in avail.ligand_id.to_numpy()]
-    y_means = -avail.pred.to_numpy(dtype=float)          # MolPAL maximizes; pred is lower-is-better
-    # Real per-ligand variance when the caller supplies one (ensemble disagreement), else
-    # zeros, which correctly collapses every uncertainty metric back to greedy rather than
-    # pretending to an uncertainty the surrogate does not have.
-    if pred_var is None:
-        y_vars = np.zeros(len(xs), dtype=float)
-    else:
-        y_vars = np.asarray(pred_var, dtype=float)[avail.index.to_numpy()] \
-            if len(pred_var) != len(xs) else np.asarray(pred_var, dtype=float)
     scores = {} if docked_scores is None else {str(kk): vv for kk, vv in docked_scores.items()}
     explored = {}
     for x in docked_ligands:
@@ -276,15 +312,82 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy
         s = scores.get(lid)
         explored[lid] = float("nan") if s is None else -float(s)
 
-    acq = Acquirer(size=len(xs), init_size=budget_ligands, batch_sizes=[budget_ligands],
-                   metric=("random" if explore else metric), epsilon=0.0, seed=seed, verbose=0)
-    picked = acq.acquire_batch(xs=xs, y_means=y_means, y_vars=y_vars, explored=explored, t=1)
+    n_avail = len(avail)
+    acq_metric = "random" if explore else metric
+    pv = None if pred_var is None else np.asarray(pred_var, dtype=float)
+    if pv is not None and len(pv) != n_avail:
+        # POSITIONAL contract, asserted at the point of USE, same as the fp_cache checks above.
+        raise ValueError(
+            f"pred_var has {len(pv):,} entries but the pool has {n_avail:,}; it is positional, so "
+            f"scoring them together would attach variances to the wrong molecules.")
+    # ONE acquirer for every pass: Acquirer.__init__ calls metrics.set_seed, so building one per
+    # chunk would reset the module RNG each time. `size` only resolves a FRACTIONAL batch_size and
+    # AFVS passes ints, so the pool-wide size is right for a chunk pass too.
+    acq = Acquirer(size=n_avail, init_size=budget_ligands, batch_sizes=[budget_ligands],
+                   metric=acq_metric, epsilon=0.0, seed=seed, verbose=0)
 
-    pos_of = {}
-    for i, lid in enumerate(xs):
-        pos_of.setdefault(lid, i)
-    picked_pos = [pos_of[p] for p in picked if p in pos_of]
-    return avail.loc[picked_pos]
+    # acquire_batch already streams (a heap of at most batch_size). The O(pool) cost was the CALLER
+    # building arrays around it, so feed the same heap in chunks. EXACT, not approximate: a ligand in
+    # the global top-B has at most B-1 ligands beating it globally, so at most B-1 inside its own
+    # chunk, so it is in that chunk's top-B and survives to the next pass.
+    #
+    # Rows are addressed by absolute POSITION, never by slicing the frame, because .iloc[slice]
+    # copies a block per object column and those sum across the loop to a full pool copy. The
+    # to_numpy() calls stay INSIDE _pick for the same reason: on pandas 3 the default string dtype is
+    # Arrow-backed and to_numpy() materialises a str per row, so hoisting them is a whole-pool
+    # allocation there even though it is free on the numpy object dtype.
+    ids_col, pred_col = avail.ligand_id, avail.pred
+
+    def _pick(pos):
+        """One acquirer pass over ABSOLUTE row positions `pos` (None = the whole pool, which avoids
+        materialising an arange). Returns the selected absolute positions, descending by utility."""
+        ids = (ids_col if pos is None else ids_col.take(pos)).to_numpy()
+        preds = (pred_col if pos is None else pred_col.take(pos)).to_numpy()
+        xs = [str(x) for x in ids]
+        y_means = -preds.astype(float)   # MolPAL maximizes; pred is lower-is-better
+        # Real per-ligand variance when the caller supplies one (ensemble disagreement), else zeros,
+        # which correctly collapses every uncertainty metric back to greedy rather than pretending
+        # to an uncertainty the surrogate does not have. pred_var is positional, like everything here.
+        if pv is None:
+            y_vars = np.zeros(len(xs), dtype=float)
+        else:
+            y_vars = pv if pos is None else pv[pos]
+        picked = acq.acquire_batch(xs=xs, y_means=y_means, y_vars=y_vars,
+                                   explored=explored, t=1)
+        # acquire_batch returns IDS, so a duplicated ligand_id is resolved here. Only the SELECTED
+        # ids need an entry, keeping this O(budget) rather than O(rows in hand).
+        #
+        # BEST occurrence, not the first, and that is load-bearing: resolving to the first makes the
+        # chunked fold non-associative, because the row carried into the next pass can hold a worse
+        # utility than the occurrence that won the heap slot. Ties keep the first, so an identical
+        # duplicate is unaffected; differing-pred duplicates are real (build_manifest joins on a key
+        # with `\.\d+$` stripped, which collides tautomer suffixes onto one id).
+        want, best_at = set(picked), {}
+        for i, lid in enumerate(xs):
+            if lid in want:
+                prev = best_at.get(lid)
+                if prev is None or y_means[i] > y_means[prev]:
+                    best_at[lid] = i
+        local = np.asarray([best_at[p] for p in picked if p in best_at], dtype=np.int64)
+        return local if pos is None else pos[local]
+
+    chunk = select_chunk_rows(budget_ligands)
+    if n_avail <= chunk or acq_metric not in CHUNKABLE_METRICS:
+        # Single pass, on pool size OR on a non-chunkable metric. The metric case lands here at ANY
+        # size and keeps an O(pool) cost, which today means every explore round (explore=True forces
+        # metric="random") plus ts/thompson.
+        return avail.iloc[_pick(None)]
+
+    # Carry a RUNNING top-B into the next chunk's pass rather than accumulating every chunk's picks
+    # and reducing at the end: accumulating holds pool * (budget/chunk) rows, half the pool at the
+    # 2x-budget floor, while folding bounds everything alive by chunk + budget. Exact because top-B
+    # is associative. No separate final pass is needed or wanted: the last iteration is already a
+    # pass over (running best u last chunk), so it returns the global top-B already ordered.
+    best = np.empty(0, dtype=np.int64)
+    for start in range(0, n_avail, chunk):
+        cand = np.arange(start, min(start + chunk, n_avail), dtype=np.int64)
+        best = _pick(cand if not len(best) else np.concatenate([best, cand]))
+    return avail.iloc[best]
 
 
 def write_named_csv(selected, out_path):
