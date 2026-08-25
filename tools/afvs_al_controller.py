@@ -78,6 +78,11 @@ def _state(state_dir):
         # reader can searchsorted into it instead of rebuilding a SMILES-keyed dict, which was
         # measured at 93 B/molecule against 8 here.
         "fp_keep": os.path.join(state_dir, "fp_keep.npy"),
+        # How many MANIFEST rows the cache was built against. Written LAST at init, so its presence
+        # is the completion marker and its absence means the init did not finish. Without it a cache
+        # that merely COVERS LESS of the manifest is indistinguishable from one whose missing rows
+        # were unparseable, and the first silently screens a fraction of the library.
+        "fp_meta": os.path.join(state_dir, "fp_cache_meta.json"),
         "fp": os.path.join(state_dir, "fp_cache.npz"),   # legacy, read-only
         "docked": os.path.join(state_dir, "docked_collections.txt"),
         "model": os.path.join(state_dir, "model.pt"),
@@ -108,6 +113,7 @@ def _load_fp_cache(st, n_manifest):
     identically, so predict_on_X returns the same value from either row. Unparseable SMILES resolve
     to -1 under both.
     """
+    _assert_cache_covers_manifest(st, n_manifest)
     if os.path.exists(st["fp_npy"]) and os.path.exists(st["fp_smiles"]):
         X = load_packed_npy(st["fp_npy"], mmap=True)
         if os.path.exists(st["fp_keep"]):
@@ -124,6 +130,45 @@ def _load_fp_cache(st, n_manifest):
     d = np.load(st["fp"], allow_pickle=True)
     smi = list(d["smiles"])
     return _row_of_from_smiles(st, smi, n_manifest), d["X"]
+
+
+def _assert_cache_covers_manifest(st, n_manifest):
+    """Refuse a cache that was not built against THIS manifest, in full.
+
+    _assert_cache_consistent checks the cache's artifacts against EACH OTHER. This checks the cache
+    against the MANIFEST, which no amount of internal consistency can establish: an init killed
+    after a sidecar flush leaves fp_keep, the sidecar and the .npy all agreeing and all short. The
+    consequence is the exact failure this design exists to prevent, because uncached rows resolve to
+    row -1, score +inf and are never selected, so the campaign screens a FRACTION of the library
+    while every stage reports success and the round returns CONTINUE.
+
+    Coverage cannot be inferred from the artifacts. A short cache and a complete one whose trailing
+    molecules were unparseable are the same shape on disk, so the row count the init RAN OVER has to
+    be recorded, and it is, in fp_meta. This deliberately runs before the branch selection above so
+    it covers the legacy sidecar and .npz readers too, which is where the probe found the second
+    hole.
+
+    A MISSING fp_meta is treated as a failure rather than waved through. That is a deliberate
+    asymmetry: the remedy is always available, since init truncates and rebuilds rather than
+    resuming, so a false refusal costs one re-fingerprint, while a false accept delivers a screen of
+    part of the library and reports success. The state dir is per-job and deleted with its parent, so
+    the only caches predating this record belong to a job whose init ran under an older checkout.
+    """
+    if not os.path.exists(st["fp_meta"]):
+        raise ValueError(
+            f"fingerprint cache has no coverage record ({st['fp_meta']}). Either the init did not "
+            f"finish (the record is written last, after every other cache artifact) or the cache "
+            f"predates this check. Neither can be scored safely: a cache covering part of the "
+            f"manifest scores the rest at +inf and silently screens a fraction of the library. "
+            f"Delete {os.path.dirname(st['fp_meta'])} and re-run init.")
+    with open(st["fp_meta"]) as fh:
+        meta = json.load(fh)
+    n_total = meta.get("n_total")
+    if n_total != n_manifest:
+        raise ValueError(
+            f"fingerprint cache was built against a {n_total:,}-row manifest but the manifest now "
+            f"has {n_manifest:,} rows. The cache and the pool being scored are different pools; "
+            f"delete {os.path.dirname(st['fp_meta'])} and re-run init.")
 
 
 def _assert_cache_consistent(st, kept, n_manifest):
@@ -657,6 +702,13 @@ def _cmd_init(args):
         n_workers=n_workers,
     )
     n_kept = int(kept.shape[0])
+    # COMPLETION MARKER, written after every other cache artifact is on disk. n_total is the only
+    # thing that distinguishes a cache missing rows because they were unparseable (fine) from one
+    # missing rows because the init never reached them (silently screens part of the library). A
+    # killed init leaves everything above this line and not this, which is exactly the signal
+    # _load_fp_cache needs. Small enough that torn writes are not a practical concern.
+    with open(st["fp_meta"], "w") as fh:
+        json.dump({"n_total": int(n_rows), "n_kept": n_kept}, fh)
     print(f"INIT fingerprint cache: {n_kept:,} molecules packed to {st['fp_npy']} "
           f"({X.nbytes / 1e9:.2f} GB on disk, {X.nbytes / max(n_kept, 1):.0f} B/molecule); "
           f"{n_rows - n_kept:,} unparseable dropped")
