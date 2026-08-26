@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Regression surrogate for multi-round active-learning virtual screening (TAM-1599).
+Regression surrogate for multi-round active-learning virtual screening.
 
 The regression counterpart of ml_classifier.py. The network BODY (1024 -> 512 -> 256 -> 128, ReLU)
 and Morgan-1024 featurization are kept verbatim from the AdaptiveFlow manuscript classifier; the
@@ -351,9 +351,16 @@ def fingerprint_to_packed_npy(smiles_list, out_path, radius=2, n_bits=None, fp_t
     Nothing here writes fp_keep incrementally or resumes a partial cache; both are tempting for a
     parallel build and both are UNSAFE today, because a short-but-internally-consistent cache passes
     the reader's consistency check and is then used to screen a fraction of the library silently.
-    That was measured, not reasoned: the check compares fp_keep's length against the SMILES sidecar's
-    row count and bounds the max index, so a cache that is merely SHORT satisfies it. A resumable
-    design needs a coverage floor first.
+    That was measured, not reasoned: the OLD check compared fp_keep's length against the SMILES
+    sidecar's row count and bounded the max index, so a cache that was merely SHORT satisfied it.
+
+    THAT COVERAGE FLOOR HAS SINCE SHIPPED. `_assert_cache_covers_manifest` in afvs_al_controller.py
+    now compares the cache against a RECORDED manifest row count rather than against the cache's own
+    artifacts, so a short cache is refused rather than silently screening a fraction of the library,
+    and `_cmd_init` clears that record up front so a re-init cannot inherit the previous run's. The
+    blocker on a resumable or incrementally-written fp_keep is therefore GONE. Read this paragraph as
+    history: it used to end by saying a resumable design needs a coverage floor first, which now
+    argues against a thing the code already has.
     """
     n_bits = DEFAULT_N_BITS if n_bits is None else n_bits
     fp_type = DEFAULT_FP_TYPE if fp_type is None else fp_type
