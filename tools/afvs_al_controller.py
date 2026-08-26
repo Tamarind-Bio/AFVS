@@ -416,7 +416,11 @@ def run_round(manifest, docked_scores, fp_cache, budget_total, per_round, k_frac
         n_hold = max(3, len(ytr) // 5)                       # ~20% held out
         hold, tr = perm[:n_hold], perm[n_hold:]
         if len(tr) >= 10:
-            probe, pmeta = train_on_X(Xtr[tr], ytr[tr], seed=seed)
+            # rows=tr, not Xtr[tr], for exactly the reason the next comment gives about predict_on_X.
+            # That discipline was applied to the predict call below and not to this train call
+            # directly above it, so the probe materialized its whole training split unpacked and
+            # defeated the per-batch bounding inside train_on_X.
+            probe, pmeta = train_on_X(Xtr, ytr, seed=seed, rows=tr)
             # rows=hold, not Xtr[hold]: the gather would materialize before predict_on_X chunks it.
             # Budget-scaled rather than pool-scaled, so this one is small at an explicit alBudget,
             # but it is the same shape as the three in afvs_al_select.py and the default budget is
