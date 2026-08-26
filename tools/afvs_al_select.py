@@ -219,6 +219,28 @@ DEFAULT_SELECT_CHUNK_ROWS = 1_000_000
 CHUNKABLE_METRICS = frozenset({"greedy", "ucb", "lcb", "ei", "pi"})
 
 
+def explored_current_max(explored):
+    """The incumbent `ei` and `pi` improve on, mirroring Acquirer.acquire_batch exactly.
+
+    Module-level and separately testable ON PURPOSE. This is the ONE piece of the acquirer's
+    internals `select_ligands` re-derives instead of reading, so it is the one a vendor bump can
+    silently desync, and it is only WEAKLY observable through select_ligands' output: it changes
+    which occurrence of a DUPLICATED id is kept, under ei/pi only, and a search over 20,000 random
+    six-row fixtures found no case where that flipped the final selection. So a behavioural test
+    cannot reliably cover it and a direct one can. Keep it exported and keep its test.
+
+    Mirrors, for k=1 (acquire_batch's default, which makes its partition a max):
+        Y = np.nan_to_num(np.array(list(explored.values()), float), nan=-np.inf)
+        current_max = np.partition(Y, -k)[-k] if len(Y) >= k else Y.max()
+    A NaN maps to -inf rather than propagating, which is what keeps a failed dock (stored as NaN)
+    from dragging the incumbent to NaN and flattening every ei/pi utility.
+    """
+    if not explored:
+        return float("-inf")
+    Y = np.nan_to_num(np.array(list(explored.values()), dtype=float), nan=-np.inf)
+    return float(Y.max())
+
+
 def select_chunk_rows(budget_ligands):
     """
     Rows per acquisition chunk, overridable with `alSelectChunkRows`.
@@ -293,6 +315,7 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy
     """
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
     from molpal.acquirer import Acquirer  # noqa: E402  (vendored; see tools/vendor/molpal)
+    from molpal.acquirer import metrics as acq_metrics  # noqa: E402  (same vendored tree)
 
     # Everything below needs index == position. reset_index(drop=True) delivers that but COPIES the
     # block pointers (28 B/molecule), and a RangeIndex(0, n, 1) already satisfies it, so alias
@@ -338,6 +361,45 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy
     # allocation there even though it is free on the numpy object dtype.
     ids_col, pred_col = avail.ligand_id, avail.pred
 
+    # acquire_batch recomputes this per call from the same `explored` mapping, which never changes
+    # across passes, so deriving it once here is exact rather than a second source of truth.
+    current_max = explored_current_max(explored)
+
+    def _dedupe_by_id(xs, y_means, y_vars):
+        """Positions of ONE row per ligand_id, keeping the occurrence with the highest acquisition
+        UTILITY. Returns None when every id is already unique, which is the overwhelmingly common
+        case and pays nothing beyond the set build.
+
+        WHY THIS EXISTS. acquire_batch heaps `(u, x)` and does not dedupe by x, so one ligand_id can
+        occupy k>1 budget slots, and the caller then has to decide which ROW each slot means. Two
+        things go wrong if it decides late:
+
+          - k slots of one id resolved by an id-keyed lookup collapse onto k copies of a SINGLE row,
+            so the budget is spent on a repeat and k-1 distinct ligands are dropped.
+          - resolving by y_mean is right only for greedy. ucb/lcb/ei/pi rank on a utility that reads
+            y_var too, so the occurrence with the best mean need not be the one that won the slot,
+            and the row carried into the next chunk then holds a utility the fold never saw.
+
+        Deduping BEFORE the heap removes both at once, and it is the honest fix rather than the
+        narrow one: a repeated id cannot be docked twice anyway (write_named_csv emits one row per
+        selected row and the collection tarball holds one molecule under that name), so a second slot
+        was never spendable. It also makes the fold trivially associative, because per-id max is
+        associative and chunk-local max composes to global max.
+
+        Utilities come from the acquirer's OWN metrics.calc, parameterised off the acquirer object,
+        so this cannot rank on a different key than acquire_batch does.
+        """
+        if len(set(xs)) == len(xs):
+            return None
+        U = acq_metrics.calc(acq.metric, y_means, y_vars, current_max,
+                             acq.threshold, acq.beta, acq.xi, acq.stochastic_preds)
+        best = {}
+        for i, lid in enumerate(xs):
+            j = best.get(lid)
+            if j is None or U[i] > U[j]:
+                best[lid] = i
+        return np.fromiter(sorted(best.values()), dtype=np.int64, count=len(best))
+
     def _pick(pos):
         """One acquirer pass over ABSOLUTE row positions `pos` (None = the whole pool, which avoids
         materialising an arange). Returns the selected absolute positions, descending by utility."""
@@ -352,23 +414,20 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy
             y_vars = np.zeros(len(xs), dtype=float)
         else:
             y_vars = pv if pos is None else pv[pos]
+
+        keep = _dedupe_by_id(xs, y_means, y_vars)
+        if keep is not None:
+            xs = [xs[i] for i in keep]
+            y_means, y_vars = y_means[keep], y_vars[keep]
+
         picked = acq.acquire_batch(xs=xs, y_means=y_means, y_vars=y_vars,
                                    explored=explored, t=1)
-        # acquire_batch returns IDS, so a duplicated ligand_id is resolved here. Only the SELECTED
-        # ids need an entry, keeping this O(budget) rather than O(rows in hand).
-        #
-        # BEST occurrence, not the first, and that is load-bearing: resolving to the first makes the
-        # chunked fold non-associative, because the row carried into the next pass can hold a worse
-        # utility than the occurrence that won the heap slot. Ties keep the first, so an identical
-        # duplicate is unaffected; differing-pred duplicates are real (build_manifest joins on a key
-        # with `\.\d+$` stripped, which collides tautomer suffixes onto one id).
-        want, best_at = set(picked), {}
-        for i, lid in enumerate(xs):
-            if lid in want:
-                prev = best_at.get(lid)
-                if prev is None or y_means[i] > y_means[prev]:
-                    best_at[lid] = i
-        local = np.asarray([best_at[p] for p in picked if p in best_at], dtype=np.int64)
+        # acquire_batch returns IDS. They are unique in `xs` now, so this is a plain lookup and each
+        # selected id resolves to exactly the row whose utility won its slot.
+        at = {lid: i for i, lid in enumerate(xs)}
+        local = np.asarray([at[p] for p in picked], dtype=np.int64)
+        if keep is not None:
+            local = keep[local]
         return local if pos is None else pos[local]
 
     chunk = select_chunk_rows(budget_ligands)
