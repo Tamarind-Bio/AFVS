@@ -49,6 +49,7 @@ sys.path.insert(0, os.path.join(HERE, "vendor"))
 
 import afvs_al_select as S  # noqa: E402
 from molpal.acquirer.acquirer import Acquirer  # noqa: E402
+from molpal.acquirer import metrics as molpal_metrics  # noqa: E402
 
 # ---- acquirer-pass spy. The pass COUNT is what separates a real chunked run from a vacuous one. ----
 _ORIG_ACQUIRE = Acquirer.acquire_batch
@@ -343,6 +344,150 @@ d_chk, d_passes = run(dup, 9, "greedy", chunk_rows=100)
 ok, detail = same(d_ref, d_chk)
 check(ok, "duplicated pool: identical", detail)
 check(d_passes >= 4, "duplicated pool really chunked", f"passes={d_passes}")
+
+# SWEEP THE BUDGET. A pinned budget is what made this section vacuous the SECOND time: it ran at 9,
+# and 9 sits inside the range where the two paths happen to agree, so 171 checks went green over a
+# defect this fixture was built to catch. The divergence is continuous from 15 upward, so any single
+# value below that reports the fixture rather than the code. The rule generalises past this file: a
+# test whose fixture PINS a scalar has sampled one point, not tested the invariant, so sweep the
+# scalar and let the sweep be the assertion.
+# ONE ligand_id must not hold TWO budget slots either, on EITHER path. That is a SEPARATE claim
+# from associativity and it is checked in the same sweep deliberately: write_named_csv emits one row
+# per selected row and the collection tarball holds ONE molecule under that name, so a repeated id
+# spends a dock slot on a molecule that can never be docked twice. develop emitted repeats on the
+# single-pass path too, so this guards BOTH branches rather than chunking alone. Checking it at one
+# budget would reproduce the very trap this sweep exists to close.
+sweep_bad, sweep_dup = [], []
+for b in (1, 2, 3, 5, 8, 13, 15, 16, 21, 34, 55, 80):
+    s_ref, _ = run(dup, b, "greedy", chunk_rows=10 * len(dup))
+    s_chk, _ = run(dup, b, "greedy", chunk_rows=100)
+    s_ok, _ = same(s_ref, s_chk)
+    if not s_ok:
+        sweep_bad.append(b)
+    for label, frame in (("single", s_ref), ("chunked", s_chk)):
+        if len(set(frame.ligand_id.astype(str))) != len(frame):
+            sweep_dup.append(f"{label}@{b}")
+check(not sweep_bad, "duplicated pool: identical at EVERY budget, not just the fixture's",
+      f"diverged at budgets {sweep_bad}" if sweep_bad else "12 budgets, 1 to 80")
+check(not sweep_dup, "no ligand_id occupies more than one budget slot, at any budget, on either path",
+      f"repeats at {sweep_dup}" if sweep_dup else "12 budgets x 2 paths")
+
+# THE UTILITY-KEYED HALF. Resolving a duplicate by y_mean is right only for greedy: ucb/lcb/ei/pi
+# rank on a utility that reads y_var too, so the occurrence that won the heap slot is not
+# necessarily the one with the best mean. Zero-variance cases cannot see this, which is why every
+# case above is blind to it; these carry a real pred_var.
+#
+# Each metric needs its OWN pred, not one shared fixture. Reusing ucb's preds for lcb inverts which
+# ligand the metric ranks first (lcb SUBTRACTS the uncertainty term), so the control would assert the
+# wrong winner and a green run would mean nothing. Caught by reading the control's own failure rather
+# than by trusting the fixture.
+for metric, pred, var, want in (
+        ("ucb",    [-5.0, -6.0, -10.0], [25.0, 0.0, 0.0], "A"),
+        ("lcb",    [-5.0, -6.0,  -3.0], [0.0, 9.0, 0.0],  "A"),
+        ("greedy", [-5.0, -6.0, -10.0], [0.0, 0.0, 0.0],  "C")):
+    UDUP = pd.DataFrame({"collection_key": ["K"] * 3,
+                         "ligand_id": ["A", "A", "C"],
+                         "smiles": ["C"] * 3,
+                         "pred": np.array(pred, dtype=np.float32)})
+    pv_ = np.asarray(var, dtype=float)
+    u_ref, _ = run(UDUP, 1, metric, chunk_rows=1000, pred_var=pv_)
+    u_chk, u_p = run(UDUP, 1, metric, chunk_rows=2, pred_var=pv_)
+    u_ok, u_detail = same(u_ref, u_chk)
+    check(u_p > 1, f"CONTROL {metric} duplicate-utility case really chunked", f"passes={u_p}")
+    check(u_ok, f"{metric} with real pred_var: chunked == single pass", u_detail)
+    check(str(u_ref.ligand_id.iloc[0]) == want,
+          f"CONTROL {metric} selects the ligand its own utility ranks first",
+          f"got {str(u_ref.ligand_id.iloc[0])}, want {want}")
+
+# THE DEPENDENCY MECHANISM, pinned DIRECTLY rather than through a downstream symptom.
+# select_ligands resolves a duplicated id by recomputing the acquirer's utilities with
+# metrics.calc, parameterised off the acquirer object. That is only correct while the utilities it
+# computes are the ones acquire_batch RANKS on, which is a property of the vendored acquirer and not
+# of anything in afvs_al_select.py. A vendor bump that changed the signature, the argument order,
+# `current_max`, or the default k would leave every case above green (they compare our two paths
+# against each OTHER, so a shared wrong key agrees with itself) and silently rank on the wrong thing.
+# So assert the property itself: our utilities must order the pool the way acquire_batch does.
+rng_u = np.random.default_rng(11)
+POOL_U = make_pool(40, seed=11)
+pv_u = np.abs(rng_u.normal(0, 2, len(POOL_U)))
+mech_bad = []
+for metric in sorted(S.CHUNKABLE_METRICS):
+    acq_probe = Acquirer(size=len(POOL_U), init_size=5, batch_sizes=[5], metric=metric,
+                         epsilon=0.0, seed=42, verbose=0)
+    xs_u = list(POOL_U.ligand_id.astype(str))
+    ym = -POOL_U.pred.to_numpy().astype(float)
+    # Non-empty explored on purpose: it is the ONLY input to current_max, so an ei/pi run with an
+    # empty one cannot discriminate a wrong derivation of it.
+    expl = {xs_u[i]: float(ym[i]) for i in (3, 9, 17)}
+    picked_u = acq_probe.acquire_batch(xs=xs_u, y_means=ym, y_vars=pv_u, explored=expl, t=1)
+    Ycm = np.nan_to_num(np.array(list(expl.values()), dtype=float), nan=-np.inf)
+    U_ours = molpal_metrics.calc(acq_probe.metric, ym, pv_u, float(Ycm.max()),
+                                 acq_probe.threshold, acq_probe.beta, acq_probe.xi,
+                                 acq_probe.stochastic_preds)
+    # acquire_batch returns ids descending by utility, skipping explored. Our utilities must
+    # reproduce exactly that order over exactly that set.
+    unexplored = [i for i, x in enumerate(xs_u) if x not in expl]
+    want_order = [xs_u[i] for i in sorted(unexplored, key=lambda i: (-U_ours[i], xs_u[i]))][:5]
+    if list(picked_u) != want_order:
+        mech_bad.append(f"{metric}: acquirer {list(picked_u)[:3]} vs ours {want_order[:3]}")
+check(not mech_bad,
+      "our metrics.calc utilities reproduce the acquirer's OWN ranking, for every chunkable metric",
+      "; ".join(mech_bad) if mech_bad else f"{len(S.CHUNKABLE_METRICS)} metrics, explored non-empty")
+
+# The OTHER half of the same dependency: `current_max`, asserted DIRECTLY against the acquirer's own
+# expression rather than through select_ligands' output. It has to be direct, because it is only
+# weakly observable end to end (see the helper's docstring), so a behavioural test cannot cover it.
+for label, expl, want in (
+        ("empty explored -> -inf",            {},                        float("-inf")),
+        ("all finite -> the MAX",             {"a": -9.0, "b": -2.0, "c": -5.0}, -2.0),
+        ("a failed dock (NaN) -> -inf, not NaN, and does not win",
+                                              {"a": float("nan"), "b": -7.0},    -7.0),
+        ("all failed -> -inf",                {"a": float("nan")},       float("-inf")),
+        ("single entry -> itself",            {"a": -3.5},               -3.5)):
+    got = S.explored_current_max(expl)
+    check(got == want, f"current_max: {label}", f"got {got}, want {want}")
+# And it must agree with what acquire_batch computes for the same mapping. Same-expression by
+# construction is the point: this is the line that goes red on a vendor bump that changes k or the
+# NaN handling, which is the whole reason the helper is module-level.
+_expl = {"a": -9.0, "b": -2.0, "c": float("nan")}
+_Yc = np.nan_to_num(np.array(list(_expl.values()), dtype=float), nan=-np.inf)
+check(S.explored_current_max(_expl) == float(np.partition(_Yc, -1)[-1]),
+      "current_max matches acquire_batch's own partition expression at k=1")
+
+# ================== 8b. adversarial battery on the duplicate resolver ==================
+print("\n8b. DUPLICATE RESOLVER: identity and tie-break cases the sweep above cannot reach")
+# Degenerate shapes first. Each must return a sane answer rather than raising: the resolver runs on
+# EVERY pass, so a crash here takes down the whole round rather than one selection.
+ONE = pd.DataFrame({"collection_key": ["K"], "ligand_id": ["A"], "smiles": ["C"],
+                    "pred": np.array([-5.0], dtype=np.float32)})
+o1, _ = run(ONE, 1, "greedy", chunk_rows=1000)
+check(len(o1) == 1 and str(o1.ligand_id.iloc[0]) == "A", "single-row pool selects that row")
+# 20 rows, not 5: chunking floors at max(chunk_rows, 2*budget), so a 5-row pool at budget 3 has a
+# floor of 6 and takes the single pass however small chunk_rows is. The pool has to clear the FLOOR,
+# not chunk_rows. A first version of this case asserted the chunked path on a 5-row pool and its own
+# control caught it, which is the control earning its line.
+_ap = np.array([-1.0, -9.0, -3.0, -2.0, -4.0] * 4, dtype=np.float32)
+ALLSAME = pd.DataFrame({"collection_key": ["K"] * 20, "ligand_id": ["A"] * 20,
+                        "smiles": ["C"] * 20, "pred": _ap})
+a_ref, _ = run(ALLSAME, 3, "greedy", chunk_rows=1000)
+a_chk, a_p = run(ALLSAME, 3, "greedy", chunk_rows=2)
+check(len(a_ref) == 1, "an all-one-id pool yields ONE row however large the budget",
+      f"{len(a_ref)} rows")
+check(float(a_ref.pred.iloc[0]) == -9.0, "and it is that id's BEST row", f"pred={float(a_ref.pred.iloc[0])}")
+ok, detail = same(a_ref, a_chk)
+check(ok, "all-one-id pool: chunked == single pass", detail)
+check(a_p > 1, "CONTROL the all-one-id pool really chunked", f"passes={a_p}")
+
+# TIE on the resolution key. Two occurrences of one id with IDENTICAL pred must resolve
+# deterministically, and to the FIRST, so a rerun of the same screen picks the same row.
+TIE = pd.DataFrame({"collection_key": ["K"] * 4, "ligand_id": ["A", "B", "A", "C"],
+                    "smiles": ["Ca", "Cb", "Cc", "Cd"],
+                    "pred": np.array([-7.0, -1.0, -7.0, -2.0], dtype=np.float32)})
+t1, _ = run(TIE, 1, "greedy", chunk_rows=1000)
+t2, _ = run(TIE, 1, "greedy", chunk_rows=1000)
+check(str(t1.smiles.iloc[0]) == "Ca", "a tie on the resolution key keeps the FIRST occurrence",
+      f"got smiles={str(t1.smiles.iloc[0])}")
+check(list(t1.index) == list(t2.index), "and it is deterministic across identical runs")
 
 # The minimal regression case, reduced from the divergence a review found. Pre-fix, single-pass
 # returned ligand A and the chunked path returned an entirely different ligand C, because the row
