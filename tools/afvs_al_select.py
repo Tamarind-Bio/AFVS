@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Active-learning acquisition step for multi-round virtual screening (TAM-1599).
+Active-learning acquisition step for multi-round virtual screening.
 
 The regress-and-rank analogue of create_todofile_atg-primaryscreen.py: instead of scoring tranches
 by the heuristic min/avg prescreen score, score every collection by a TRAINED surrogate's predicted
@@ -388,9 +388,13 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy
 
         Utilities come from the acquirer's OWN metrics.calc, parameterised off the acquirer object,
         so this cannot rank on a different key than acquire_batch does.
+
+        `has_dup` is decided by the CALLER, on the pandas Series, and passed in. It is not recomputed
+        here from `xs`: `len(set(xs)) == len(xs)` costs a python set of every id in the pass, which is
+        O(rows) and is paid on EVERY pass including the overwhelmingly common one where the answer is
+        no. `Series.duplicated().any()` answers the same question in C over the Arrow buffer without
+        materialising anything per row. Everything below this line runs ONLY when duplicates exist.
         """
-        if len(set(xs)) == len(xs):
-            return None
         U = acq_metrics.calc(acq.metric, y_means, y_vars, current_max,
                              acq.threshold, acq.beta, acq.xi, acq.stochastic_preds)
         best = {}
@@ -403,7 +407,13 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy
     def _pick(pos):
         """One acquirer pass over ABSOLUTE row positions `pos` (None = the whole pool, which avoids
         materialising an arange). Returns the selected absolute positions, descending by utility."""
-        ids = (ids_col if pos is None else ids_col.take(pos)).to_numpy()
+        ids_s = ids_col if pos is None else ids_col.take(pos)
+        # Decide duplicate-ness on the SERIES, before anything is materialised per row: this is a
+        # C-level hash over the Arrow buffer, where the equivalent python `len(set(xs)) == len(xs)`
+        # allocates a set of every id in the pass. It is asked on every pass and answers no on
+        # essentially all of them, so it must not be the expensive one.
+        has_dup = bool(ids_s.duplicated().any())
+        ids = ids_s.to_numpy()
         preds = (pred_col if pos is None else pred_col.take(pos)).to_numpy()
         xs = [str(x) for x in ids]
         y_means = -preds.astype(float)   # MolPAL maximizes; pred is lower-is-better
@@ -415,16 +425,24 @@ def select_ligands(manifest_pred, docked_ligands, budget_ligands, metric="greedy
         else:
             y_vars = pv if pos is None else pv[pos]
 
-        keep = _dedupe_by_id(xs, y_means, y_vars)
+        keep = _dedupe_by_id(xs, y_means, y_vars) if has_dup else None
         if keep is not None:
             xs = [xs[i] for i in keep]
             y_means, y_vars = y_means[keep], y_vars[keep]
 
         picked = acq.acquire_batch(xs=xs, y_means=y_means, y_vars=y_vars,
                                    explored=explored, t=1)
-        # acquire_batch returns IDS. They are unique in `xs` now, so this is a plain lookup and each
+        # acquire_batch returns IDS, unique in `xs` by now, so this is a plain lookup and each
         # selected id resolves to exactly the row whose utility won its slot.
-        at = {lid: i for i, lid in enumerate(xs)}
+        #
+        # Only the SELECTED ids get an entry, which keeps this O(budget) rather than O(rows in hand).
+        # That property is load-bearing and was lost once already: a `{lid: i for i, lid in
+        # enumerate(xs)}` comprehension is the obvious way to write this and it is O(rows), which on
+        # the explore path (single pass, whole pool) is the term that sets the round-path ceiling.
+        want, at = set(picked), {}
+        for i, lid in enumerate(xs):
+            if lid in want and lid not in at:
+                at[lid] = i
         local = np.asarray([at[p] for p in picked], dtype=np.int64)
         if keep is not None:
             local = keep[local]

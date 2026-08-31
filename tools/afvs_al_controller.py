@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Active-learning controller for multi-round virtual screening (TAM-1599).
+Active-learning controller for multi-round virtual screening.
 
 Runs on the AFVS head node. Drives the seed -> train -> predict -> acquire -> dock loop, reusing the
 existing AFVS docking fan-out for each round (run-virtual-screening.sh submits the todo.all this
@@ -19,8 +19,15 @@ Design decisions (validated against exhaustively-docked ground truth):
     epsilon 0. The explore round uses MolPAL's `random` metric.
   - convergence: stop when the rolling mean of the top-K docked score stops improving, or the docking
     budget is spent, whichever first.
-  - guardrail 2: after the seed round, if the held-out surrogate Spearman is below --min-spearman,
-    print a QUALITY_LOW warning so the run driver can fall back to brute force.
+  - guardrail 2: explore-then-exploit. When the held-out surrogate Spearman is below --min-spearman
+    the next round docks a random unbiased batch instead of a greedy one, and only after
+    --max-explore-rounds CONSECUTIVE such rounds does the run stop with QUALITY_LOW. It is a
+    consecutive-bad-round streak, not a single low round.
+    QUALITY_LOW is a TERMINAL stop and NOTHING falls back to brute force. That is deliberate, not a
+    gap: auto-brute-forcing the remaining library on a weak surrogate is a budget blowout at giga
+    scale, so a full-library screen stays an explicit opt-in. An earlier version of this docstring
+    said the run driver "can fall back to brute force", which described a mechanism that has never
+    existed and that the wrapper documents as harmful.
 
 TWO infra seams (marked SEAM below, cannot be unit-tested off a live run):
   (A) build_manifest: the cheapest (collection -> ligand_ids) source is deployment-specific (collection
@@ -33,6 +40,7 @@ import argparse
 import glob
 import json
 import os
+import pathlib
 import sys
 
 import numpy as np
@@ -659,6 +667,28 @@ def _cmd_init(args):
     from ml_regressor import fingerprint_to_packed_npy
     st = _state(args.state_dir)
     os.makedirs(args.state_dir, exist_ok=True)
+
+    # DROP the previous run's coverage record BEFORE touching anything else, so a re-init that dies
+    # partway cannot leave a stale record certifying a cache it did not write.
+    #
+    # The window this closes: open_memmap(mode="w+") TRUNCATES and zero-fills the .npy at the full
+    # manifest row count on entry, while the smiles sidecar's ParquetWriter is constructed lazily
+    # inside the first flush, so a re-init killed inside its first chunk leaves run 1's record, keep
+    # array and sidecar mutually consistent beside a fully zeroed matrix. _assert_cache_covers_manifest
+    # then ACCEPTS that, and every molecule scores on a zero vector with no unresolved-row signal,
+    # which is strictly worse than the short-cache case the floor was built for (those rows resolve
+    # to -1 and sink to +inf, so they are merely never selected).
+    #
+    # Clearing the record ALONE is sufficient and fp_keep does NOT also need clearing: the record has
+    # exactly one writer and it is placed strictly last, so its presence certifies that ONE run
+    # completed the whole chain. Every partial-kill variant then lands on either the missing-record
+    # refusal or the pre-existing torn-pair check.
+    #
+    # missing_ok=True is load-bearing, NOT defensive tidiness. On a fresh state dir, which is the
+    # universal case, a bare os.remove raises FileNotFoundError, and the wrapper runs this init
+    # unguarded under `set -euo pipefail`, so the strict form would abort EVERY AL job at init while
+    # working fine on the rare reproduction it was written for.
+    pathlib.Path(st["fp_meta"]).unlink(missing_ok=True)
 
     # SEAM A: (collection_key, ligand_id). Prefer a pre-built ingestion manifest; else scan the tarball
     # file lists (parallel + cached to the state dir so the O(10k)-collection scan happens at most once).
