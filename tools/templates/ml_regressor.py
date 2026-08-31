@@ -595,15 +595,16 @@ def train_on_X(X, y, val_fraction=0.10, batch_size=256, max_epochs=100, patience
     # the SMILES that produced it. A caller that featurized with a non-default fp_type must
     # override it (train_regressor does). Recorded so predict_scores cannot silently re-featurize
     # a checkpoint with a different fingerprint, which inverts the ranking with no error.
-    # n_bits, NOT X.shape[1]. X is now kept PACKED, so its second axis is the packed byte width
-    # (n_bits / 8) rather than the model's input width. This field is not cosmetic: predict_on_X and
-    # load_regressor both read it, the first to size chunks and to decide whether a matrix handed to
-    # it is packed, so a packed width here silently mis-dispatches every later prediction. The
-    # trained model itself is unaffected (it is built from n_bits and comes out bit-identical), which
-    # is what makes this the kind of defect a weights comparison alone would pass.
+    # BOTH width fields are n_bits, NOT X.shape[1]. X is now kept PACKED, so its second axis is the
+    # packed byte width (n_bits / 8) rather than the model's input width. Neither is cosmetic:
+    # predict_on_X and load_regressor read input_dim to size chunks and to size the first Linear,
+    # and afvs_al_select re-featurizes at fp_nbits on its fp_cache=None paths, so a packed width in
+    # either field is wrong by a factor of 8. The trained model is unaffected (it is built from
+    # n_bits and comes out bit-identical), which is what makes this a defect a weights comparison
+    # alone passes.
     meta = {"input_dim": n_bits, "y_mean": y_mean, "y_std": y_std,
             "best_epoch": best_epoch, "best_val_loss": best_val,
-            "fp_radius": 2, "fp_nbits": X.shape[1],
+            "fp_radius": 2, "fp_nbits": n_bits,
             "fp_type": DEFAULT_FP_TYPE}
     return model, meta
 
