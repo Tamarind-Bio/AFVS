@@ -466,23 +466,60 @@ class FNNRegressor(nn.Module):
 
 
 def train_on_X(X, y, val_fraction=0.10, batch_size=256, max_epochs=100, patience=8,
-               learning_rate=1e-3, huber_delta=1.0, seed=42, device=None, verbose=False):
+               learning_rate=1e-3, huber_delta=1.0, seed=42, device=None, verbose=False,
+               rows=None):
     """
     Train the FNN regressor on a precomputed fingerprint matrix X and aligned scores y.
     Returns (model, meta); meta carries the score standardization (mean/std) + training history.
+
+    `rows` is an optional integer index selecting a SUBSET of X and y, and it exists for the same
+    reason predict_on_X's does: `train_on_X(X[sub], y[sub])` is a caller-side fancy-index gather, so
+    numpy materializes the whole selection BEFORE this function is entered and the per-batch
+    materialization below then bounds nothing, because the peak already happened in the caller.
+    Passing the indices keeps the gather per-batch. It selects into BOTH X and y, so the caller hands
+    over the full arrays and cannot get their lengths out of step.
     """
     set_seed(seed)
     device = get_device(device)
-    # A packed matrix is unpacked WHOLE here, unlike predict_on_X which unpacks per chunk. That is
-    # deliberate and bounded: this only ever sees the DOCKED set, which is capped by alBudget, so
-    # it is 7% of pool at the default budget shape rather than the pool itself. It is still the
-    # next ceiling to fall on this path (at 1e8 pool that is 7e6 rows ~ 57 GB unpacked), so a
-    # per-batch unpacking Dataset is the fix when the pool goes past ~1e7, not before.
-    if getattr(X, "dtype", None) == np.uint8:
-        X = unpack_fp(X, X.shape[1] * 8)
-    else:
-        X = np.asarray(X, dtype=np.float32)
+    # X stays PACKED and is materialised one BATCH at a time, which is the discipline predict_on_X
+    # already documents and this function was the one place not following it. Its docstring states
+    # the rule exactly: "X[rows] is a fancy-index gather, so numpy materializes the whole selection
+    # as a new array BEFORE this function is entered; the chunk loop then bounds nothing, because
+    # the peak already happened in the caller."
+    #
+    # This function did that twice. Unpacking whole cost n_bits/8 * 4 = 8,192 B/row at 2048 bits,
+    # and then X[train_idx] and X[val_idx] were caller-side fancy-index gathers that COPIED that
+    # again, so the true peak was ~16,384 B/row rather than the 8,192 the old comment reasoned
+    # from. That understatement is why the old comment deferred the fix to "past ~1e7 pool": the
+    # wall is on the BUDGET axis, not the pool axis, so it does not scale with pool at all. At
+    # 16,384 B per DOCKED ligand a 122 GB box tops out near 7.2e6 attempted dockings, which the
+    # sprint's own settled 10M-docking budget already exceeds, needing ~164 GB. It was never a
+    # future problem.
+    #
+    # Peak is now O(batch) plus the packed matrix at 256 B/row, so the same budget needs ~2.6 GB.
+    # The gather happens on the PACKED array and the unpack happens after it, which is the whole
+    # point: gathering after unpacking would reinstate the term this removes.
+    packed = getattr(X, "dtype", None) == np.uint8
+    n_bits = X.shape[1] * 8 if packed else X.shape[1]
+
     y = np.asarray(y, dtype=np.float32)
+    if rows is None:
+        base = None
+    else:
+        base = np.asarray(rows)
+        if base.ndim != 1:
+            raise ValueError(f"rows must be a 1-D index array, got shape {base.shape}")
+        if len(y) != X.shape[0]:
+            raise ValueError(
+                f"with rows= the caller passes the FULL arrays and this selects into both, but y has "
+                f"{len(y):,} entries against {X.shape[0]:,} rows of X; subsetting y yourself and also "
+                f"passing rows would silently train on mismatched pairs.")
+        y = y[base]
+
+    def _rows_as_float(idx):
+        """Materialise ONLY these rows. Gather first (on packed bytes), unpack second."""
+        sel = idx if base is None else base[idx]
+        return unpack_fp(X[sel], n_bits) if packed else np.asarray(X[sel], dtype=np.float32)
 
     y_mean, y_std = float(y.mean()), float(y.std())
     if y_std < 1e-8:
@@ -494,13 +531,28 @@ def train_on_X(X, y, val_fraction=0.10, batch_size=256, max_epochs=100, patience
     n_val = max(1, int(round(len(y_z) * val_fraction)))
     val_idx, train_idx = perm[:n_val], perm[n_val:]
 
-    train_ds = TensorDataset(torch.from_numpy(X[train_idx]),
-                             torch.from_numpy(y_z[train_idx].astype(np.float32)))
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    Xv = torch.from_numpy(X[val_idx]).to(device)
-    yv = torch.from_numpy(y_z[val_idx].astype(np.float32)).to(device)
+    # The dataset yields POSITIONS, and the collate does the gather-then-unpack for the batch. The
+    # shuffle is still DataLoader's, driven by the same torch seed set above, so batch membership
+    # and batch ORDER are unchanged and training stays bit-identical to the whole-unpack version.
+    class _PackedRowDataset(TensorDataset):
+        def __init__(self, positions, targets):
+            super().__init__(torch.from_numpy(positions), torch.from_numpy(targets))
 
-    model = FNNRegressor(input_dim=X.shape[1]).to(device)
+    def _collate(items):
+        pos = np.fromiter((int(p) for p, _ in items), dtype=np.int64, count=len(items))
+        tgt = torch.stack([t for _, t in items])
+        return torch.from_numpy(_rows_as_float(train_idx[pos])), tgt
+
+    train_ds = _PackedRowDataset(np.arange(len(train_idx), dtype=np.int64),
+                                 y_z[train_idx].astype(np.float32))
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=_collate)
+    # Validation is chunked for the same reason and never lands on the device whole. The old code
+    # put the entire validation split on the GPU as one tensor, which at a 10M-docking budget is a
+    # 1e6 x 2048 float32 allocation, about 8 GB, on top of everything else.
+    val_chunk = max(1, _rows_per_chunk(n_bits, None))
+    yv_all = y_z[val_idx].astype(np.float32)
+
+    model = FNNRegressor(input_dim=n_bits).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     loss_fn = nn.HuberLoss(delta=huber_delta)
 
@@ -518,7 +570,20 @@ def train_on_X(X, y, val_fraction=0.10, batch_size=256, max_epochs=100, patience
             losses.append(loss.item())
         model.eval()
         with torch.no_grad():
-            val_loss = float(loss_fn(model(Xv).squeeze(1), yv).item())
+            # Chunked, and the per-chunk means are weighted by chunk SIZE before being combined.
+            # HuberLoss reduces with mean, so a plain mean-of-means would be wrong whenever the
+            # final chunk is short, which is the usual case. Weighting makes this exactly equal to
+            # the single-tensor reduction it replaces.
+            tot, seen = 0.0, 0
+            for s in range(0, len(val_idx), val_chunk):
+                sl = slice(s, min(s + val_chunk, len(val_idx)))
+                xb = torch.from_numpy(_rows_as_float(val_idx[sl])).to(device)
+                yb = torch.from_numpy(yv_all[sl]).to(device)
+                m = int(yb.shape[0])
+                tot += float(loss_fn(model(xb).squeeze(1), yb).item()) * m
+                seen += m
+                del xb, yb
+            val_loss = tot / max(seen, 1)
         history["train_loss"].append(float(np.mean(losses)))
         history["val_loss"].append(val_loss)
         if verbose:
@@ -537,9 +602,16 @@ def train_on_X(X, y, val_fraction=0.10, batch_size=256, max_epochs=100, patience
     # the SMILES that produced it. A caller that featurized with a non-default fp_type must
     # override it (train_regressor does). Recorded so predict_scores cannot silently re-featurize
     # a checkpoint with a different fingerprint, which inverts the ranking with no error.
-    meta = {"input_dim": X.shape[1], "y_mean": y_mean, "y_std": y_std,
+    # BOTH width fields are n_bits, NOT X.shape[1]. X is now kept PACKED, so its second axis is the
+    # packed byte width (n_bits / 8) rather than the model's input width. Neither is cosmetic:
+    # predict_on_X and load_regressor read input_dim to size chunks and to size the first Linear,
+    # and afvs_al_select re-featurizes at fp_nbits on its fp_cache=None paths, so a packed width in
+    # either field is wrong by a factor of 8. The trained model is unaffected (it is built from
+    # n_bits and comes out bit-identical), which is what makes this a defect a weights comparison
+    # alone passes.
+    meta = {"input_dim": n_bits, "y_mean": y_mean, "y_std": y_std,
             "best_epoch": best_epoch, "best_val_loss": best_val,
-            "fp_radius": 2, "fp_nbits": X.shape[1],
+            "fp_radius": 2, "fp_nbits": n_bits,
             "fp_type": DEFAULT_FP_TYPE}
     return model, meta
 
