@@ -336,23 +336,26 @@ then re-run afvs_prepare_folders.py --skip_errors (Not recommended!)
 '''
         )
         exit(1)
-    # Local mode keeps its runner lock and attempt markers in the workflow
+    # Local mode keeps its attempt markers in the workflow
     # directory: never wipe it under a live runner, and stop what a killed
     # runner left running first (its markers are how it is found)
-    if(config.get('batchsystem') == "local"):
+    # (whatever the new all.ctrl says: the existing workflow may be local)
+    if(config.get('batchsystem') == "local" or (workflow_dir / "local").is_dir()):
         import afvs_run_local
 
         lock_file = afvs_run_local.acquire_runner_lock()
         if(lock_file is None):
             print("afvs_run_local.py is running this workflow; stop it before --overwrite")
             exit(1)
+        # Held through the delete, so no runner can start in between
         with lock_file:
             if(not afvs_run_local.kill_orphans()):
                 print("An earlier attempt is still running; not overwriting the workflow")
                 exit(1)
-
-    # Delete anything that is currently there...
-    shutil.rmtree(workflow_dir)
+            shutil.rmtree(workflow_dir)
+    else:
+        # Delete anything that is currently there...
+        shutil.rmtree(workflow_dir)
     workflow_dir.mkdir(parents=True, exist_ok=True)
 
     # Update a few fields so they do not need to be computed later

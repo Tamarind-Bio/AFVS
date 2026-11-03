@@ -134,7 +134,7 @@ Per-attempt state goes under `../workflow/local/`, which prepare resets:
 
 ## Runner ownership
 
-`afvs_run_local.py` holds an flock on `../workflow/local/runner.lock` while it
+`afvs_run_local.py` holds an flock on `../.afvs_local_runner.lock` (beside `../workflow`, which prepare deletes) while it
 runs, and "a runner is alive" means that lock is held. The kernel releases the
 lock however the runner dies, so a reused pid can never fake a live runner.
 

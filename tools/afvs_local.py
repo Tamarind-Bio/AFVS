@@ -26,7 +26,7 @@
 # <local_job_root>/<job_name>/.status/<wu>/<sj>.done exists; it is written only
 # after that subjob's outputs are complete, and a rerun skips subjobs that have it.
 #
-# Per-attempt bookkeeping (running / failed markers, logs, the runner lock)
+# Per-attempt bookkeeping (running / failed markers, logs)
 # lives under ../workflow/local/, which afvs_prepare_folders.py resets for
 # every wave.
 #
@@ -46,8 +46,11 @@ from pathlib import Path
 
 WORKFLOW_DIR = Path("..") / "workflow"
 LOCAL_STATE_DIR = WORKFLOW_DIR / "local"
-# Held (flock LOCK_EX) by afvs_run_local.py for as long as it owns the workflow
-RUNNER_LOCK = LOCAL_STATE_DIR / "runner.lock"
+# Held (flock LOCK_EX) by afvs_run_local.py for as long as it owns the
+# workflow. It sits beside ../workflow, not in it: prepare --overwrite deletes
+# that directory while holding the lock, and a lock file deleted with it would
+# let a second runner lock a fresh file at the same path.
+RUNNER_LOCK = Path("..") / ".afvs_local_runner.lock"
 # Written when a runner starts, so status can tell "not run yet" from "a run
 # ended without reaching this subjob"
 RUN_STARTED = LOCAL_STATE_DIR / "started"
@@ -149,8 +152,11 @@ def outputs_complete(config, workunit_id, subjob_id):
 
 
 def _file_hash(path):
+    digest = hashlib.sha256()
     with open(path, "rb") as read_file:
-        return hashlib.file_digest(read_file, "sha256").hexdigest()
+        for chunk in iter(lambda: read_file.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def inputs_digest(config):
@@ -158,13 +164,27 @@ def inputs_digest(config):
     every file under it (each scenario's config.txt, the receptor, grids,
     rDock .prm files and whatever those refer to), byte for byte. Hidden
     files are left out, so a stray .DS_Store in a restaged tree does not
-    invalidate every .done."""
+    invalidate every .done (a config that names a hidden file is therefore
+    not covered). Symlinked directories are followed, as the copy of this
+    folder into each workunit follows them."""
     base = Path(config['docking_scenario_basefolder'])
     files = {}
-    for path in sorted(base.rglob("*")):
-        relative = path.relative_to(base)
-        if path.is_file() and not any(part.startswith(".") for part in relative.parts):
-            files[relative.as_posix()] = _file_hash(path)
+    for directory, dirnames, filenames in os.walk(base, followlinks=True):
+        dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
+        for filename in sorted(filenames):
+            path = Path(directory) / filename
+            if not filename.startswith(".") and path.is_file():
+                files[path.relative_to(base).as_posix()] = _file_hash(path)
+
+    # Absolute files a scenario config names (e.g. receptor = /app/inputs/r.pdb)
+    for scenario_key in config['docking_scenario_names']:
+        config_path = base / scenario_key / "config.txt"
+        if not config_path.is_file():
+            continue
+        for line in config_path.read_text().splitlines():
+            for token in line.split('#')[0].replace("=", " ").split():
+                if os.path.isabs(token) and os.path.isfile(token):
+                    files[token] = _file_hash(Path(token))
     return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
 
 

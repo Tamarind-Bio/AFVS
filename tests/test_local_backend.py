@@ -406,6 +406,10 @@ def test_resume_across_a_fresh_prepare(screen):
     ("collection_restaged", "1 subjobs to run, 1 already done"),
     # A hidden stray file in a restaged tree does not count
     ("stray_file", "0 subjobs to run, 2 already done"),
+    # A file under a symlinked directory counts (the workunit copy follows links)
+    ("symlinked_dir", "2 subjobs to run, 0 already done"),
+    # So does an absolute receptor outside the folder (e.g. under /app/inputs)
+    ("absolute_receptor", "2 subjobs to run, 0 already done"),
 ])
 def test_done_markers_follow_the_work_they_describe(screen, change, expect):
     screen.prepare()
@@ -433,6 +437,21 @@ def test_done_markers_follow_the_work_they_describe(screen, change, expect):
         box.write_text(box.read_text() + "bindingsite_radius 9\n")
     elif change == "scenario_file":
         (inputs / "qvina02" / "grid.prm").write_text("RECEPTOR_FILE receptor.mol2\n")
+    elif change == "symlinked_dir":
+        outside = screen.base / "grids"
+        outside.mkdir()
+        (outside / "grid.map").write_text("A")
+        (inputs / "qvina02" / "grids").symlink_to(outside)
+        screen.prepare()
+        screen.run("afvs_run_local.py")
+        (outside / "grid.map").write_text("B")
+    elif change == "absolute_receptor":
+        outside = screen.base / "receptor.pdb"
+        outside.write_text((inputs / "receptors" / "receptor.pdb").read_text())
+        box.write_text(box.read_text().replace("../input-files/receptors/receptor.pdb", str(outside)))
+        screen.prepare()
+        screen.run("afvs_run_local.py")
+        outside.write_text("".join(outside.read_text().splitlines(keepends=True)[:-1]))
     elif change == "duplicate_order":
         box.write_text(box.read_text() + "exhaustiveness = 1\nexhaustiveness = 2\n")
         screen.prepare()
@@ -486,7 +505,7 @@ def test_running_means_the_runner_lock_is_held(screen):
 
     assert status(screen)['failed'] == "1"
 
-    lock_path = screen.tree / "workflow" / "local" / "runner.lock"
+    lock_path = screen.tree / ".afvs_local_runner.lock"
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         parsed = status(screen)
@@ -549,7 +568,7 @@ def test_kill_orphans_spares_a_reused_pid(tmp_path, monkeypatch):
 
 def test_a_second_runner_is_refused(screen):
     screen.prepare()
-    lock_path = screen.tree / "workflow" / "local" / "runner.lock"
+    lock_path = screen.tree / ".afvs_local_runner.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
