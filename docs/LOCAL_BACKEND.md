@@ -52,6 +52,12 @@ filesystem.
 ./afvs_recover_failed_subjobs.py     # reruns failed subjobs here; --queue is ignored
 ```
 
+`afvs_recover_failed_subjobs.py` reruns every subjob that is not done. While
+a runner is still alive it waits for that runner to finish first, because a
+running runner never retries the subjobs that already failed in it.
+`afvs_prepare_folders.py --overwrite` refuses to wipe a workflow a live runner
+owns.
+
 `afvs_run_local.py` exits 0 when every subjob it ran succeeded and 1 when any
 failed. If it gets SIGTERM or SIGINT, it stops its subjobs and exits 128+signal.
 Only one runner can own a workflow at a time. `afvs_submit_jobs.py` has nothing
@@ -96,10 +102,14 @@ the subjob runs again, when:
     match
   - the docking scenarios
   - the all.ctrl settings that change what is docked or written
-  - each scenario's `config.txt` settings (normalised) and the files they name,
-    such as the receptor, so a run under the same `job_name` with another box
-    or receptor does not match. Prepare fails if a path in `config.txt` does
-    not resolve. Other files in the folder are ignored.
+  - every non-hidden file under `docking_scenario_basefolder`, byte for byte:
+    each scenario's `config.txt`, the receptor, grids, rDock `.prm` files and
+    whatever those refer to. So a run under the same `job_name` with another
+    box or receptor does not match. Hidden files (a stray `.DS_Store`) don't
+    count.
+  - the size of each staged collection tarball. This is a cheap guard
+    against a restage that changed a collection under the same key; hashing
+    the contents would mean reading the whole library on every prepare.
 - any output recorded in the marker is missing or has changed size, or any
   output the subjob should have is missing:
   - the summary
@@ -133,7 +143,10 @@ Each subjob runs in its own session:
 - When a subjob ends, its whole process group is killed, so worker processes
   cannot outlive an `afvs_run.py` that was OOM-killed.
 - A runner that starts after another was killed outright first kills any
-  attempt that runner left running, and only then reruns that subjob.
+  attempt that runner left running, and only then reruns that subjob. If an
+  attempt won't exit, the new runner refuses to start (exit 2).
+  `prepare --overwrite` stops such leftover attempts too, before it deletes
+  the markers that find them.
 
 ## Status
 

@@ -3,6 +3,7 @@ machine with no AWS Batch and no S3 (batchsystem=local)."""
 
 import fcntl
 import gzip
+import io
 import json
 import os
 import signal
@@ -15,7 +16,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from conftest import COLLECTIONS, TOOLS, ligand_names, local_data_key
+from conftest import COLLECTIONS, FIXTURES, TOOLS, ligand_names, local_data_key
 
 ALL_LIGANDS = sorted(name for key in COLLECTIONS for name in ligand_names(key))
 
@@ -133,36 +134,6 @@ def test_prepare_rejects_mixed_local_configs(screen, old, new, message):
     ret = screen.run("afvs_prepare_folders.py", "--overwrite", check=False)
     assert ret.returncode == 1
     assert message in ret.stdout
-
-
-@pytest.mark.parametrize("edit, error", [
-    # The fingerprint must cover the receptor; one it cannot find fails prepare
-    (lambda text: text.replace("receptors/receptor.pdb", "receptors/missing.pdb"),
-     "receptor = ../input-files/receptors/missing.pdb does not name a file"),
-    # Absolute tool locations (dock6_path, chimera_path, ...) are image paths, not inputs
-    (lambda text: text + "dock6_path = /opt/dock6\nchimera_path = /usr/bin\n", None),
-    # Relative to the folder itself, the way docking resolves it
-    (lambda text: text.replace("../input-files/receptors/receptor.pdb", "receptors/receptor.pdb"), None),
-    # An absolute receptor (e.g. under /app/inputs) is hashed where it is
-    ("absolute", None),
-    # PLANTS-style "key value" lines prepare fine (their files are hashed)
-    (lambda text: text + "protein_file ../input-files/receptors/receptor.pdb\nbindingsite_radius 9\n", None),
-    (lambda text: text.replace("../input-files/receptors/receptor.pdb", "/nonexistent/receptor.pdb"),
-     "receptor = /nonexistent/receptor.pdb does not name a file"),
-])
-def test_scenario_paths_at_prepare(screen, edit, error):
-    box = screen.tree / "input-files" / "qvina02" / "config.txt"
-    if edit == "absolute":
-        receptor = screen.tree / "input-files" / "receptors" / "receptor.pdb"
-        box.write_text(box.read_text().replace("../input-files/receptors/receptor.pdb", str(receptor)))
-    else:
-        box.write_text(edit(box.read_text()))
-    screen.run("afvs_prepare_folders.py", "--overwrite")
-    ret = screen.run("afvs_prepare_workunits.py", check=False)
-    if error:
-        assert ret.returncode != 0 and error in ret.stderr
-    else:
-        assert ret.returncode == 0 and "Generated 2 workunits" in ret.stdout
 
 
 def test_submit_jobs_points_local_mode_at_the_runner(screen):
@@ -356,6 +327,26 @@ def test_resume_after_sigkill_of_runner(screen):
     assert status(screen)['total_succeeded'] == "6"
 
 
+def test_prepare_overwrite_stops_a_killed_runners_attempts(screen):
+    """Re-preparing (the next wave) after a runner was killed outright must
+    stop its leftover attempt first: the overwrite deletes the markers that
+    are the only way to find it."""
+    screen.prepare()
+    gate, gate_env = screen.gate(COLLECTIONS[0])
+    runner = screen.popen("afvs_run_local.py", **gate_env)
+    running_marker = screen.tree / "workflow" / "local" / "1" / "0.running"
+    wait_for(running_marker.exists)
+    orphan_pgid = json.loads(running_marker.read_text())['pid']
+    runner.kill()
+    runner.wait(timeout=30)
+    assert not process_group_gone(orphan_pgid, timeout=0)
+
+    out = screen.run("afvs_prepare_folders.py", "--overwrite").stdout
+    assert "Stopped what was left of an earlier attempt at 1:0" in out
+    assert process_group_gone(orphan_pgid, timeout=0)
+    gate.unlink()
+
+
 def test_recover_after_a_stopped_run_also_runs_what_never_started(make_screen):
     screen = make_screen(array_size=1, collections=COLLECTIONS)
     screen.prepare()
@@ -406,11 +397,14 @@ def test_resume_across_a_fresh_prepare(screen):
     ("box", "2 subjobs to run, 0 already done"),
     ("receptor", "2 subjobs to run, 0 already done"),
     ("setting", "2 subjobs to run, 0 already done"),
-    # A PLANTS-style config line, and a file in the scenario folder that a config refers to
+    # Anything else under the scenario folder: a PLANTS-style line, a file a
+    # config refers to, the order of duplicate settings (the last one wins)
     ("plants_line", "2 subjobs to run, 0 already done"),
     ("scenario_file", "2 subjobs to run, 0 already done"),
-    # A restaged tree that differs only in ways docking ignores still resumes
-    ("config_formatting", "0 subjobs to run, 2 already done"),
+    ("duplicate_order", "2 subjobs to run, 0 already done"),
+    # A collection restaged with other contents under the same key
+    ("collection_restaged", "1 subjobs to run, 1 already done"),
+    # A hidden stray file in a restaged tree does not count
     ("stray_file", "0 subjobs to run, 2 already done"),
 ])
 def test_done_markers_follow_the_work_they_describe(screen, change, expect):
@@ -439,9 +433,20 @@ def test_done_markers_follow_the_work_they_describe(screen, change, expect):
         box.write_text(box.read_text() + "bindingsite_radius 9\n")
     elif change == "scenario_file":
         (inputs / "qvina02" / "grid.prm").write_text("RECEPTOR_FILE receptor.mol2\n")
-    elif change == "config_formatting":
-        box.write_text("# restaged\n" + "".join(f"{line.replace(' = ', '=')}   # x\n"
-                                                for line in reversed(box.read_text().splitlines())))
+    elif change == "duplicate_order":
+        box.write_text(box.read_text() + "exhaustiveness = 1\nexhaustiveness = 2\n")
+        screen.prepare()
+        screen.run("afvs_run_local.py")
+        box.write_text(box.read_text().replace("exhaustiveness = 1\nexhaustiveness = 2\n",
+                                               "exhaustiveness = 2\nexhaustiveness = 1\n"))
+    elif change == "collection_restaged":
+        tarball = screen.data_root / local_data_key(COLLECTIONS[1])
+        with tarfile.open(tarball, "w:gz") as tar:
+            for ligand_file in sorted((FIXTURES / "ligands" / COLLECTIONS[1]).glob("*.pdbqt")):
+                info = tar.gettarinfo(ligand_file, arcname=f"00002/{ligand_file.name}")
+                data = ligand_file.read_bytes() + b"REMARK regenerated\n"
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
     else:
         (inputs / ".DS_Store").write_text("junk")
     screen.prepare()
@@ -549,9 +554,13 @@ def test_a_second_runner_is_refused(screen):
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         ret = screen.run("afvs_run_local.py", check=False)
+        # ...and the workflow is not wiped from under it
+        overwrite = screen.run("afvs_prepare_folders.py", "--overwrite", check=False)
     assert ret.returncode == 2
     assert "already running" in ret.stdout
     assert screen.done_markers() == []
+    assert overwrite.returncode == 1 and "stop it before --overwrite" in overwrite.stdout
+    assert (screen.tree / "workflow" / "status.json").exists()
 
 
 # --- failure + recovery ---------------------------------------------------

@@ -41,8 +41,6 @@ import gzip
 import hashlib
 import json
 import os
-import posixpath
-import re
 from pathlib import Path
 
 
@@ -151,78 +149,36 @@ def outputs_complete(config, workunit_id, subjob_id):
 
 
 def _file_hash(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _resolve_scenario_value(base, value):
-    return Path(value) if os.path.isabs(value) else scenario_input_path(base, value)
+    with open(path, "rb") as read_file:
+        return hashlib.file_digest(read_file, "sha256").hexdigest()
 
 
 def inputs_digest(config):
-    """Hash of what each scenario docks against:
-
-    - its config.txt, normalised (comments, blank lines, spacing and line
-      order do not count). Both "key = value" and PLANTS-style "key value"
-      lines are covered.
-    - every file a config.txt token names (the receptor, a PLANTS
-      protein_file, a reference ligand, ...)
-    - the files in the scenario's own folder (grids, rDock .prm files and
-      other inputs those configs refer to)
-
-    Other files under docking_scenario_basefolder are left out, so a stray
-    file in a restaged tree does not invalidate every .done."""
+    """Hash of everything docking reads from docking_scenario_basefolder:
+    every file under it (each scenario's config.txt, the receptor, grids,
+    rDock .prm files and whatever those refer to), byte for byte. Hidden
+    files are left out, so a stray .DS_Store in a restaged tree does not
+    invalidate every .done."""
     base = Path(config['docking_scenario_basefolder'])
-    scenarios = {}
-    for scenario_key in config['docking_scenario_names']:
-        scenario_dir = base / scenario_key
-        config_path = scenario_dir / "config.txt"
-        lines = []
-        files = {}
-        if config_path.is_file():
-            for line in config_path.read_text().splitlines():
-                line = " ".join(line.split('#')[0].split())
-                if not line:
-                    continue
-                lines.append(re.sub(r'\s*=\s*', '=', line))
-
-                key, sep, value = line.partition("=")
-                key, value = key.strip(), value.strip()
-                tokens = [value] if sep else line.split()[1:]
-                for token in tokens:
-                    path = _resolve_scenario_value(base, token)
-                    if path is not None and path.is_file():
-                        files[token] = _file_hash(path)
-                    elif sep and (key == 'receptor' or (not os.path.isabs(token) and "/" in token
-                                                        and not (path is not None and path.is_dir()))):
-                        # A setting that names a file must resolve, or the
-                        # fingerprint would silently stop covering it (a
-                        # swapped receptor would then reuse old results).
-                        # Absolute values that are not files (tool installs
-                        # such as dock6_path) count as settings only.
-                        raise ValueError(f"{config_path}: {key} = {token} does not name a file under {base}")
-
-        if scenario_dir.is_dir():
-            for path in sorted(scenario_dir.rglob("*")):
-                relative = path.relative_to(scenario_dir)
-                if path.is_file() and path != config_path and not any(part.startswith(".") for part in relative.parts):
-                    files[f"{scenario_key}/{relative.as_posix()}"] = _file_hash(path)
-
-        scenarios[scenario_key] = {'config': sorted(lines), 'files': files}
-
-    return hashlib.sha256(json.dumps(scenarios, sort_keys=True).encode()).hexdigest()
+    files = {}
+    for path in sorted(base.rglob("*")):
+        relative = path.relative_to(base)
+        if path.is_file() and not any(part.startswith(".") for part in relative.parts):
+            files[relative.as_posix()] = _file_hash(path)
+    return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
 
 
-def scenario_input_path(base, value):
-    """Where a relative config.txt path lands inside docking_scenario_basefolder
-    as docking sees it (cwd = a copy of the folder named input-files), or None
-    if it points outside the folder or is absolute."""
-    if not value or os.path.isabs(value):
-        return None
-    run_dir = "/run/input-files"
-    resolved = posixpath.normpath(posixpath.join(run_dir, value))
-    if resolved == run_dir or not resolved.startswith(run_dir + "/"):
-        return None
-    return base / resolved[len(run_dir) + 1:]
+def collection_sizes(subjob):
+    """Byte size of each staged collection tarball (None if missing). A cheap
+    guard against a restage that changed a collection under the same key;
+    hashing contents would read the whole library on every prepare."""
+    sizes = {}
+    for collection_key, collection in subjob['collections'].items():
+        try:
+            sizes[collection_key] = os.path.getsize(collection['local_data_path'])
+        except (KeyError, OSError):
+            sizes[collection_key] = None
+    return sizes
 
 
 def subjob_fingerprint(config, subjob, docking_inputs):
@@ -238,6 +194,7 @@ def subjob_fingerprint(config, subjob, docking_inputs):
 
     blob = json.dumps({
         'collections': collections,
+        'collection_sizes': collection_sizes(subjob),
         'config': {key: config.get(key) for key in _FINGERPRINT_CONFIG_KEYS},
         'docking_inputs': docking_inputs,
     }, sort_keys=True)
