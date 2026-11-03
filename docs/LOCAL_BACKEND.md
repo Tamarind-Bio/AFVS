@@ -73,9 +73,22 @@ exited 0 and its outputs are in place. It is JSON and records:
 A rerun skips every subjob that has a valid marker. A marker is ignored, and
 the subjob runs again, when:
 
-- the fingerprint differs. A later active-learning wave reuses the same
-  workunit and subjob ids for different ligands.
-- the subjob's `summary/<wu>/<sj>.json.gz` is missing.
+- the fingerprint differs. The fingerprint covers:
+  - the subjob's collections and counts, so a later active-learning wave that
+    reuses the same workunit and subjob ids for different ligands does not
+    match
+  - the docking scenarios
+  - the contents of `docking_scenario_basefolder` (receptor, box), so a run
+    under the same `job_name` with another box or receptor does not match
+- any output the subjob should have is missing:
+  - the summary
+  - the log archive of each scenario, when anything was docked
+  - the parquet/csv score tables, when a docking succeeded
+
+  This covers a restore that stopped part way.
+
+A missing collection tarball is recorded as a failed download, and the subjob
+still completes, as on S3.
 
 To resume on a fresh machine:
 
@@ -87,6 +100,19 @@ Per-attempt state goes under `../workflow/local/`, which prepare resets:
 
 - running and failed markers
 - each subjob's `afvs_run.py` output (`<wu>/<sj>.out`)
+
+## Runner ownership
+
+`afvs_run_local.py` holds an flock on `../workflow/local/runner.lock` while it
+runs, and "a runner is alive" means that lock is held. The kernel releases the
+lock however the runner dies, so a reused pid can never fake a live runner.
+
+Each subjob runs in its own session:
+
+- When a subjob ends, its whole process group is killed, so worker processes
+  cannot outlive an `afvs_run.py` that was OOM-killed.
+- A runner that starts after another was killed outright first kills any
+  attempt that runner left running, and only then reruns that subjob.
 
 ## Status
 
@@ -114,8 +140,14 @@ resume.
 
 It does not include boto3. It runs as UID 1000.
 
+The image is laid out for the T2 sealed pod:
+
+- AFVS is installed at `/opt/AFVS`, exported as `AFVS_HOME`.
+- There is no ENTRYPOINT. The pod runs `bash run.sh` in `/app`, and `run.sh` calls `$AFVS_HOME/tools/*`.
+- Inputs are in `/app/inputs` and outputs go to `/app/out`.
+
 ```bash
-cd tools && docker build --platform linux/amd64 -t afvs-local -f docker/Dockerfile.local .
+docker build --platform linux/amd64 -t afvs-local -f tools/docker/Dockerfile.local .
 ```
 
 ## Tests
@@ -133,7 +165,7 @@ engine, plus one run with the real `qvina02`):
 implemented on macOS. Run the tests in the image:
 
 ```bash
-docker build --platform linux/amd64 -t afvs-local -f tools/docker/Dockerfile.local tools
+docker build --platform linux/amd64 -t afvs-local -f tools/docker/Dockerfile.local .
 printf 'FROM afvs-local\nUSER root\nRUN pip install pytest\nUSER 1000\n' | docker build --platform linux/amd64 -t afvs-local-test -
 docker run --rm --platform linux/amd64 --network none -v "$PWD":/src:ro -w /src/tests \
   afvs-local-test python -m pytest -p no:cacheprovider -q

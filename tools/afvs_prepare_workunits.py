@@ -161,7 +161,7 @@ def publish_workunit(ctx, index, workunit_subjobs):
 
         subjobs = compress_subjobs(ctx, workunit_subjobs)
         for subjob_id, subjob in workunit_subjobs.items():
-            subjobs[subjob_id]['fingerprint'] = afvs_local.subjob_fingerprint(ctx['config'], subjob)
+            subjobs[subjob_id]['fingerprint'] = afvs_local.subjob_fingerprint(ctx['config'], subjob, ctx['docking_inputs'])
 
         return {'subjobs': subjobs, 'download_path': local_workunit_path.as_posix()}
 
@@ -454,7 +454,9 @@ def main():
     ctx['config'] = parse_config("../workflow/config.json")
 
     # Local mode never touches S3 (and must not import boto3)
-    if(not afvs_local.is_local(ctx['config'])):
+    if(afvs_local.is_local(ctx['config'])):
+        ctx['docking_inputs'] = afvs_local.inputs_digest(ctx['config'])
+    else:
         import boto3
         from botocore.config import Config
 

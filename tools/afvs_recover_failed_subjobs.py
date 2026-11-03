@@ -314,8 +314,8 @@ def submit_recovery_job(ctx, recovery_workunit, recovery_id, queue_name=None):
 
 
 def recover_local(args, config):
-    """batchsystem=local: rerun the failed subjobs in place, on this machine.
-    --queue has no meaning here and is ignored."""
+    """batchsystem=local: rerun the failed subjobs (and any never started) in
+    place, on this machine. --queue has no meaning here and is ignored."""
     import afvs_run_local
 
     with open(args.status_file, "r") as read_file:
@@ -323,19 +323,18 @@ def recover_local(args, config):
 
     print("Analyzing local subjob markers for failed subjobs...")
 
-    alive = afvs_local.runner_alive()
     failed_subjobs = []
     for workunit_id, workunit in workunits.items():
         for subjob_id, subjob in workunit['subjobs'].items():
-            state, _ = afvs_local.subjob_state(config, workunit_id, subjob_id, subjob, alive=alive)
-            if state == afvs_local.FAILED:
+            state, _ = afvs_local.subjob_state(config, workunit_id, subjob_id, subjob)
+            if state in (afvs_local.FAILED, afvs_local.PENDING):
                 failed_subjobs.append((workunit_id, subjob_id, subjob))
 
     if not failed_subjobs:
         print("No failed subjobs found!")
         return 0
 
-    print(f"\nFound {len(failed_subjobs)} failed subjobs:")
+    print(f"\nFound {len(failed_subjobs)} failed or not yet run subjobs:")
     print(f"{'Workunit ID':<15} {'Subjob ID':<12} {'Expected Ligands':<20}")
     print("-" * 80)
 
@@ -351,9 +350,12 @@ def recover_local(args, config):
         print("\n[Report-only mode: No resubmission performed]")
         return 0
 
+    # Everything not done, not only the failed: a runner that was stopped part
+    # way leaves never-started subjobs PENDING, and the wrapper only waits for
+    # the screen to finish after this
     workers = int(config.get('local_workers') or 1)
-    print(f"\nRerunning failed subjobs locally ({workers} at a time)...")
-    return afvs_run_local.run(config, workers, select={afvs_local.FAILED})
+    print(f"\nRerunning failed subjobs locally, with any not yet run ({workers} at a time)...")
+    return afvs_run_local.run(config, workers)
 
 
 def main():

@@ -22,9 +22,14 @@
 # and python with pandas/pyarrow plus torch/rdkit for active learning.
 #
 # It has no AWS SDK on purpose: the local paths never need it, and leaving it
-# out keeps them from reaching for S3. Build from tools/:
+# out keeps them from reaching for S3.
 #
-#   docker build --platform linux/amd64 -t afvs-local -f docker/Dockerfile.local .
+# This is the T2 sealed-pod tool image: AFVS lives at $AFVS_HOME (/opt/AFVS),
+# there is no ENTRYPOINT (the pod runs `bash run.sh` in /app, and run.sh calls
+# $AFVS_HOME/tools/*), inputs are in /app/inputs and outputs go to /app/out.
+# Build from the repository root:
+#
+#   docker build --platform linux/amd64 -t afvs-local -f tools/docker/Dockerfile.local .
 #
 # The bundled docking binaries in bin/ are x86-64, so the image is amd64.
 #
@@ -49,25 +54,28 @@ RUN pip install --no-cache-dir \
         rdkit==2024.9.6 \
     && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
 
+ENV AFVS_HOME=/opt/AFVS
+ENV AFVS_TOOLS_PATH=/opt/AFVS/tools/bin
+
 # The AFVS tools (scripts, templates, docking binaries, vendored molpal)
-COPY . /opt/vf/tools
-RUN chmod +x /opt/vf/tools/*.py /opt/vf/tools/templates/*.py /opt/vf/tools/bin/* \
-    && rm -rf /opt/vf/tools/docker
+COPY tools /opt/AFVS/tools
+RUN chmod +x /opt/AFVS/tools/*.py /opt/AFVS/tools/templates/*.py /opt/AFVS/tools/bin/* \
+    && rm -rf /opt/AFVS/tools/docker
 
-ENV AFVS_TOOLS_PATH=/opt/vf/tools/bin
-
-# Fail the build if the local paths or the active-learning stack cannot import
-RUN cd /opt/vf/tools \
+# Fail the build if what run.sh relies on is missing, or if the local paths or
+# the active-learning stack cannot import
+RUN command -v bash stdbuf tee python3 \
+    && cd /opt/AFVS/tools \
     && python -c "import afvs_local, afvs_run_local, pandas, pyarrow, torch, rdkit" \
     && python afvs_al_controller.py --help > /dev/null \
     && ! python -c "import boto3" 2> /dev/null
 
 # Matches the sealed pod's unprivileged tool container. The tools write their
-# workflow state beside themselves (templates/all.ctrl, ../workflow), so the
-# tree belongs to that user.
+# workflow state beside themselves (templates/all.ctrl, ../workflow,
+# ../input-files), so the tree belongs to that user.
 RUN useradd --uid 1000 --create-home afvs \
-    && mkdir -p /opt/vf/workflow /opt/vf/input-files \
-    && chown -R 1000:1000 /opt/vf
+    && mkdir -p /opt/AFVS/workflow /opt/AFVS/input-files /app/inputs /app/out \
+    && chown -R 1000:1000 /opt/AFVS /app
 USER 1000
 
-WORKDIR /opt/vf/tools
+WORKDIR /app

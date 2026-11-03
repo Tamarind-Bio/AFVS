@@ -26,25 +26,27 @@
 # <local_job_root>/<job_name>/.status/<wu>/<sj>.done exists; it is written only
 # after that subjob's outputs are complete, and a rerun skips subjobs that have it.
 #
-# Per-attempt bookkeeping (running / failed markers, logs) lives under
-# ../workflow/local/, which afvs_prepare_folders.py resets for every wave.
+# Per-attempt bookkeeping (running / failed markers, logs, the runner lock)
+# lives under ../workflow/local/, which afvs_prepare_folders.py resets for
+# every wave.
 #
 # Nothing in this module (or anything a local-mode path imports) uses boto3 or
 # the network.
 #
 # ---------------------------------------------------------------------------
 
+import errno
+import fcntl
 import gzip
 import hashlib
 import json
 import os
-import socket
 from pathlib import Path
 
 
 WORKFLOW_DIR = Path("..") / "workflow"
 LOCAL_STATE_DIR = WORKFLOW_DIR / "local"
-RUNNER_INFO = LOCAL_STATE_DIR / "runner.json"
+# Held (flock LOCK_EX) by afvs_run_local.py for as long as it owns the workflow
 RUNNER_LOCK = LOCAL_STATE_DIR / "runner.lock"
 
 # Subjob states, named after the AWS Batch states afvs_get_status.py reports
@@ -78,20 +80,65 @@ def summary_path(config, workunit_id, subjob_id):
     return job_root(config) / "summary" / str(workunit_id) / f"{subjob_id}.json.gz"
 
 
+def scenario_output_path(config, scenario_key, content_type, workunit_id, subjob_id):
+    extension = {'parquet': "parquet", 'csv': "csv.gz", 'logs': "tar.gz"}[content_type]
+    return job_root(config) / scenario_key / content_type / str(workunit_id) / f"{subjob_id}.{extension}"
+
+
 def subjob_output_paths(config, workunit_id, subjob_id):
-    """Every file afvs_run.py can write for one subjob (see generate_output_path)."""
-    root = job_root(config)
+    """Every file afvs_run.py can write for one subjob (see generate_output_path),
+    including the .partial name each is written under before it is renamed."""
     paths = [summary_path(config, workunit_id, subjob_id)]
     for scenario_key in config['docking_scenario_names']:
-        paths.append(root / scenario_key / "parquet" / str(workunit_id) / f"{subjob_id}.parquet")
-        paths.append(root / scenario_key / "csv" / str(workunit_id) / f"{subjob_id}.csv.gz")
-        paths.append(root / scenario_key / "logs" / str(workunit_id) / f"{subjob_id}.tar.gz")
-    return paths
+        for content_type in ('parquet', 'csv', 'logs'):
+            paths.append(scenario_output_path(config, scenario_key, content_type, workunit_id, subjob_id))
+    return paths + [path.with_name(f"{path.name}.partial") for path in paths]
 
 
-def subjob_fingerprint(config, subjob):
+def outputs_complete(config, workunit_id, subjob_id):
+    """Whether every output afvs_run.py writes for this subjob is in place.
+
+    The summary is always written. Whenever anything was docked, each scenario
+    gets a log archive. The score tables (parquet / csv.gz, per summary_formats)
+    exist when a docking succeeded; with several scenarios afvs_run.py only
+    writes them up to the first scenario that had no success, so they are
+    required here for the single-scenario case only."""
+    summary = read_summary(config, workunit_id, subjob_id)
+    if summary is None:
+        return False
+
+    if summary.get('total_dockings', 0) > 0:
+        for scenario_key in config['docking_scenario_names']:
+            if not scenario_output_path(config, scenario_key, 'logs', workunit_id, subjob_id).is_file():
+                return False
+
+    if summary.get('dockings_status', {}).get('success', 0) > 0 and len(config['docking_scenario_names']) == 1:
+        scenario_key = config['docking_scenario_names'][0]
+        summary_formats = config.get('summary_formats') or []
+        for summary_format, content_type in (('parquet', 'parquet'), ('csv.gz', 'csv')):
+            if summary_format in summary_formats and \
+                    not scenario_output_path(config, scenario_key, content_type, workunit_id, subjob_id).is_file():
+                return False
+
+    return True
+
+
+def inputs_digest(config):
+    """Hash of the docking inputs every subjob carries (the receptor and each
+    scenario's config, i.e. docking_scenario_basefolder)."""
+    digest = hashlib.sha256()
+    base = Path(config['docking_scenario_basefolder'])
+    for path in sorted(p for p in base.rglob("*") if p.is_file()):
+        digest.update(path.relative_to(base).as_posix().encode() + b"\0")
+        digest.update(path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def subjob_fingerprint(config, subjob, docking_inputs):
     """Identifies what a subjob docks, so a .done left by an earlier wave that
-    reused the same workunit/subjob ids is not mistaken for this wave's."""
+    reused the same workunit/subjob ids (or an earlier run under the same
+    job_name with another receptor or box) is not mistaken for this one's.
+    `docking_inputs` is inputs_digest(config)."""
     collections = {}
     for collection_key, collection in subjob['collections'].items():
         collections[collection_key] = {
@@ -103,6 +150,7 @@ def subjob_fingerprint(config, subjob):
         'scenario_names': config['docking_scenario_names'],
         'scenario_methods': config['docking_scenario_methods'],
         'scenario_replicas': config['docking_scenario_replicas'],
+        'docking_inputs': docking_inputs,
     }, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()
 
@@ -143,31 +191,38 @@ def read_summary(config, workunit_id, subjob_id):
 
 def read_done_marker(config, workunit_id, subjob_id, fingerprint):
     """The subjob's .done contents if it is complete for THIS workunit layout,
-    otherwise None (missing, unreadable, another wave's, or its summary is gone)."""
+    otherwise None (missing, unreadable, another wave's, or any of its outputs
+    is gone, e.g. a restore that stopped part way)."""
     marker = read_json(done_marker_path(config, workunit_id, subjob_id))
     if not isinstance(marker, dict) or marker.get('fingerprint') != fingerprint:
         return None
-    if not summary_path(config, workunit_id, subjob_id).is_file():
+    if not outputs_complete(config, workunit_id, subjob_id):
         return None
     return marker
 
 
 def runner_alive():
-    """True when an afvs_run_local.py on this host still owns the workflow."""
-    info = read_json(RUNNER_INFO)
-    if not isinstance(info, dict) or info.get('host') != socket.gethostname():
-        return False
+    """True while an afvs_run_local.py holds the runner lock. The kernel drops
+    the lock when that process dies, however it dies."""
     try:
-        os.kill(int(info['pid']), 0)
-    except (KeyError, TypeError, ValueError, ProcessLookupError):
+        lock_file = open(RUNNER_LOCK, "r")
+    except FileNotFoundError:
         return False
-    except PermissionError:
-        return True
-    return True
+    with lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as err:
+            if err.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                return True
+            raise
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+    return False
 
 
 def subjob_state(config, workunit_id, subjob_id, subjob, alive=None):
-    """(state, marker) for one subjob.
+    """(state, marker) for one subjob. `alive` overrides the runner check;
+    leave it None so liveness is read AFTER the running marker (the runner
+    takes its lock before it writes any).
 
     SUCCEEDED  valid .done for this layout
     RUNNING    an attempt is in flight under a live runner

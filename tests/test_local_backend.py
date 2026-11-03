@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -59,6 +60,26 @@ def status(screen, *args):
     return wrapper_parse(screen.run("afvs_get_status.py", *args).stdout)
 
 
+def process_group_gone(pgid, timeout=30):
+    """No live (non-zombie) member left; unreaped zombies linger in a container."""
+    def alive():
+        for stat_path in Path("/proc").glob("[0-9]*/stat"):
+            try:
+                fields = stat_path.read_text().rsplit(")", 1)[1].split()
+            except (OSError, IndexError):
+                continue
+            if int(fields[2]) == pgid and fields[0] != "Z":
+                return True
+        return False
+
+    deadline = time.time() + timeout
+    while alive():
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
 def wait_for(predicate, timeout=120, interval=0.1):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -95,13 +116,20 @@ def test_prepare_writes_local_workunits(screen):
     assert config['local_data_root'] == str(screen.data_root)
 
 
-def test_prepare_rejects_local_batchsystem_without_local_storage(screen):
+@pytest.mark.parametrize("old, new, message", [
+    ("data_storage_mode=local", "data_storage_mode=s3",
+     "batchsystem 'local' requires job_storage_mode=local and data_storage_mode=local"),
+    # Local storage under AWS Batch stays rejected, as it was before local mode
+    ("batchsystem=local", "batchsystem=awsbatch",
+     "job_storage_mode=local and data_storage_mode=local need batchsystem=local"),
+])
+def test_prepare_rejects_mixed_local_configs(screen, old, new, message):
     ctrl = screen.tools / "templates" / "all.ctrl"
-    ctrl.write_text(ctrl.read_text().replace("data_storage_mode=local", "data_storage_mode=s3"))
+    ctrl.write_text(ctrl.read_text().replace(old, new))
 
     ret = screen.run("afvs_prepare_folders.py", "--overwrite", check=False)
     assert ret.returncode == 1
-    assert "batchsystem 'local' requires job_storage_mode=local and data_storage_mode=local" in ret.stdout
+    assert message in ret.stdout
 
 
 def test_submit_jobs_points_local_mode_at_the_runner(screen):
@@ -202,6 +230,8 @@ def test_missing_collection_is_a_failed_download(screen):
 
     screen.run("afvs_run_local.py")
 
+    # As on S3, a missing collection does not fail its subjob
+    assert screen.done_markers() == ["1/0.done", "2/0.done"]
     out = screen.run("afvs_get_status.py").stdout
     assert "* Failed Downloads: 1 (est. 3 dockings)" in out
     assert wrapper_parse(out)['total_succeeded'] == "3"
@@ -219,9 +249,11 @@ def test_resume_after_sigterm_skips_done_subjobs(screen):
     screen.prepare()
     first, second = screen.subjobs()
 
-    runner = screen.popen("afvs_run_local.py", FAKE_DOCK_SLEEP="0.5")
+    runner = screen.popen("afvs_run_local.py", FAKE_DOCK_SLEEP="1")
     wait_for(lambda: screen.done_markers() == ["1/0.done"])
-    wait_for((screen.tree / "workflow" / "local" / "2" / "0.running").exists)
+    running_marker = screen.tree / "workflow" / "local" / "2" / "0.running"
+    wait_for(running_marker.exists)
+    child_pgid = json.loads(running_marker.read_text())['pid']
 
     # Mid-run: the wrapper sees it as in progress
     parsed = status(screen)
@@ -232,6 +264,7 @@ def test_resume_after_sigterm_skips_done_subjobs(screen):
     runner.send_signal(signal.SIGTERM)
     assert runner.wait(timeout=60) == 128 + signal.SIGTERM
     assert screen.done_markers() == ["1/0.done"]
+    assert process_group_gone(child_pgid)
 
     # The interrupted subjob reads as failed until it is rerun
     parsed = status(screen)
@@ -253,25 +286,47 @@ def test_resume_after_sigterm_skips_done_subjobs(screen):
 
 
 def test_resume_after_sigkill_of_runner(screen):
-    """A pod death: the runner gets no chance to clean up."""
+    """The runner is killed outright (OOM): no cleanup runs, and its attempt
+    keeps going in its own session. The next runner must stop that attempt
+    before redoing the subjob."""
     screen.prepare()
-    runner = screen.popen("afvs_run_local.py", FAKE_DOCK_SLEEP="0.5")
+    runner = screen.popen("afvs_run_local.py", FAKE_DOCK_SLEEP="2")
     wait_for(lambda: screen.done_markers() == ["1/0.done"])
     running_marker = screen.tree / "workflow" / "local" / "2" / "0.running"
     wait_for(running_marker.exists)
 
-    child_pid = json.loads(running_marker.read_text())['pid']
+    orphan_pgid = json.loads(running_marker.read_text())['pid']
     runner.kill()
     runner.wait(timeout=30)
-    os.killpg(child_pid, signal.SIGKILL)
+    assert not process_group_gone(orphan_pgid, timeout=0)
 
     parsed = status(screen)
     assert parsed['failed'] == "1" and parsed['running'] == "0"
 
-    screen.run("afvs_run_local.py")
+    out = screen.run("afvs_run_local.py").stdout
+    assert "Stopped what was left of an earlier attempt at 2:0" in out
+    assert process_group_gone(orphan_pgid, timeout=0)
     assert screen.done_markers() == ["1/0.done", "2/0.done"]
     marker = json.loads((screen.job_dir / ".status" / "2" / "0.done").read_text())
     assert marker['attempts'] == 2
+    assert marker['vcpu_seconds_interrupted'] > 0
+    assert status(screen)['total_succeeded'] == "6"
+
+
+def test_recover_after_a_stopped_run_also_runs_what_never_started(make_screen):
+    screen = make_screen(array_size=1, collections=COLLECTIONS)
+    screen.prepare()
+    runner = screen.popen("afvs_run_local.py", FAKE_DOCK_SLEEP="1")
+    wait_for((screen.tree / "workflow" / "local" / "1" / "0.running").exists)
+    runner.send_signal(signal.SIGTERM)
+    assert runner.wait(timeout=60) == 128 + signal.SIGTERM
+
+    parsed = status(screen)
+    assert parsed['failed'] == "1" and parsed['pending'] == "1" and parsed['complete'] == "0"
+
+    screen.run("afvs_recover_failed_subjobs.py", "--queue", "vf-queue-ondemand")
+    recovery = status(screen, "--recovery")
+    assert recovery['complete'] == "1" and recovery['failed'] == "0"
     assert status(screen)['total_succeeded'] == "6"
 
 
@@ -291,30 +346,73 @@ def test_resume_across_a_fresh_prepare(screen):
     assert parsed['succeeded'] == "2" and parsed['total_succeeded'] == "6"
 
 
-def test_a_done_marker_from_a_different_wave_is_not_reused(screen):
-    """Active learning reruns the job under the same name with a new todo.all,
-    so workunit/subjob ids repeat with different contents."""
+@pytest.mark.parametrize("change, expect_rerun", [
+    # Active learning reruns the job under the same name with a new todo.all,
+    # so workunit/subjob ids repeat with different contents
+    ("todo", "1 subjobs to run, 1 already done"),
+    # The same job_name docked against another box (or receptor)
+    ("box", "2 subjobs to run, 0 already done"),
+])
+def test_a_done_marker_for_different_work_is_not_reused(screen, change, expect_rerun):
     screen.prepare()
     screen.run("afvs_run_local.py")
 
-    todo = screen.tools / "templates" / "todo.all"
-    todo.write_text(todo.read_text().replace(f"{COLLECTIONS[1]} 3", f"{COLLECTIONS[1]} 4"))
+    if change == "todo":
+        todo = screen.tools / "templates" / "todo.all"
+        todo.write_text(todo.read_text().replace(f"{COLLECTIONS[1]} 3", f"{COLLECTIONS[1]} 4"))
+    else:
+        box = screen.tree / "input-files" / "qvina02" / "config.txt"
+        box.write_text(box.read_text().replace("size_x = 18", "size_x = 20"))
     screen.prepare()
 
-    before = status(screen)
-    assert before['succeeded'] == "1" and before['pending'] == "1"
-
-    out = screen.run("afvs_run_local.py").stdout
-    assert "1 subjobs to run, 1 already done" in out
+    assert status(screen)['complete'] == "0"
+    assert expect_rerun in screen.run("afvs_run_local.py").stdout
 
 
-def test_a_done_marker_without_its_outputs_is_not_trusted(screen):
+@pytest.mark.parametrize("output", [
+    "summary/2/0.json.gz", "qvina02/parquet/2/0.parquet", "qvina02/csv/2/0.csv.gz", "qvina02/logs/2/0.tar.gz"])
+def test_a_done_marker_without_its_outputs_is_not_trusted(screen, output):
+    """E.g. a restore from S3 that stopped part way."""
     screen.prepare()
     screen.run("afvs_run_local.py")
-    (screen.job_dir / "summary" / "2" / "0.json.gz").unlink()
+    (screen.job_dir / output).unlink()
 
     assert status(screen)['pending'] == "1"
     assert "1 subjobs to run, 1 already done" in screen.run("afvs_run_local.py").stdout
+
+
+def test_running_means_the_runner_lock_is_held(screen):
+    """Liveness is the runner's flock, not a pid that a container can reuse."""
+    screen.prepare()
+    running_marker = screen.tree / "workflow" / "local" / "1" / "0.running"
+    running_marker.parent.mkdir(parents=True)
+    # A stale marker naming a live pid (this test's own) must not read as running
+    running_marker.write_text(json.dumps({'pid': os.getpid(), 'started': time.time(), 'attempts': 1}))
+
+    assert status(screen)['failed'] == "1"
+
+    lock_path = screen.tree / "workflow" / "local" / "runner.lock"
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        parsed = status(screen)
+    assert parsed['running'] == "1" and parsed['complete'] == "0"
+
+
+def test_liveness_is_read_after_the_running_marker(monkeypatch):
+    """A status poll racing a runner's start: the runner takes its lock before
+    writing any .running marker, so a marker read first and liveness read
+    second can never pair a fresh marker with a stale "no runner"."""
+    monkeypatch.syspath_prepend(str(TOOLS))
+    import afvs_local
+
+    events = []
+    monkeypatch.setattr(afvs_local, "read_done_marker", lambda *args: None)
+    monkeypatch.setattr(afvs_local, "read_json",
+                        lambda path: events.append(("read", path.suffix)) or ({} if path.suffix == ".running" else None))
+    monkeypatch.setattr(afvs_local, "runner_alive", lambda: events.append(("alive",)) or True)
+
+    assert afvs_local.subjob_state({}, "1", "0", {'fingerprint': "x"})[0] == afvs_local.RUNNING
+    assert events == [("read", ".running"), ("alive",)]
 
 
 def test_a_second_runner_is_refused(screen):
@@ -355,6 +453,31 @@ def test_failed_subjob_exits_nonzero_and_recovers_locally(screen):
     marker = json.loads((screen.job_dir / ".status" / "2" / "0.done").read_text())
     assert marker['attempts'] == 2
     assert marker['vcpu_seconds_interrupted'] > 0
+
+
+def test_workers_of_a_killed_afvs_run_do_not_outlive_it(screen):
+    """afvs_run.py OOM-killed while its worker processes live on: they must
+    not keep writing outputs into the rerun."""
+    screen.prepare()
+    victim = ligand_names(COLLECTIONS[0])[0]
+
+    ret = screen.run("afvs_run_local.py", check=False, timeout=100, FAKE_DOCK_KILL_COORDINATOR=victim)
+    assert ret.returncode == 1
+
+    failed = json.loads((screen.tree / "workflow" / "local" / "1" / "0.failed").read_text())
+    assert failed['returncode'] == -signal.SIGKILL
+    # The lingering engine (it sleeps 120 s) and its worker went with it
+    assert not any(f"/{victim}.pdbqt" in line for line in ps_lines())
+
+
+def ps_lines():
+    lines = []
+    for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            lines.append(cmdline.read_bytes().replace(b"\0", b" ").decode())
+        except OSError:
+            pass
+    return lines
 
 
 def test_recover_with_nothing_failed_is_a_no_op(screen):

@@ -237,6 +237,10 @@ def check_parameters(config):
             print(f"* batchsystem '{config['batchsystem']}' is not supported. Only awsbatch and slurm are supported")
 
 
+    if(config.get('batchsystem') != "local" and "local" in (config.get('job_storage_mode'), config.get('data_storage_mode'))):
+        print("* job_storage_mode=local and data_storage_mode=local need batchsystem=local")
+        error = 1
+
     if(empty_value(config, 'ligand_library_format')):
         print("* 'ligand_library_format' must be set in all.ctrl")
         error = 1

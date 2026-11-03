@@ -74,9 +74,16 @@ def s3_client_error():
     return botocore.exceptions.ClientError
 
 
+def job_bucket(ctx):
+    # Local mode has no job bucket (and its all.ctrl need not name one)
+    if(ctx['main_config']['job_storage_mode'] == "local"):
+        return None
+    return ctx['main_config']['object_store_job_bucket']
+
+
 def run_obabel(args):
-    """Run obabel with an argv list (no shell). Returns its exit status, or 127 if
-    obabel is not installed, matching what os.system reported before."""
+    """Run obabel with an argv list (no shell). Returns its exit status, or 127
+    if obabel is not installed. Callers ignore it, as they ignored os.system's."""
     try:
         return subprocess.run(["obabel", *args]).returncode
     except OSError as err:
@@ -929,7 +936,7 @@ def generate_output_archives(ctx, upload_queue, scenario_directories):
         uploader_item = {
             'storage_type': ctx['main_config']['job_storage_mode'],
             'remote_path' : generate_output_path(ctx, scenario_key, "logs", "tar.gz"),
-            's3_bucket' : ctx['main_config'].get('object_store_job_bucket'),
+            's3_bucket' : job_bucket(ctx),
             'local_path': tar_name,
             'temp_dir': upload_tmp_dir
         }
@@ -948,7 +955,7 @@ def generate_overview_file(ctx, overview_data, upload_queue):
     uploader_item = {
         'storage_type': ctx['main_config']['job_storage_mode'],
         'remote_path' : generate_output_path(ctx, None, "summary", "json.gz"),
-        's3_bucket': ctx['main_config'].get('object_store_job_bucket'),
+        's3_bucket': job_bucket(ctx),
         'local_path': overview_json_location,
         'temp_dir': upload_tmp_dir
     }
@@ -1006,7 +1013,7 @@ def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
             uploader_item = {
                 'storage_type': ctx['main_config']['job_storage_mode'],
                 'remote_path' : generate_output_path(ctx, scenario_key, "parquet", "parquet"),
-                's3_bucket': ctx['main_config'].get('object_store_job_bucket'),
+                's3_bucket': job_bucket(ctx),
                 'local_path': f"{upload_tmp_dir}/summary.parquet",
                 'temp_dir': upload_tmp_dir
             }
@@ -1038,7 +1045,7 @@ def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
             uploader_item_csv = {
                 'storage_type': ctx['main_config']['job_storage_mode'],
                 'remote_path' : generate_output_path(ctx, scenario_key, "csv", "csv.gz"),
-                's3_bucket': ctx['main_config'].get('object_store_job_bucket'),
+                's3_bucket': job_bucket(ctx),
                 'local_path': f"{upload_tmp_dir}/summary.txt.gz",
                 'temp_dir': upload_tmp_dir
             }

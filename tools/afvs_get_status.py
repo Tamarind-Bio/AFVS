@@ -573,7 +573,6 @@ def process_local(config):
 
     status = complete['workunits']
     vcpus_per_job = int(config['threads_to_use'])
-    alive = afvs_local.runner_alive()
 
     print("Getting workunit status")
 
@@ -602,7 +601,7 @@ def process_local(config):
         subjob_states = []
 
         for subjob_id, subjob in workunit['subjobs'].items():
-            subjob_status, marker = afvs_local.subjob_state(config, workunit_id, subjob_id, subjob, alive=alive)
+            subjob_status, marker = afvs_local.subjob_state(config, workunit_id, subjob_id, subjob)
             subjob_states.append(subjob_status)
 
             overview_status[subjob_status]['subjobs'] += 1

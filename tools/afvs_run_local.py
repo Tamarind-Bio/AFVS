@@ -38,7 +38,6 @@ import fcntl
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -51,6 +50,9 @@ TOOLS_DIR = Path(__file__).resolve().parent
 AFVS_RUN = TOOLS_DIR / "templates" / "afvs_run.py"
 
 POLL_SECONDS = 0.2
+LOCK_WAIT_SECONDS = 5
+ORPHAN_WAIT_SECONDS = 30
+STOP_SIGNALS = {signal.SIGTERM, signal.SIGINT}
 
 
 class Terminated(Exception):
@@ -58,7 +60,70 @@ class Terminated(Exception):
 
 
 def _raise_terminated(signum, frame):
+    # One stop is enough: ignore any further signal so cleanup runs to the end
+    for stop_signal in STOP_SIGNALS:
+        signal.signal(stop_signal, signal.SIG_IGN)
     raise Terminated(signum)
+
+
+def kill_process_group(pgid):
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def process_group_alive(pgid):
+    """Whether any process of the group is still running. Killed orphans can
+    linger as zombies when nothing reaps them (a container's PID 1 often
+    does not), so on Linux zombies are not counted."""
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+
+    proc = Path("/proc")
+    if not (proc / "self" / "stat").exists():
+        return True
+    for stat_path in proc.glob("[0-9]*/stat"):
+        try:
+            # pid (comm) state ppid pgrp ...; comm may contain spaces
+            fields = stat_path.read_text().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if int(fields[2]) == pgid and fields[0] != "Z":
+            return True
+    return False
+
+
+def wait_for_process_group(pgid, timeout):
+    deadline = time.time() + timeout
+    while process_group_alive(pgid):
+        if time.time() >= deadline:
+            return False
+        time.sleep(POLL_SECONDS)
+    return True
+
+
+def kill_orphans():
+    """An attempt whose runner was killed outright (SIGKILL, OOM) keeps running
+    in its own session. Stop each one before its subjob is run again, so two
+    attempts never write the same outputs. Called with the runner lock held,
+    so every .running marker left is a dead runner's."""
+    for running_path in sorted(afvs_local.LOCAL_STATE_DIR.glob("*/*.running")):
+        marker = afvs_local.read_json(running_path) or {}
+        pgid = marker.get('pid')
+        if not isinstance(pgid, int) or pgid <= 1:
+            continue
+        if process_group_alive(pgid):
+            # It ran until now: record that, so its time counts as interrupted
+            kill_process_group(pgid)
+            marker['stopped'] = time.time()
+            afvs_local.write_json_atomic(running_path, marker)
+        if wait_for_process_group(pgid, ORPHAN_WAIT_SECONDS):
+            print(f"Stopped what was left of an earlier attempt at {running_path.parent.name}:{running_path.stem}", flush=True)
+        else:
+            print(f"WARNING: process group {pgid} of an earlier attempt did not exit", flush=True)
 
 
 def parse_config(filename):
@@ -89,23 +154,6 @@ def subjob_env(config, workunit_id, subjob_id, workunit):
     return env
 
 
-def outputs_complete(config, workunit_id, subjob_id):
-    """afvs_run.py exited 0; check its outputs are actually in place before the
-    subjob is marked done. The summary is always written; the per-scenario log
-    archives are written whenever anything was docked."""
-    summary = afvs_local.read_summary(config, workunit_id, subjob_id)
-    if summary is None:
-        return False
-
-    if summary.get('total_dockings', 0) > 0:
-        root = afvs_local.job_root(config)
-        for scenario_key in config['docking_scenario_names']:
-            if not (root / scenario_key / "logs" / str(workunit_id) / f"{subjob_id}.tar.gz").is_file():
-                return False
-
-    return True
-
-
 class Attempt:
 
     def __init__(self, config, workunit_id, subjob_id, workunit):
@@ -120,7 +168,18 @@ class Attempt:
         self.log_path = afvs_local.attempt_path(workunit_id, subjob_id, "out")
 
         # A failed attempt, or one whose runner died mid-attempt
-        previous = afvs_local.read_json(self.failed_path) or afvs_local.read_json(self.running_path) or {}
+        previous = afvs_local.read_json(self.failed_path)
+        if previous is None:
+            previous = afvs_local.read_json(self.running_path) or {}
+            if 'started' in previous:
+                # Its runner died, so nobody recorded its time: count it up to
+                # when kill_orphans stopped it, else to the last line it logged
+                try:
+                    ended = previous.get('stopped') or os.path.getmtime(self.log_path)
+                    previous['vcpu_seconds_interrupted'] = float(previous.get('vcpu_seconds_interrupted', 0)) + \
+                        max(0.0, ended - float(previous['started'])) * int(config['threads_to_use'])
+                except (OSError, TypeError, ValueError):
+                    pass
         self.attempts = int(previous.get('attempts', 0)) + 1
         self.vcpu_seconds_interrupted = float(previous.get('vcpu_seconds_interrupted', 0))
 
@@ -139,6 +198,16 @@ class Attempt:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
         print(f"Workunit {self.workunit_id}:{self.subjob_id}: started (attempt {self.attempts}), output in {self.log_path}", flush=True)
+
+        # A stop signal is held back until the child is recorded (self.process
+        # and its .running marker), so stop() can always find it
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+        try:
+            self._spawn()
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+
+    def _spawn(self):
         with open(self.log_path, "w") as log_out:
             # A session of its own, so afvs_run.py's worker processes can be
             # stopped together with it
@@ -162,12 +231,24 @@ class Attempt:
     def vcpu_seconds(self):
         return (time.time() - self.started) * int(self.config['threads_to_use'])
 
+    def exited(self):
+        """Whether afvs_run.py has exited, WITHOUT reaping it: until it is
+        reaped its pid (= its process group id) cannot be reused, so finish()
+        can safely kill the group."""
+        try:
+            return os.waitid(os.P_PID, self.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        except ChildProcessError:
+            return self.process.poll() is not None
+
     def finish(self):
         """Record the result of an exited attempt. Returns True on success."""
-        returncode = self.process.returncode
+        # afvs_run.py's worker processes share its session; if it died without
+        # them (OOM), they must not outlive it and race a rerun
+        kill_process_group(self.process.pid)
+        returncode = self.process.wait()
         vcpu_seconds = self.vcpu_seconds()
 
-        if returncode == 0 and outputs_complete(self.config, self.workunit_id, self.subjob_id):
+        if returncode == 0 and afvs_local.outputs_complete(self.config, self.workunit_id, self.subjob_id):
             afvs_local.write_json_atomic(
                 afvs_local.done_marker_path(self.config, self.workunit_id, self.subjob_id), {
                     'fingerprint': self.subjob['fingerprint'],
@@ -197,23 +278,27 @@ class Attempt:
         if self.process is None:
             afvs_local.remove_file(self.running_path)
             return
-        try:
-            os.killpg(self.process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_process_group(self.process.pid)
         self.process.wait()
         self.mark_failed(self.process.returncode, self.vcpu_seconds())
 
 
 def acquire_runner_lock():
+    """The runner lock, or None if another runner holds it. A status call
+    probes the lock (shared, for an instant), so retry for a few seconds
+    before giving up."""
     afvs_local.LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock_file = open(afvs_local.RUNNER_LOCK, "w")
-    try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock_file.close()
-        return None
-    return lock_file
+    deadline = time.time() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock_file
+        except BlockingIOError:
+            if time.time() >= deadline:
+                lock_file.close()
+                return None
+            time.sleep(POLL_SECONDS)
 
 
 def run_subjobs(config, workunits, subjobs, workers):
@@ -232,26 +317,23 @@ def run_subjobs(config, workunits, subjobs, workers):
                 running.append(attempt)
                 attempt.start()
 
-            for attempt in [attempt for attempt in running if attempt.process.poll() is not None]:
-                running.remove(attempt)
+            for attempt in [attempt for attempt in running if attempt.exited()]:
                 if not attempt.finish():
                     failed += 1
+                running.remove(attempt)
 
             time.sleep(POLL_SECONDS)
     finally:
-        # Only reached with attempts still running if we were stopped
-        if running:
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        # Only reached with attempts still running if we were stopped (the
+        # signal handler has already set further stop signals to be ignored)
         for attempt in running:
             attempt.stop()
 
     return failed
 
 
-def run(config, workers, select=None):
-    """Run every subjob that is not done (or, with `select`, those of the given
-    states). Returns a process exit status."""
+def run(config, workers):
+    """Run every subjob that is not done. Returns a process exit status."""
 
     if not afvs_local.is_local(config):
         print(f"afvs_run_local.py needs batchsystem=local (this workflow has batchsystem={config['batchsystem']})")
@@ -267,11 +349,7 @@ def run(config, workers, select=None):
     }
 
     try:
-        afvs_local.write_json_atomic(afvs_local.RUNNER_INFO, {
-            'pid': os.getpid(),
-            'host': socket.gethostname(),
-            'started': time.time()
-        })
+        kill_orphans()
 
         workunits = get_workunits()
 
@@ -282,7 +360,7 @@ def run(config, workers, select=None):
                 state, _ = afvs_local.subjob_state(config, workunit_id, subjob_id, subjob, alive=False)
                 if state == afvs_local.SUCCEEDED:
                     skipped += 1
-                elif select is None or state in select:
+                else:
                     todo.append((workunit_id, subjob_id))
 
         print(f"{len(todo)} subjobs to run, {skipped} already done, {workers} at a time", flush=True)
@@ -299,7 +377,6 @@ def run(config, workers, select=None):
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-        afvs_local.remove_file(afvs_local.RUNNER_INFO)
         lock_file.close()
 
 
