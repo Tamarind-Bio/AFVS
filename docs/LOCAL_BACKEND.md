@@ -11,12 +11,22 @@ network calls.
 batchsystem=local
 job_storage_mode=local
 data_storage_mode=local
-local_job_root=/out/afvs          # outputs land in <local_job_root>/<job_name>/
-local_data_root=/in/collections   # collections, at their S3 keys
-local_workers=4                   # subjobs at once (optional, default 1)
-local_array_job_size=100          # subjobs per workunit (optional, default 100)
-threads_to_use=8                  # docking processes per subjob, as before
+local_job_root=/app/out/afvs
+local_data_root=/app/inputs/collections
+local_workers=4
+local_array_job_size=100
+threads_to_use=8
 ```
+
+- `local_job_root`: outputs land in `<local_job_root>/<job_name>/`.
+- `local_data_root`: holds the collections, at their S3 keys.
+- `local_workers`: how many subjobs run at once (optional, default 1).
+- `local_array_job_size`: subjobs per workunit (optional, default 100).
+- `threads_to_use`: docking processes per subjob, as before.
+
+all.ctrl has no inline comments: the parser keeps everything after `=`, so a
+`# comment` would become part of the value. Prepare rejects a `#` in the two
+roots.
 
 The three `*=local` settings go together. `object_store_*` and `aws_*` keys
 are not needed.
@@ -28,7 +38,11 @@ metatranche addressing, `AACAAA_00001` is read from
 
 ## Running
 
-From `tools/`, as before:
+Every path in these scripts is relative to `tools/`, so run them from there
+(`cd "$AFVS_HOME/tools"` in the image). They write `templates/all.ctrl` and
+`../workflow/` beside themselves, so that tree must be writable: the image
+gives UID 1000 ownership of `/opt/AFVS`, which needs a writable root
+filesystem.
 
 ```bash
 ./afvs_prepare_folders.py --overwrite
@@ -70,6 +84,9 @@ exited 0 and its outputs are in place. It is JSON and records:
 - `vcpu_seconds_interrupted`
 - `attempts`
 
+The `.done` marker also records the size of every output the subjob
+wrote.
+
 A rerun skips every subjob that has a valid marker. A marker is ignored, and
 the subjob runs again, when:
 
@@ -78,9 +95,13 @@ the subjob runs again, when:
     reuses the same workunit and subjob ids for different ligands does not
     match
   - the docking scenarios
-  - the contents of `docking_scenario_basefolder` (receptor, box), so a run
-    under the same `job_name` with another box or receptor does not match
-- any output the subjob should have is missing:
+  - the all.ctrl settings that change what is docked or written
+  - each scenario's `config.txt` settings (normalised) and the files they name,
+    such as the receptor, so a run under the same `job_name` with another box
+    or receptor does not match. Prepare fails if a path in `config.txt` does
+    not resolve. Other files in the folder are ignored.
+- any output recorded in the marker is missing or has changed size, or any
+  output the subjob should have is missing:
   - the summary
   - the log archive of each scenario, when anything was docked
   - the parquet/csv score tables, when a docking succeeded
@@ -123,8 +144,8 @@ subjob is shown as:
 | --- | --- |
 | `SUCCEEDED` | It has a valid `.done` marker |
 | `RUNNING` | An attempt is in flight under a live runner |
-| `FAILED` | Its last attempt failed, or its runner died mid-attempt |
-| `PENDING` | It has not been attempted yet |
+| `FAILED` | Its last attempt failed, its runner died mid-attempt, or a run ended without reaching it |
+| `PENDING` | It has not been attempted yet, and a runner may still reach it |
 
 Workunits roll these up the way an AWS Batch array parent does. vCPU hours
 come from the `.done` markers, so they include subjobs that finished before a

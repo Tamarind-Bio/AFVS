@@ -117,6 +117,9 @@ def test_prepare_writes_local_workunits(screen):
 
 
 @pytest.mark.parametrize("old, new, message", [
+    # all.ctrl has no inline comments: this parser would keep one as part of the path
+    ("local_job_root=", "local_job_root=/out   # comment\nignored_",
+     "'local_job_root' must not contain '#'"),
     ("data_storage_mode=local", "data_storage_mode=s3",
      "batchsystem 'local' requires job_storage_mode=local and data_storage_mode=local"),
     # Local storage under AWS Batch stays rejected, as it was before local mode
@@ -130,6 +133,16 @@ def test_prepare_rejects_mixed_local_configs(screen, old, new, message):
     ret = screen.run("afvs_prepare_folders.py", "--overwrite", check=False)
     assert ret.returncode == 1
     assert message in ret.stdout
+
+
+def test_prepare_fails_when_a_scenario_file_does_not_resolve(screen):
+    """The fingerprint must cover the receptor; one it cannot find fails prepare."""
+    box = screen.tree / "input-files" / "qvina02" / "config.txt"
+    box.write_text(box.read_text().replace("receptors/receptor.pdb", "receptors/missing.pdb"))
+    screen.run("afvs_prepare_folders.py", "--overwrite")
+    ret = screen.run("afvs_prepare_workunits.py", check=False)
+    assert ret.returncode != 0
+    assert "receptor = ../input-files/receptors/missing.pdb does not name a file" in ret.stderr
 
 
 def test_submit_jobs_points_local_mode_at_the_runner(screen):
@@ -148,7 +161,13 @@ def test_full_local_screen(screen):
     assert before['pending'] == "2" and before['complete'] == "0"
     assert before['succeeded'] == "0" and before['total_succeeded'] == "0"
 
-    screen.run("afvs_run_local.py")
+    sigmask = screen.base / "sigmask"
+    screen.run("afvs_run_local.py", FAKE_DOCK_SIGMASK=str(sigmask))
+
+    # The runner blocks stop signals while it spawns; nothing below inherits that
+    masks = sigmask.read_text().split()
+    assert len(masks) == 6
+    assert all(int(mask, 16) & (1 << (signal.SIGTERM - 1) | 1 << (signal.SIGINT - 1)) == 0 for mask in masks)
 
     # Same layout as the S3 backend: <scenario>/parquet|logs|csv/<wu>/<sj>.*, summary/<wu>/<sj>.json.gz
     for workunit_id, subjob_id in screen.subjobs():
@@ -249,22 +268,25 @@ def test_resume_after_sigterm_skips_done_subjobs(screen):
     screen.prepare()
     first, second = screen.subjobs()
 
-    runner = screen.popen("afvs_run_local.py", FAKE_DOCK_SLEEP="1")
+    gate, gate_env = screen.gate(COLLECTIONS[1])
+    runner = screen.popen("afvs_run_local.py", **gate_env)
     wait_for(lambda: screen.done_markers() == ["1/0.done"])
     running_marker = screen.tree / "workflow" / "local" / "2" / "0.running"
     wait_for(running_marker.exists)
     child_pgid = json.loads(running_marker.read_text())['pid']
 
-    # Mid-run: the wrapper sees it as in progress
+    # Mid-run: the wrapper sees it as in progress, and recovery has nothing to do yet
     parsed = status(screen)
     assert parsed['complete'] == "0"
     assert parsed['succeeded'] == "1"
     assert parsed['running'] == "1"
+    assert "still running" in screen.run("afvs_recover_failed_subjobs.py", "--queue", "vf-queue-ondemand").stdout
 
     runner.send_signal(signal.SIGTERM)
     assert runner.wait(timeout=60) == 128 + signal.SIGTERM
     assert screen.done_markers() == ["1/0.done"]
     assert process_group_gone(child_pgid)
+    gate.unlink()
 
     # The interrupted subjob reads as failed until it is rerun
     parsed = status(screen)
@@ -290,7 +312,8 @@ def test_resume_after_sigkill_of_runner(screen):
     keeps going in its own session. The next runner must stop that attempt
     before redoing the subjob."""
     screen.prepare()
-    runner = screen.popen("afvs_run_local.py", FAKE_DOCK_SLEEP="2")
+    gate, gate_env = screen.gate(COLLECTIONS[1])
+    runner = screen.popen("afvs_run_local.py", **gate_env)
     wait_for(lambda: screen.done_markers() == ["1/0.done"])
     running_marker = screen.tree / "workflow" / "local" / "2" / "0.running"
     wait_for(running_marker.exists)
@@ -303,6 +326,7 @@ def test_resume_after_sigkill_of_runner(screen):
     parsed = status(screen)
     assert parsed['failed'] == "1" and parsed['running'] == "0"
 
+    gate.unlink()
     out = screen.run("afvs_run_local.py").stdout
     assert "Stopped what was left of an earlier attempt at 2:0" in out
     assert process_group_gone(orphan_pgid, timeout=0)
@@ -316,13 +340,17 @@ def test_resume_after_sigkill_of_runner(screen):
 def test_recover_after_a_stopped_run_also_runs_what_never_started(make_screen):
     screen = make_screen(array_size=1, collections=COLLECTIONS)
     screen.prepare()
-    runner = screen.popen("afvs_run_local.py", FAKE_DOCK_SLEEP="1")
+    gate, gate_env = screen.gate(COLLECTIONS[0])
+    runner = screen.popen("afvs_run_local.py", **gate_env)
     wait_for((screen.tree / "workflow" / "local" / "1" / "0.running").exists)
     runner.send_signal(signal.SIGTERM)
     assert runner.wait(timeout=60) == 128 + signal.SIGTERM
+    gate.unlink()
 
+    # The subjob the stopped run never reached reads FAILED, not PENDING for
+    # good, so the wrapper's wait ends and its recovery runs it
     parsed = status(screen)
-    assert parsed['failed'] == "1" and parsed['pending'] == "1" and parsed['complete'] == "0"
+    assert parsed['failed'] == "2" and parsed['pending'] == "0" and parsed['complete'] == "1"
 
     screen.run("afvs_recover_failed_subjobs.py", "--queue", "vf-queue-ondemand")
     recovery = status(screen, "--recovery")
@@ -346,38 +374,63 @@ def test_resume_across_a_fresh_prepare(screen):
     assert parsed['succeeded'] == "2" and parsed['total_succeeded'] == "6"
 
 
-@pytest.mark.parametrize("change, expect_rerun", [
+@pytest.mark.parametrize("change, expect", [
     # Active learning reruns the job under the same name with a new todo.all,
     # so workunit/subjob ids repeat with different contents
     ("todo", "1 subjobs to run, 1 already done"),
-    # The same job_name docked against another box (or receptor)
+    # The same job_name docked against another box, or another receptor
     ("box", "2 subjobs to run, 0 already done"),
+    ("receptor", "2 subjobs to run, 0 already done"),
+    ("setting", "2 subjobs to run, 0 already done"),
+    # A restaged tree that differs only in ways docking ignores still resumes
+    ("config_formatting", "0 subjobs to run, 2 already done"),
+    ("stray_file", "0 subjobs to run, 2 already done"),
 ])
-def test_a_done_marker_for_different_work_is_not_reused(screen, change, expect_rerun):
+def test_done_markers_follow_the_work_they_describe(screen, change, expect):
     screen.prepare()
     screen.run("afvs_run_local.py")
 
+    inputs = screen.tree / "input-files"
+    box = inputs / "qvina02" / "config.txt"
     if change == "todo":
         todo = screen.tools / "templates" / "todo.all"
         todo.write_text(todo.read_text().replace(f"{COLLECTIONS[1]} 3", f"{COLLECTIONS[1]} 4"))
-    else:
-        box = screen.tree / "input-files" / "qvina02" / "config.txt"
+    elif change == "box":
         box.write_text(box.read_text().replace("size_x = 18", "size_x = 20"))
+    elif change == "receptor":
+        receptor = inputs / "receptors" / "receptor.pdb"
+        receptor.write_text("".join(receptor.read_text().splitlines(keepends=True)[:-1]))
+    elif change == "setting":
+        ctrl = screen.tools / "templates" / "all.ctrl"
+        ctrl.write_text(ctrl.read_text().replace("run_atom_check=1", "run_atom_check=0"))
+    elif change == "config_formatting":
+        box.write_text("# restaged\n" + "".join(f"{line.replace(' = ', '=')}   # x\n"
+                                                for line in reversed(box.read_text().splitlines())))
+    else:
+        (inputs / ".DS_Store").write_text("junk")
     screen.prepare()
 
-    assert status(screen)['complete'] == "0"
-    assert expect_rerun in screen.run("afvs_run_local.py").stdout
+    out = screen.run("afvs_run_local.py").stdout
+    assert expect in out
+    rerun = not expect.startswith("0 ")
+    assert (".done markers ignored" in out) == rerun
+    assert status(screen)['complete'] == "1"
 
 
 @pytest.mark.parametrize("output", [
     "summary/2/0.json.gz", "qvina02/parquet/2/0.parquet", "qvina02/csv/2/0.csv.gz", "qvina02/logs/2/0.tar.gz"])
-def test_a_done_marker_without_its_outputs_is_not_trusted(screen, output):
+@pytest.mark.parametrize("damage", ["delete", "truncate"])
+def test_a_done_marker_without_its_outputs_is_not_trusted(screen, output, damage):
     """E.g. a restore from S3 that stopped part way."""
     screen.prepare()
     screen.run("afvs_run_local.py")
-    (screen.job_dir / output).unlink()
+    path = screen.job_dir / output
+    if damage == "delete":
+        path.unlink()
+    else:
+        path.write_bytes(path.read_bytes()[:-1])
 
-    assert status(screen)['pending'] == "1"
+    assert status(screen)['failed'] == "1"
     assert "1 subjobs to run, 1 already done" in screen.run("afvs_run_local.py").stdout
 
 
@@ -413,6 +466,12 @@ def test_liveness_is_read_after_the_running_marker(monkeypatch):
 
     assert afvs_local.subjob_state({}, "1", "0", {'fingerprint': "x"})[0] == afvs_local.RUNNING
     assert events == [("read", ".running"), ("alive",)]
+
+    # The attempt finished (and its runner exited) between the two reads
+    done_reads = iter([None, {'fingerprint': "x"}])
+    monkeypatch.setattr(afvs_local, "read_done_marker", lambda *args: next(done_reads))
+    monkeypatch.setattr(afvs_local, "runner_alive", lambda: False)
+    assert afvs_local.subjob_state({}, "1", "0", {'fingerprint': "x"})[0] == afvs_local.SUCCEEDED
 
 
 def test_a_second_runner_is_refused(screen):

@@ -48,6 +48,9 @@ WORKFLOW_DIR = Path("..") / "workflow"
 LOCAL_STATE_DIR = WORKFLOW_DIR / "local"
 # Held (flock LOCK_EX) by afvs_run_local.py for as long as it owns the workflow
 RUNNER_LOCK = LOCAL_STATE_DIR / "runner.lock"
+# Written when a runner starts, so status can tell "not run yet" from "a run
+# ended without reaching this subjob"
+RUN_STARTED = LOCAL_STATE_DIR / "started"
 
 # Subjob states, named after the AWS Batch states afvs_get_status.py reports
 SUCCEEDED = "SUCCEEDED"
@@ -58,6 +61,14 @@ PENDING = "PENDING"
 # The parts of a collection entry that decide what a subjob docks. Paths are
 # left out so a screen restaged under a different mount still matches.
 _FINGERPRINT_COLLECTION_KEYS = ('count', 'mode', 'ligands', 'prescreen_ligands_per_tranche', 'dockings')
+
+# all.ctrl settings that change which ligands are docked or what is written
+_FINGERPRINT_CONFIG_KEYS = (
+    'docking_scenario_names', 'docking_scenario_methods', 'docking_scenario_replicas',
+    'ligand_library_format', 'run_atom_check', 'prescreen_mode', 'prescreen_ligands_per_tranche',
+    'dynamic_tranche_filtering', 'dynamic_tranche_filtering_regex', 'summary_formats',
+    'print_attrs_in_summary', 'threads_per_docking', 'program_timeout',
+)
 
 
 def is_local(config):
@@ -124,14 +135,36 @@ def outputs_complete(config, workunit_id, subjob_id):
 
 
 def inputs_digest(config):
-    """Hash of the docking inputs every subjob carries (the receptor and each
-    scenario's config, i.e. docking_scenario_basefolder)."""
-    digest = hashlib.sha256()
+    """Hash of what each scenario docks against: its config.txt settings
+    (normalised, so comments, spacing and order do not count) and the files
+    those settings name, such as the receptor. Other files under
+    docking_scenario_basefolder are left out, so a stray file in a restaged
+    tree does not invalidate every .done."""
     base = Path(config['docking_scenario_basefolder'])
-    for path in sorted(p for p in base.rglob("*") if p.is_file()):
-        digest.update(path.relative_to(base).as_posix().encode() + b"\0")
-        digest.update(path.read_bytes() + b"\0")
-    return digest.hexdigest()
+    scenarios = {}
+    for scenario_key in config['docking_scenario_names']:
+        settings = {}
+        config_path = base / scenario_key / "config.txt"
+        if config_path.is_file():
+            for line in config_path.read_text().splitlines():
+                key, sep, value = line.split('#')[0].partition("=")
+                if sep:
+                    settings[key.strip()] = value.strip()
+
+        # Docking runs inside a copy of docking_scenario_basefolder, so that
+        # is where relative paths in config.txt resolve from. A setting that
+        # names a file must resolve, or the fingerprint would silently stop
+        # covering it (a swapped receptor would then reuse old results).
+        files = {}
+        for key, value in settings.items():
+            path = base / value
+            if value and path.is_file():
+                files[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+            elif "/" in value or key in ('receptor', 'flex'):
+                raise ValueError(f"{config_path}: {key} = {value} does not name a file under {base}")
+        scenarios[scenario_key] = {'settings': settings, 'files': files}
+
+    return hashlib.sha256(json.dumps(scenarios, sort_keys=True).encode()).hexdigest()
 
 
 def subjob_fingerprint(config, subjob, docking_inputs):
@@ -147,9 +180,7 @@ def subjob_fingerprint(config, subjob, docking_inputs):
 
     blob = json.dumps({
         'collections': collections,
-        'scenario_names': config['docking_scenario_names'],
-        'scenario_methods': config['docking_scenario_methods'],
-        'scenario_replicas': config['docking_scenario_replicas'],
+        'config': {key: config.get(key) for key in _FINGERPRINT_CONFIG_KEYS},
         'docking_inputs': docking_inputs,
     }, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()
@@ -189,16 +220,40 @@ def read_summary(config, workunit_id, subjob_id):
         return None
 
 
+def output_manifest(config, workunit_id, subjob_id):
+    """{path relative to the job root: size} of the subjob's outputs on disk.
+    Recorded in its .done, so a resume can tell a partial restore (any
+    scenario, any format) from a complete one."""
+    root = job_root(config)
+    manifest = {}
+    for path in subjob_output_paths(config, workunit_id, subjob_id):
+        if not path.name.endswith(".partial") and path.is_file():
+            manifest[path.relative_to(root).as_posix()] = path.stat().st_size
+    return manifest
+
+
 def read_done_marker(config, workunit_id, subjob_id, fingerprint):
     """The subjob's .done contents if it is complete for THIS workunit layout,
-    otherwise None (missing, unreadable, another wave's, or any of its outputs
-    is gone, e.g. a restore that stopped part way)."""
+    otherwise None (missing, unreadable, another wave's, or any output it
+    recorded is gone or changed size, e.g. a restore that stopped part way)."""
     marker = read_json(done_marker_path(config, workunit_id, subjob_id))
     if not isinstance(marker, dict) or marker.get('fingerprint') != fingerprint:
         return None
-    if not outputs_complete(config, workunit_id, subjob_id):
+    if not isinstance(marker.get('outputs'), dict) or not outputs_complete(config, workunit_id, subjob_id):
         return None
+    root = job_root(config)
+    for relative_path, size in marker['outputs'].items():
+        try:
+            if (root / relative_path).stat().st_size != size:
+                return None
+        except OSError:
+            return None
     return marker
+
+
+def run_started():
+    """Whether an afvs_run_local.py has started on this workflow (this wave)."""
+    return RUN_STARTED.exists()
 
 
 def runner_alive():
@@ -226,8 +281,9 @@ def subjob_state(config, workunit_id, subjob_id, subjob, alive=None):
 
     SUCCEEDED  valid .done for this layout
     RUNNING    an attempt is in flight under a live runner
-    FAILED     the last attempt failed, or its runner died mid-attempt
-    PENDING    never attempted in this wave
+    FAILED     the last attempt failed, its runner died mid-attempt, or a run
+               ended without reaching it
+    PENDING    not attempted yet, and a runner may still get to it
     """
     marker = read_done_marker(config, workunit_id, subjob_id, subjob.get('fingerprint'))
     if marker is not None:
@@ -239,11 +295,25 @@ def subjob_state(config, workunit_id, subjob_id, subjob, alive=None):
             alive = runner_alive()
         if alive:
             return RUNNING, running
+        # The attempt may have succeeded (and its runner exited) since the
+        # .done was read above
+        marker = read_done_marker(config, workunit_id, subjob_id, subjob.get('fingerprint'))
+        if marker is not None:
+            return SUCCEEDED, marker
         return FAILED, running
 
     failed = read_json(attempt_path(workunit_id, subjob_id, "failed"))
     if failed is not None:
         return FAILED, failed
+
+    # Never attempted. Once a run has started and no runner is left, nothing
+    # will ever pick it up, so it is reported FAILED (and recovery runs it)
+    # rather than PENDING for good.
+    if run_started():
+        if alive is None:
+            alive = runner_alive()
+        if not alive:
+            return FAILED, None
 
     return PENDING, None
 

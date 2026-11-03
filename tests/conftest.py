@@ -73,12 +73,17 @@ FAKE_QVINA = """\
 #   FAKE_DOCK_FAIL      comma-separated ligand names that exit 1
 #   FAKE_DOCK_CRASH     ligand name that kills its whole afvs_run.py (a hard subjob failure)
 #   FAKE_DOCK_KILL_COORDINATOR  ligand name that kills only afvs_run.py itself
+#   FAKE_DOCK_GATE      file; while it exists, FAKE_DOCK_GATE_LIGANDS (comma-separated) wait
+#   FAKE_DOCK_SIGMASK   file that gets the engine's blocked-signal mask per docking
 #   FAKE_DOCK_LOG       file that gets "<ligand> <start> <end>" per docking run
 import hashlib, os, shutil, signal, sys, time
 args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
 ligand = os.path.basename(args['--ligand']).split('.')[0]
 start = time.time()
 time.sleep(float(os.environ.get('FAKE_DOCK_SLEEP', '0')))
+if ligand in os.environ.get('FAKE_DOCK_GATE_LIGANDS', '').split(','):
+    while os.path.exists(os.environ['FAKE_DOCK_GATE']):
+        time.sleep(0.05)
 if ligand == os.environ.get('FAKE_DOCK_CRASH'):
     os.killpg(os.getpgrp(), signal.SIGKILL)
 if ligand == os.environ.get('FAKE_DOCK_KILL_COORDINATOR'):
@@ -88,6 +93,9 @@ if ligand == os.environ.get('FAKE_DOCK_KILL_COORDINATOR'):
         coordinator = int(stat.read().rsplit(")", 1)[1].split()[1])
     os.kill(coordinator, signal.SIGKILL)
     time.sleep(120)
+if os.environ.get('FAKE_DOCK_SIGMASK'):
+    with open('/proc/self/status') as status, open(os.environ['FAKE_DOCK_SIGMASK'], 'a') as out:
+        out.write(next(line for line in status if line.startswith('SigBlk:')).split()[1] + "\\n")
 if os.environ.get('FAKE_DOCK_LOG'):
     with open(os.environ['FAKE_DOCK_LOG'], 'a') as log:
         log.write(f"{{ligand}} {{start}} {{time.time()}}\\n")
@@ -190,6 +198,13 @@ class Screen:
         env['FAKE_DOCK_LOG'] = str(self.dock_log)
         env.update(extra)
         return env
+
+    def gate(self, collection_key):
+        """Env that holds every docking of one collection until the gate file
+        is removed, so a test can act mid-subjob without racing a timer."""
+        gate = self.base / f"gate-{collection_key}"
+        gate.write_text("")
+        return gate, {'FAKE_DOCK_GATE': str(gate), 'FAKE_DOCK_GATE_LIGANDS': ",".join(ligand_names(collection_key))}
 
     def popen(self, script, *args, **env):
         return subprocess.Popen([sys.executable, f"./{script}", *args], cwd=self.tools,

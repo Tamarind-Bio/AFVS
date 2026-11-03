@@ -201,10 +201,12 @@ def downloader(download_queue, unpack_queue, summary_queue, tmp_dir):
         elif('local_data_path' in item['collection']):
             # Local mode: the orchestrator staged the collections under local_data_root.
             # A missing one is a failed download, exactly as a missing S3 object is.
-            try:
-                shutil.copyfile(Path(item['collection']['local_data_path']), item['local_path'])
-            except OSError as error:
-                reason = f"Failed to read {item['collection']['local_data_path']} to {item['local_path']}: ({error})"
+            # Any other error (a full or failing scratch disk) fails the subjob.
+            source = Path(item['collection']['local_data_path'])
+            if source.is_file():
+                shutil.copyfile(source, item['local_path'])
+            else:
+                reason = f"Collection {source} is not in local_data_root"
                 logging.error(reason)
 
                 summary_item = {

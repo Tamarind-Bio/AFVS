@@ -155,6 +155,10 @@ def check_parameters(config):
         if(empty_value(config, 'local_job_root')):
             print("* 'local_job_root' must be set if job_storage_mode is 'local'")
             error = 1
+        elif('#' in config['local_job_root']):
+            # This parser keeps everything after '=', so an inline comment would become part of the path
+            print("* 'local_job_root' must not contain '#' (all.ctrl has no inline comments)")
+            error = 1
     else:
         if(config['job_storage_mode'] == "s3"):
             if(empty_value(config, 'object_store_job_bucket')):
@@ -172,6 +176,9 @@ def check_parameters(config):
     elif(config['data_storage_mode'] == "local"):
         if(empty_value(config, 'local_data_root')):
             print("* 'local_data_root' must be set if data_storage_mode is 'local'")
+            error = 1
+        elif('#' in config['local_data_root']):
+            print("* 'local_data_root' must not contain '#' (all.ctrl has no inline comments)")
             error = 1
     else:
         if(config['job_storage_mode'] == "s3"):

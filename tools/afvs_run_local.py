@@ -66,11 +66,25 @@ def _raise_terminated(signum, frame):
     raise Terminated(signum)
 
 
+def _unblock_stop_signals():
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+
+
 def kill_process_group(pgid):
     try:
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+def process_start_time(pid):
+    """The kernel's start time of a process (clock ticks since boot), or None.
+    With the pid it identifies one process: a reused pid has another."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
 
 
 def process_group_alive(pgid):
@@ -113,7 +127,15 @@ def kill_orphans():
     for running_path in sorted(afvs_local.LOCAL_STATE_DIR.glob("*/*.running")):
         marker = afvs_local.read_json(running_path) or {}
         pgid = marker.get('pid')
-        if not isinstance(pgid, int) or pgid <= 1:
+        # A reused pid could name our own group; never kill that
+        if not isinstance(pgid, int) or pgid <= 1 or pgid in (os.getpid(), os.getpgrp()):
+            continue
+        # If the group's leader is still there it must be the process the
+        # marker recorded. (If it is gone, the kernel does not hand its pid out
+        # as a new group id while members of the old group live, so any live
+        # member is the orphan's.)
+        leader_start = process_start_time(pgid)
+        if leader_start is not None and marker.get('start_time') not in (None, leader_start):
             continue
         if process_group_alive(pgid):
             # It ran until now: record that, so its time counts as interrupted
@@ -185,6 +207,7 @@ class Attempt:
 
         self.process = None
         self.started = None
+        self.finished = False
 
     def start(self):
         # Clear what an earlier attempt (or an earlier wave) left, so nothing
@@ -201,8 +224,8 @@ class Attempt:
 
         # A stop signal is held back until the child is recorded (self.process
         # and its .running marker), so stop() can always find it
-        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
         try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
             self._spawn()
         finally:
             signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
@@ -218,11 +241,14 @@ class Attempt:
                 stdin=subprocess.DEVNULL,
                 stdout=log_out,
                 stderr=subprocess.STDOUT,
-                start_new_session=True
+                start_new_session=True,
+                # The child inherits the mask start() set; give it the default
+                preexec_fn=_unblock_stop_signals
             )
 
         afvs_local.write_json_atomic(self.running_path, {
             'pid': self.process.pid,
+            'start_time': process_start_time(self.process.pid),
             'started': self.started,
             'attempts': self.attempts,
             'vcpu_seconds_interrupted': self.vcpu_seconds_interrupted,
@@ -246,12 +272,14 @@ class Attempt:
         # them (OOM), they must not outlive it and race a rerun
         kill_process_group(self.process.pid)
         returncode = self.process.wait()
+        self.finished = True
         vcpu_seconds = self.vcpu_seconds()
 
         if returncode == 0 and afvs_local.outputs_complete(self.config, self.workunit_id, self.subjob_id):
             afvs_local.write_json_atomic(
                 afvs_local.done_marker_path(self.config, self.workunit_id, self.subjob_id), {
                     'fingerprint': self.subjob['fingerprint'],
+                    'outputs': afvs_local.output_manifest(self.config, self.workunit_id, self.subjob_id),
                     'vcpu_seconds': vcpu_seconds,
                     'vcpu_seconds_interrupted': self.vcpu_seconds_interrupted,
                     'attempts': self.attempts,
@@ -275,6 +303,9 @@ class Attempt:
         afvs_local.remove_file(self.running_path)
 
     def stop(self):
+        if self.finished:
+            # finish() already recorded it; its pid may be reused by now
+            return
         if self.process is None:
             afvs_local.remove_file(self.running_path)
             return
@@ -347,14 +378,19 @@ def run(config, workers):
     previous_handlers = {
         signum: signal.signal(signum, _raise_terminated) for signum in (signal.SIGTERM, signal.SIGINT)
     }
+    # An inherited SIG_IGN would have the kernel reap subjobs itself, and a
+    # failed afvs_run.py would then read as exit 0
+    previous_handlers[signal.SIGCHLD] = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
     try:
         kill_orphans()
+        afvs_local.RUN_STARTED.write_text(f"{time.time()}\n")
 
         workunits = get_workunits()
 
         todo = []
         skipped = 0
+        ignored_markers = 0
         for workunit_id, workunit in workunits.items():
             for subjob_id, subjob in workunit['subjobs'].items():
                 state, _ = afvs_local.subjob_state(config, workunit_id, subjob_id, subjob, alive=False)
@@ -362,7 +398,12 @@ def run(config, workers):
                     skipped += 1
                 else:
                     todo.append((workunit_id, subjob_id))
+                    if afvs_local.done_marker_path(config, workunit_id, subjob_id).exists():
+                        ignored_markers += 1
 
+        if ignored_markers:
+            print(f"{ignored_markers} .done markers ignored: they are for different work "
+                  "(another todo.all, receptor or box) or their outputs are incomplete", flush=True)
         print(f"{len(todo)} subjobs to run, {skipped} already done, {workers} at a time", flush=True)
 
         failed = run_subjobs(config, workunits, todo, workers)
