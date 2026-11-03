@@ -1,4 +1,5 @@
 import os
+import subprocess
 from typing import Dict, Tuple
 import logging
 
@@ -41,7 +42,10 @@ def format_ligand(ligand_path: str, file_format: str) -> str:
         logger.info(f'Converting ligand file format to {file_format} using obabel.')
         ligand_path_as_list[-1] = file_format
         result = ''.join(ligand_path_as_list)
-        os.system('obabel {} -O {}'.format(ligand_path, result))
+        try:
+            subprocess.run(['obabel', ligand_path, '-O', result])
+        except OSError as err:
+            logger.error(f'Could not run obabel: {err}')
         return result
         
     return ligand_path

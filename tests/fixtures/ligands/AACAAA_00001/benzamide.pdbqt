@@ -1,0 +1,21 @@
+REMARK    SMILES: NC(=O)c1ccccc1
+REMARK    * Heavy atom count: 9
+REMARK SMILES NC(=O)c1ccccc1
+REMARK SMILES IDX 1 1 2 2 3 3 4 6 5 7 9 8 6 9 8 10 7 11
+REMARK H PARENT 1 4 1 5
+ROOT
+ATOM      1  N   UNL     1       2.738  -0.480   0.172  1.00  0.00    -0.366 N 
+ATOM      2  C   UNL     1       1.879   0.495  -0.255  1.00  0.00     0.248 C 
+ATOM      3  O   UNL     1       2.304   1.514  -0.783  1.00  0.00    -0.270 OA
+ATOM      4  H   UNL     1       2.431  -1.429   0.328  1.00  0.00     0.159 HD
+ATOM      5  H   UNL     1       3.710  -0.342  -0.074  1.00  0.00     0.159 HD
+ENDROOT
+BRANCH   2   6
+ATOM      6  C   UNL     1       0.421   0.246  -0.092  1.00  0.00     0.039 A 
+ATOM      7  C   UNL     1      -0.080  -0.653   0.859  1.00  0.00     0.014 A 
+ATOM      8  C   UNL     1      -0.469   0.957  -0.908  1.00  0.00     0.014 A 
+ATOM      9  C   UNL     1      -1.458  -0.851   0.974  1.00  0.00     0.001 A 
+ATOM     10  C   UNL     1      -1.845   0.754  -0.790  1.00  0.00     0.001 A 
+ATOM     11  C   UNL     1      -2.338  -0.152   0.148  1.00  0.00     0.000 A 
+ENDBRANCH   2   6
+TORSDOF 1

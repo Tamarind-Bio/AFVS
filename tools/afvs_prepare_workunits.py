@@ -33,14 +33,13 @@ import tarfile
 import os
 import json
 import re
-import boto3
 import logging
 import sys
-from botocore.config import Config
 from pathlib import Path
 import shutil
 import pathlib
 import hashlib
+import afvs_local
 
 
 def parse_config(filename):
@@ -150,6 +149,22 @@ def publish_workunit(ctx, index, workunit_subjobs):
 
         return {'subjobs': compress_subjobs(ctx, workunit_subjobs), 'download_path': sharedfs_workunit_path.as_posix()}
 
+    elif(ctx['config']['job_storage_mode'] == "local"):
+
+        # Same place the S3 backend puts it: <job>/input/tasks/<index>.tar.gz
+        local_workunit_path = afvs_local.job_root(ctx['config']) / "input" / "tasks" / f"{index}.tar.gz"
+        local_workunit_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(f'{temp_dir_tar.name}/{index}.tar.gz', local_workunit_path)
+
+        temp_dir.cleanup()
+        temp_dir_tar.cleanup()
+
+        subjobs = compress_subjobs(ctx, workunit_subjobs)
+        for subjob_id, subjob in workunit_subjobs.items():
+            subjobs[subjob_id]['fingerprint'] = afvs_local.subjob_fingerprint(ctx['config'], subjob)
+
+        return {'subjobs': subjobs, 'download_path': local_workunit_path.as_posix()}
+
 
 def compress_subjobs(ctx, subjobs):
     new_subjobs = {}
@@ -175,7 +190,8 @@ def generate_subjob_init():
     return subjob_init
 
 
-def gen_s3_download_path(ctx, collection_name, collection_number):
+def gen_data_collection_key(ctx, collection_name, collection_number):
+    """Key of a collection tarball relative to object_store_data_collection_prefix."""
 
     # Two different structures (hash-based on meta-tranche based)
     if(ctx['config']['object_store_data_collection_addressing_mode'] == "hash"):
@@ -185,7 +201,6 @@ def gen_s3_download_path(ctx, collection_name, collection_number):
 
         if(ctx['config']['object_store_data_collection_identifier'] != ""):
             remote_dir = [
-                    ctx['config']['object_store_data_collection_prefix'],
                     hash_string[0:2],
                     hash_string[2:4],
                     ctx['config']['object_store_data_collection_identifier'],
@@ -194,7 +209,6 @@ def gen_s3_download_path(ctx, collection_name, collection_number):
                     ]
         else:
             remote_dir = [
-                    ctx['config']['object_store_data_collection_prefix'],
                     hash_string[0:2],
                     hash_string[2:4],
                     format_type,
@@ -202,8 +216,7 @@ def gen_s3_download_path(ctx, collection_name, collection_number):
                     ]
 
         # Remote path
-        object_name = "/".join(remote_dir) + f"/{int(collection_number):07}.tar.gz"
-        return object_name
+        return "/".join(remote_dir) + f"/{int(collection_number):07}.tar.gz"
 
     else:
 
@@ -212,14 +225,26 @@ def gen_s3_download_path(ctx, collection_name, collection_number):
         collection_name_dir = collection_name.replace("_", "/")
 
         object_path = [
-            ctx['config']['object_store_data_collection_prefix'],
             collection_mt,
             collection_name_dir,
             f"{collection_number}.tar.gz"
         ]
-        object_name = "/".join(object_path)
+        return "/".join(object_path)
 
-        return object_name
+
+def gen_s3_download_path(ctx, collection_name, collection_number):
+    return "/".join([
+        ctx['config']['object_store_data_collection_prefix'],
+        gen_data_collection_key(ctx, collection_name, collection_number)
+    ])
+
+
+def gen_local_data_path(ctx, collection_name, collection_number):
+    # local_data_root mirrors the S3 keys under object_store_data_collection_prefix
+    return "/".join([
+        ctx['config']['local_data_root'],
+        gen_data_collection_key(ctx, collection_name, collection_number)
+    ])
 
 
 def gen_sharedfs_path(ctx, collection_name, collection_number):
@@ -283,8 +308,11 @@ def add_collection_to_subjob(ctx, subjob, collection_key, collection_obj):
     elif(ctx['config']['data_storage_mode'] == "sharedfs"):
         subjob['collections'][collection_key]['sharedfs_path'] = gen_sharedfs_path(ctx, collection_name, collection_number)
 
+    elif(ctx['config']['data_storage_mode'] == "local"):
+        subjob['collections'][collection_key]['local_data_path'] = gen_local_data_path(ctx, collection_name, collection_number)
+
     else:
-        print(f"data_storage_mode must be either s3 or sharedfs (currently: {ctx['config']['data_storage_mode']})")
+        print(f"data_storage_mode must be either s3, sharedfs or local (currently: {ctx['config']['data_storage_mode']})")
         exit(1)
 
     subjob['collections'][collection_key]['dockings'] = dockings_per_ligand * collection_obj['count']
@@ -334,6 +362,8 @@ def process(ctx):
         max_array_job_size = int(config['slurm_array_job_size'])
     elif(config['batchsystem'] == "bash"):
         max_array_job_size = int(config['bash_array_job_size'])
+    elif(config['batchsystem'] == "local"):
+        max_array_job_size = int(config.get('local_array_job_size') or 100)
 
     for collection_key, collection_obj in collections.items():
 
@@ -422,10 +452,16 @@ def main():
 
     ctx = {}
     ctx['config'] = parse_config("../workflow/config.json")
-    aws_config = Config(
-        region_name=ctx['config']['aws_region']
-    )
-    ctx['s3'] = boto3.client('s3', config=aws_config)
+
+    # Local mode never touches S3 (and must not import boto3)
+    if(not afvs_local.is_local(ctx['config'])):
+        import boto3
+        from botocore.config import Config
+
+        aws_config = Config(
+            region_name=ctx['config']['aws_region']
+        )
+        ctx['s3'] = boto3.client('s3', config=aws_config)
 
     ctx['base_dir'] = pathlib.Path(__file__).parent.resolve()
 

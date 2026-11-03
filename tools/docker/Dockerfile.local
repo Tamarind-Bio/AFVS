@@ -1,0 +1,73 @@
+# Copyright (C) 2026 Tamarind Bio
+#
+# This file is part of AdaptiveFlow.
+#
+# AdaptiveFlow is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# AdaptiveFlow is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with AdaptiveFlow.  If not, see <https://www.gnu.org/licenses/>.
+
+# ---------------------------------------------------------------------------
+#
+# CPU-only image for running a whole screen in one container with the local
+# backend (batchsystem=local): AFVS, the bundled docking binaries, Open Babel,
+# and python with pandas/pyarrow plus torch/rdkit for active learning.
+#
+# It has no AWS SDK on purpose: the local paths never need it, and leaving it
+# out keeps them from reaching for S3. Build from tools/:
+#
+#   docker build --platform linux/amd64 -t afvs-local -f docker/Dockerfile.local .
+#
+# The bundled docking binaries in bin/ are x86-64, so the image is amd64.
+#
+# ---------------------------------------------------------------------------
+
+FROM --platform=linux/amd64 python:3.12.8-slim-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openbabel procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Verify obabel is available
+RUN obabel -V
+
+RUN pip install --no-cache-dir \
+        numpy==2.1.3 \
+        pandas==2.2.3 \
+        pyarrow==18.1.0 \
+        scipy==1.14.1 \
+        tqdm==4.67.1 \
+        jinja2==3.1.4 \
+        rdkit==2024.9.6 \
+    && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+
+# The AFVS tools (scripts, templates, docking binaries, vendored molpal)
+COPY . /opt/vf/tools
+RUN chmod +x /opt/vf/tools/*.py /opt/vf/tools/templates/*.py /opt/vf/tools/bin/* \
+    && rm -rf /opt/vf/tools/docker
+
+ENV AFVS_TOOLS_PATH=/opt/vf/tools/bin
+
+# Fail the build if the local paths or the active-learning stack cannot import
+RUN cd /opt/vf/tools \
+    && python -c "import afvs_local, afvs_run_local, pandas, pyarrow, torch, rdkit" \
+    && python afvs_al_controller.py --help > /dev/null \
+    && ! python -c "import boto3" 2> /dev/null
+
+# Matches the sealed pod's unprivileged tool container. The tools write their
+# workflow state beside themselves (templates/all.ctrl, ../workflow), so the
+# tree belongs to that user.
+RUN useradd --uid 1000 --create-home afvs \
+    && mkdir -p /opt/vf/workflow /opt/vf/input-files \
+    && chown -R 1000:1000 /opt/vf
+USER 1000
+
+WORKDIR /opt/vf/tools

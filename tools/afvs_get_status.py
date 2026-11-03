@@ -31,15 +31,12 @@
 
 import os
 import json
-import boto3
-import botocore
 import re
 import tempfile
 import gzip
 import time
 import pprint
 import hashlib
-from botocore.config import Config
 from pathlib import Path
 import argparse
 import gzip
@@ -49,10 +46,14 @@ from multiprocessing import Queue
 from queue import Empty
 import logging
 import shutil
+import afvs_local
 
 
 
 def downloader(download_queue, summary_queue, tmp_dir, config):
+    import boto3
+    import botocore
+    from botocore.config import Config
 
     temp_dir = tempfile.mkdtemp(prefix=tmp_dir)
 
@@ -107,6 +108,8 @@ def parse_config(filename):
 
 
 def process(config):
+    import boto3
+    from botocore.config import Config
 
     statuses = ['SUBMITTED','PENDING','RUNNABLE','STARTING','RUNNING','SUCCEEDED','FAILED']
 
@@ -547,11 +550,162 @@ def process(config):
 
 
 
+def process_local(config):
+    """Status of a batchsystem=local workflow, read from the subjob markers and
+    outputs under local_job_root. Prints the same report as the AWS Batch path
+    (the Tamarind wrapper parses it), and is safe to call at any time."""
+
+    statuses = ['SUBMITTED','PENDING','RUNNABLE','STARTING','RUNNING','SUCCEEDED','FAILED']
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--detailed', action='store_true',
+        help="Get detailed ligand information (this can take a long time!)")
+    parser.add_argument('--recovery', action='store_true',
+        help="Show only recovery jobs status")
+    args = parser.parse_args()
+
+    # Local recovery reruns failed subjobs in place, so the recovery view is
+    # the same subjobs, without the completed summary (as on AWS Batch)
+    is_recovery_mode = args.recovery
+
+    with open("../workflow/status.json", "r") as read_file:
+        complete = json.load(read_file)
+
+    status = complete['workunits']
+    vcpus_per_job = int(config['threads_to_use'])
+    alive = afvs_local.runner_alive()
+
+    print("Getting workunit status")
+
+    summary = {
+        'total_dockings' : 0,
+        'docking_succeeded' : 0,
+        'docking_failed' : 0,
+        'skipped_ligands' : 0,
+        'vcpu_seconds': 0,
+        'vcpu_seconds_interrupted': 0,
+        'failed_downloads': 0,
+        'failed_downloads_dockings': 0
+    }
+
+    overview_status = {}
+    for status_val in statuses:
+        overview_status[status_val] = {
+            'ligands': 0,
+            'workunits': 0,
+            'subjobs': 0
+        }
+
+    failed_downloads = []
+
+    for workunit_id, workunit in status.items():
+        subjob_states = []
+
+        for subjob_id, subjob in workunit['subjobs'].items():
+            subjob_status, marker = afvs_local.subjob_state(config, workunit_id, subjob_id, subjob, alive=alive)
+            subjob_states.append(subjob_status)
+
+            overview_status[subjob_status]['subjobs'] += 1
+            overview_status[subjob_status]['ligands'] += subjob['ligands_expected']
+
+            if marker is not None:
+                summary['vcpu_seconds_interrupted'] += float(marker.get('vcpu_seconds_interrupted', 0))
+
+            if subjob_status != afvs_local.SUCCEEDED:
+                continue
+
+            summary['vcpu_seconds'] += float(marker.get('vcpu_seconds', 0))
+
+            result = afvs_local.read_summary(config, workunit_id, subjob_id)
+            if result is None:
+                logging.error(f"Could not read the summary for {workunit_id}:{subjob_id}")
+                continue
+
+            summary['total_dockings'] += result['total_dockings']
+            summary['docking_succeeded'] += result['dockings_status']['success']
+            summary['docking_failed'] += result['dockings_status']['failed']
+            summary['skipped_ligands'] += result['skipped_ligands']
+            summary['failed_downloads'] += result['failed_downloads']
+            summary['failed_downloads_dockings'] += result['failed_downloads_dockings']
+
+            for log_item in result['failed_downloads_log']:
+                failed_downloads.append([str(workunit_id), str(subjob_id), log_item['base_collection_key'], str(log_item['dockings']), log_item['reason']  ])
+
+        if subjob_states:
+            overview_status[afvs_local.workunit_state(subjob_states)]['workunits'] += 1
+
+
+    # Rebuilt on every call (this path keeps no incremental state)
+
+    with open("../workflow/failed_downloads.csv", "w") as failed_downloads_out:
+        for failed_download in failed_downloads:
+            failed_downloads_out.write(",".join(failed_download))
+            failed_downloads_out.write("\n")
+
+
+    # output a nice summary
+
+    status_header = "Status"
+    workunits_header = "Workunits"
+    subjobs_header = "Subjobs"
+    ligands_header = "Dockings (est.)"
+
+    print(f"-----------------------------------------------------------------")
+    print("Local Progress")
+    print(f"-----------------------------------------------------------------")
+    print(f"")
+
+
+    print(f"Docking count is inaccurate for prescreens. Correct value will")
+    print(f"be in 'Completed Summary' when finished.")
+    print(f"")
+
+    print(f"{status_header:>15}   {workunits_header:^10}   {subjobs_header:^15}  {ligands_header:^15}")
+    for status_val in statuses:
+        print(f"{status_val:>15}   {overview_status[status_val]['workunits']:^10}   {overview_status[status_val]['subjobs']:^15}   {overview_status[status_val]['ligands']:^15}")
+
+
+    vcpu_hrs = summary['vcpu_seconds'] / 60 / 60
+    vcpu_hrs_interrupted = summary['vcpu_seconds_interrupted'] / 60 / 60
+
+    print(f"")
+    active_vcpus = (overview_status['RUNNING']['subjobs'] + overview_status['STARTING']['subjobs']) * vcpus_per_job
+    print(f"Active vCPUs: {active_vcpus}")
+
+
+    if not is_recovery_mode:
+        print(f"")
+        print(f"-----------------------------------------------------------------")
+        print("Completed Summary")
+        print(f"-----------------------------------------------------------------")
+        print(f"")
+        print(f"* Total Dockings  : {summary['total_dockings']}")
+        print(f"  - Succeeded     : {summary['docking_succeeded']}")
+        print(f"  - Failed        : {summary['docking_failed']}")
+        print(f"* Skipped ligands : {summary['skipped_ligands']}")
+        print(f"* Failed Downloads: {summary['failed_downloads']} (est. {summary['failed_downloads_dockings']} dockings)")
+        if(summary['failed_downloads'] != 0):
+            print(f"     (failed downloads are in '../workflow/failed_downloads.csv')")
+        print(f"")
+
+
+        if(summary['total_dockings'] != 0):
+            vcpu_sec = summary['vcpu_seconds'] / summary['total_dockings']
+            print(f"* vCPU seconds per docking: {vcpu_sec:0.2f}")
+        else:
+            print(f"* vCPU seconds per docking: N/A")
+        print(f"* vCPU hours total        : {vcpu_hrs:0.2f}")
+        print(f"* vCPU hours interrupted  : {vcpu_hrs_interrupted:0.2f}")
+        print(f"")
+
+
 def main():
 
     config = parse_config("../workflow/config.json")
 
-    if(config['job_storage_mode'] == "s3" and config['batchsystem'] == "awsbatch"):
+    if(afvs_local.is_local(config)):
+        process_local(config)
+    elif(config['job_storage_mode'] == "s3" and config['batchsystem'] == "awsbatch"):
         with tempfile.TemporaryDirectory(prefix=os.path.join(config['tempdir_default'], '')) as temp_dir:
             config['temp_dir'] = temp_dir
             process(config)

@@ -26,15 +26,13 @@
 
 import os
 import json
-import boto3
-import botocore
 import argparse
 import sys
 import tempfile
 import tarfile
 import shutil
 from pathlib import Path
-from botocore.config import Config
+import afvs_local
 
 MAX_LIGANDS_ON_DEMAND = 100000 # This will be about 100 subjobs
 
@@ -216,6 +214,8 @@ def submit_recovery_job(ctx, recovery_workunit, recovery_id, queue_name=None):
     """
     Submit recovery workunit to AWS Batch (optionally to a specific queue)
     """
+    import botocore
+
     config = ctx['config']
     client = ctx['batch']
 
@@ -313,6 +313,49 @@ def submit_recovery_job(ctx, recovery_workunit, recovery_id, queue_name=None):
         raise
 
 
+def recover_local(args, config):
+    """batchsystem=local: rerun the failed subjobs in place, on this machine.
+    --queue has no meaning here and is ignored."""
+    import afvs_run_local
+
+    with open(args.status_file, "r") as read_file:
+        workunits = json.load(read_file)['workunits']
+
+    print("Analyzing local subjob markers for failed subjobs...")
+
+    alive = afvs_local.runner_alive()
+    failed_subjobs = []
+    for workunit_id, workunit in workunits.items():
+        for subjob_id, subjob in workunit['subjobs'].items():
+            state, _ = afvs_local.subjob_state(config, workunit_id, subjob_id, subjob, alive=alive)
+            if state == afvs_local.FAILED:
+                failed_subjobs.append((workunit_id, subjob_id, subjob))
+
+    if not failed_subjobs:
+        print("No failed subjobs found!")
+        return 0
+
+    print(f"\nFound {len(failed_subjobs)} failed subjobs:")
+    print(f"{'Workunit ID':<15} {'Subjob ID':<12} {'Expected Ligands':<20}")
+    print("-" * 80)
+
+    total_expected_ligands = 0
+    for workunit_id, subjob_id, subjob in failed_subjobs:
+        expected = subjob.get('ligands_expected', 0)
+        total_expected_ligands += expected
+        print(f"{workunit_id:<15} {subjob_id:<12} {expected:<20}")
+
+    print(f"\nTotal expected ligands in failed subjobs: {total_expected_ligands:,}")
+
+    if args.report_only:
+        print("\n[Report-only mode: No resubmission performed]")
+        return 0
+
+    workers = int(config.get('local_workers') or 1)
+    print(f"\nRerunning failed subjobs locally ({workers} at a time)...")
+    return afvs_run_local.run(config, workers, select={afvs_local.FAILED})
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Identify and resubmit failed subjobs from AFVS workflow'
@@ -347,6 +390,12 @@ def main():
 
     # Parse configuration
     config = parse_config(args.config_file)
+
+    if afvs_local.is_local(config):
+        return recover_local(args, config)
+
+    import boto3
+    from botocore.config import Config
 
     # Initialize AWS clients (needed to download workunit tarballs)
     aws_config = Config(region_name=config['aws_region'])

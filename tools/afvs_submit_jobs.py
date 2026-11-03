@@ -27,13 +27,10 @@
 
 import os
 import json
-import boto3
-import botocore
 import re
 import argparse
 import sys
 import time
-from botocore.config import Config
 from pathlib import Path
 import shutil
 import jinja2
@@ -175,6 +172,7 @@ def submit_slurm(config, client, current_workunit, jobline):
 
 
 def submit_aws_batch(config, client, current_workunit, jobline):
+    import botocore
 
     jobline_str = str(jobline)
 
@@ -271,6 +269,8 @@ def submit_aws_batch(config, client, current_workunit, jobline):
     time.sleep(0.1)
 
 def process(config, start, stop):
+    import boto3
+    from botocore.config import Config
 
     aws_config = Config(
         region_name=config['aws_region']
@@ -345,6 +345,11 @@ def main():
         sys.exit()
 
     config = parse_config("../workflow/config.json")
+
+    if config['batchsystem'] == "local":
+        print('batchsystem=local has no submission step: run ./afvs_run_local.py to run the workunits')
+        sys.exit(2)
+
     process(config, int(sys.argv[1]), int(sys.argv[2]))
 
 

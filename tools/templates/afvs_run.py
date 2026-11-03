@@ -36,17 +36,14 @@ import gzip
 import os
 import json
 import re
-import boto3
 import multiprocessing
 import subprocess
-import botocore
 import logging
 import time
 import shutil
 import hashlib
 import pandas as pd
 from pathlib import Path
-from botocore.config import Config
 from statistics import mean
 from multiprocessing import Process
 from multiprocessing import Queue
@@ -60,6 +57,31 @@ import urllib.request
 import urllib.error
 
 logger = logging.getLogger(__name__)
+
+
+# boto3 is imported only by the S3 code paths, so local mode (job_storage_mode=local)
+# runs without it and without any network access.
+def s3_client(**config_args):
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client('s3', config=Config(**config_args))
+
+
+def s3_client_error():
+    import botocore.exceptions
+
+    return botocore.exceptions.ClientError
+
+
+def run_obabel(args):
+    """Run obabel with an argv list (no shell). Returns its exit status, or 127 if
+    obabel is not installed, matching what os.system reported before."""
+    try:
+        return subprocess.run(["obabel", *args]).returncode
+    except OSError as err:
+        logger.error(f"Could not run obabel: {err}")
+        return 127
 
 # Progress tracking for Tamarind integration
 _last_progress_update = 0
@@ -110,22 +132,15 @@ def format_ligand(ligand_path: str, file_format: str) -> str:
         logger.info(f'Converting ligand file format to {file_format} using obabel.')
         ligand_path_as_list[-1] = file_format
         result = ''.join(ligand_path_as_list)
-        os.system('obabel {} -O {}'.format(ligand_path, result))
+        run_obabel([ligand_path, '-O', result])
         return result
         
     return ligand_path
 
 def downloader(download_queue, unpack_queue, summary_queue, tmp_dir):
 
-
-    botoconfig = Config(
-       retries = {
-          'max_attempts': 25,
-          'mode': 'standard'
-       }
-    )
-
-    s3 = boto3.client('s3', config=botoconfig)
+    # Created on the first S3 collection, so local runs never import boto3
+    s3 = None
 
 
     while True:
@@ -147,10 +162,16 @@ def downloader(download_queue, unpack_queue, summary_queue, tmp_dir):
             remote_path = item['collection']['s3_download_path']
             job_bucket = item['collection']['s3_bucket']
 
+            if s3 is None:
+                s3 = s3_client(retries = {
+                    'max_attempts': 25,
+                    'mode': 'standard'
+                })
+
             try:
                 with open(item['local_path'], 'wb') as f:
                     s3.download_fileobj(job_bucket, remote_path, f)
-            except botocore.exceptions.ClientError as error:
+            except s3_client_error() as error:
                     reason = f"Failed to download from S3 {job_bucket}/{remote_path} to {item['local_path']}: ({error})"
                     logging.error(reason)
 
@@ -169,6 +190,26 @@ def downloader(download_queue, unpack_queue, summary_queue, tmp_dir):
 
         elif('sharedfs_path' in item['collection']):
             shutil.copyfile(Path(item['collection']['sharedfs_path']), item['local_path'])
+
+        elif('local_data_path' in item['collection']):
+            # Local mode: the orchestrator staged the collections under local_data_root.
+            # A missing one is a failed download, exactly as a missing S3 object is.
+            try:
+                shutil.copyfile(Path(item['collection']['local_data_path']), item['local_path'])
+            except OSError as error:
+                reason = f"Failed to read {item['collection']['local_data_path']} to {item['local_path']}: ({error})"
+                logging.error(reason)
+
+                summary_item = {
+                    'type': "download_failed",
+                    'log': {
+                        'base_collection_key': item['collection_key'],
+                        'reason': reason,
+                        'dockings': item['collection']['dockings']
+                    }
+                }
+                summary_queue.put(summary_item)
+                continue
 
 
         # Move it to the next step if there's space
@@ -853,6 +894,13 @@ def generate_tarfile(dir, tarname):
 
 def generate_output_path(ctx, scenario_key, content_type, extension):
 
+    # Local mode mirrors the S3 layout under <local_job_root>/<job_name>/
+    if(ctx['main_config']['job_storage_mode'] == "local"):
+        job_root = f"{ctx['main_config']['local_job_root']}/{ctx['main_config']['job_name']}"
+        if scenario_key != None:
+            return f"{job_root}/{scenario_key}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
+        else:
+            return f"{job_root}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
 
     if scenario_key != None:
         if(ctx['main_config']['job_storage_mode'] == "s3"):
@@ -881,7 +929,7 @@ def generate_output_archives(ctx, upload_queue, scenario_directories):
         uploader_item = {
             'storage_type': ctx['main_config']['job_storage_mode'],
             'remote_path' : generate_output_path(ctx, scenario_key, "logs", "tar.gz"),
-            's3_bucket' : ctx['main_config']['object_store_job_bucket'],
+            's3_bucket' : ctx['main_config'].get('object_store_job_bucket'),
             'local_path': tar_name,
             'temp_dir': upload_tmp_dir
         }
@@ -900,7 +948,7 @@ def generate_overview_file(ctx, overview_data, upload_queue):
     uploader_item = {
         'storage_type': ctx['main_config']['job_storage_mode'],
         'remote_path' : generate_output_path(ctx, None, "summary", "json.gz"),
-        's3_bucket': ctx['main_config']['object_store_job_bucket'],
+        's3_bucket': ctx['main_config'].get('object_store_job_bucket'),
         'local_path': overview_json_location,
         'temp_dir': upload_tmp_dir
     }
@@ -958,7 +1006,7 @@ def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
             uploader_item = {
                 'storage_type': ctx['main_config']['job_storage_mode'],
                 'remote_path' : generate_output_path(ctx, scenario_key, "parquet", "parquet"),
-                's3_bucket': ctx['main_config']['object_store_job_bucket'],
+                's3_bucket': ctx['main_config'].get('object_store_job_bucket'),
                 'local_path': f"{upload_tmp_dir}/summary.parquet",
                 'temp_dir': upload_tmp_dir
             }
@@ -990,7 +1038,7 @@ def generate_summary_file(ctx, summary_data, upload_queue, tmp_dir):
             uploader_item_csv = {
                 'storage_type': ctx['main_config']['job_storage_mode'],
                 'remote_path' : generate_output_path(ctx, scenario_key, "csv", "csv.gz"),
-                's3_bucket': ctx['main_config']['object_store_job_bucket'],
+                's3_bucket': ctx['main_config'].get('object_store_job_bucket'),
                 'local_path': f"{upload_tmp_dir}/summary.txt.gz",
                 'temp_dir': upload_tmp_dir
             }
@@ -1002,14 +1050,8 @@ def upload_process(ctx, upload_queue):
 
     print('Uploader: Running', flush=True)
 
-    botoconfig = Config(
-       retries = {
-          'max_attempts': 25,
-          'mode': 'standard'
-       }
-    )
-
-    s3 = boto3.client('s3', config=botoconfig)
+    # Created on the first S3 upload, so local runs never import boto3
+    s3 = None
 
     while True:
         try:
@@ -1028,12 +1070,27 @@ def upload_process(ctx, upload_queue):
         # Basically.. if s3 then use boto3
 
         if(item['storage_type'] == "s3"):
+            if s3 is None:
+                s3 = s3_client(retries = {
+                    'max_attempts': 25,
+                    'mode': 'standard'
+                })
+
             try:
                 print(f"Uploading to {item['remote_path']}")
                 response = s3.upload_file(item['local_path'], item['s3_bucket'], item['remote_path'])
-            except botocore.exceptions.ClientError as e:
+            except s3_client_error() as e:
                 logging.error(e)
                 raise
+
+        elif(item['storage_type'] == "local"):
+            # Copy then rename, so a reader never sees a half-written output
+            parent_directory = Path(Path(item['remote_path']).parent)
+            parent_directory.mkdir(parents=True, exist_ok=True)
+
+            partial_path = f"{item['remote_path']}.partial"
+            shutil.copyfile(item['local_path'], partial_path)
+            os.replace(partial_path, item['remote_path'])
 
         else:
             # if sharedfs.. .then just do a copy
@@ -1104,7 +1161,7 @@ def get_workunit_from_s3(ctx, workunit_id, subjob_id, job_bucket, job_object, do
     try:
         with open(download_to_workunit_file, 'wb') as f:
             ctx['s3'].download_fileobj(job_bucket, job_object, f)
-    except botocore.exceptions.ClientError as error:
+    except s3_client_error() as error:
         logging.error(
             f"Failed to download from S3 {job_bucket}/{job_object} to {download_to_workunit_file}, ({error})")
         sys.exit(1)
@@ -1249,7 +1306,7 @@ def docking_start_MpSDockZN(task):
         f.writelines(['$DOCK6/bin/grid -i {} \n'.format(config_['grid_in'])])
         f.writelines(['./executables/MpSDock -i {} \n'.format(config_['dock_in'])])
         
-    os.system('chmod 0700 {}'.format(task['MpSDockZN_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['MpSDockZN_tmp_file'], 0o700) # Assign execution permisions on script
     cmd = ['./{}'.format(task['MpSDockZN_tmp_file'])]
         
     return cmd
@@ -1298,7 +1355,7 @@ def docking_start_SEED(task):
         f.writelines(["\t\t-out:suffix out\n"])
         f.writelines(['{}/seed4 {} > log'.format(task['tools_path'], config_['seed_inp_file'])])
         
-    os.system('chmod 0700 {}'.format(task['seed_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['seed_tmp_file'], 0o700) # Assign execution permisions on script
     cmd = ['./{}'.format(task['seed_tmp_file'])]
         
     return cmd
@@ -1334,7 +1391,7 @@ def docking_start_HDock(task):
         f.writelines(['{}/hdock {} {} -out Hdock.out'.format(task['tools_path'], config_['receptor'], task['lig_path'])])
         f.writelines(['{}/createpl Hdock.out top100.pdb -nmax 1 -complex -models'.format(task['tools_path']) ])
         
-    os.system('chmod 0700 {}'.format(task['HDock_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['HDock_tmp_file'], 0o700) # Assign execution permisions on script
     cmd = ['./{}'.format(task['HDock_tmp_file'])]
         
     return cmd
@@ -1435,7 +1492,11 @@ def docking_finish_dock6(item, ret):
     try:
         dock_file = [x for x in os.listdir(item['tmp_run_dir']) if 'ligand_out' in x]
         dock_file = [x for x in dock_file if 'mol2' in x][0]
-        os.system('cp {} {}'.format(dock_file, item['output_dir']))
+        try:
+            shutil.copy(dock_file, item['output_dir'])
+        except OSError as err:
+            # cp's failure never stopped the score parse below
+            logging.error(f"Could not copy {dock_file}: {err}")
 
         # Save the results:
         with open('./ligand_out_scored.mol2', 'r') as f:
@@ -1478,7 +1539,7 @@ def docking_start_rosetta_ligand(task):
         f.writelines(["\t\t-out:suffix out\n"])
         
 
-    os.system('chmod 0700 {}'.format(task['rosetta_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['rosetta_tmp_file'], 0o700) # Assign execution permisions on script
     cmd = ['./{}'.format(task['rosetta_tmp_file'])]
         
     return cmd
@@ -1537,7 +1598,7 @@ def docking_start_Molegro(task):
         f.writelines('cat {} {} > ligands.mol2\n'.format(config_['ref_ligand'], task['ligand_path']))
         f.writelines('$Molegro/bin/mvd docking.mvdscript -nogui\n')
 
-    os.system('chmod 0700 {}'.format(task['molegro_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['molegro_tmp_file'], 0o700) # Assign execution permisions on script
     cmd = ['./{}'.format(task['molegro_tmp_file'])]
         
     return cmd
@@ -1664,7 +1725,7 @@ def docking_start_LightDock(task):
         f.writelines('{}/bin/lightdock3.py setup.json 100 -c 1 -l 0\n')
         f.writelines('{}/bin/lgd_generate_conformations.py {} {} swarm_0/gso_100.out {}\n'.format(config_['lightdock_path'], config_['receptor'], task['ligand_path'], config_['exhaustiveness']))
 
-    os.system('chmod 0700 {}'.format(task['lightdock_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['lightdock_tmp_file'], 0o700) # Assign execution permisions on script
     
     cmd = ['./{}'.format(task['lightdock_tmp_file'])]
     
@@ -2951,7 +3012,8 @@ def convert_pose_to_sdf(output_path, input_format=None):
         sdf_path = output_path + '.sdf'
         try:
             # Use explicit input format flag for obabel
-            result = os.system(f'obabel -i{obabel_fmt} {output_path} -O {sdf_path} 2>/dev/null')
+            result = subprocess.run(['obabel', f'-i{obabel_fmt}', output_path, '-O', sdf_path],
+                                    stderr=subprocess.DEVNULL).returncode
             if result == 0 and os.path.exists(sdf_path) and os.path.getsize(sdf_path) > 0:
                 os.remove(output_path)  # Remove original to save space
                 logging.info(f"Successfully converted {output_path} to SDF")
@@ -2995,7 +3057,7 @@ def convert_ligand_format(ligand_, new_format):
             >>> convert_ligand_format('./ligands/ligand1.mol2', 'pdbqt')
     """
     input_format = ligand_.split('.')[-1]
-    os.system('obabel {} -O {}'.format(ligand_, ligand_.replace(input_format, new_format)))
+    run_obabel([ligand_, '-O', ligand_.replace(input_format, new_format)])
 
     
 ## nnscore2.0
@@ -3020,7 +3082,7 @@ def scoring_start_nnscore2(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('export VINA_EXEC={}; python {}/NNScore2.py -receptor {} -ligand {} -vina_executable $VINA_EXEC > output.txt'.format(vina_loc, task['tools_path'], config_['receptor'], task['output_path']))
     
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3071,7 +3133,7 @@ def _scoring_start_gold(task, scoring_function: str):
     with open(run_sh_script, 'w') as f:
         f.writelines(f'{gold_loc} {input_conf}')
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
 
     return cmd 
@@ -3136,7 +3198,7 @@ def scoring_start_rf(task):
         f.writelines('{} --receptor {} {} -O {}/ligands_rescored.pdbqt'.format(rf_score_vs_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
         f.writelines('{} --receptor {} {} -ocsv > {}/temp.csv'.format(rf_score_vs_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3177,7 +3239,7 @@ def scoring_start_smina(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('{} --receptor {} -l {} --score_only > {}/output.txt'.format(smina_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3216,7 +3278,7 @@ def scoring_start_gnina(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('{} --receptor {} -l {} --score_only > {}/output.txt'.format(smina_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3254,7 +3316,7 @@ def scoring_start_ad4(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('{} --receptor {} -l {} --score_only --scoring ad4_scoring > {}/output.txt'.format(smina_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3293,7 +3355,7 @@ def scoring_start_vinardo(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('{} --receptor {} -l {} --score_only --scoring vinardo > {}/output.txt'.format(smina_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3331,7 +3393,7 @@ def scoring_start_vina(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('{} --receptor {} -l {} --score_only --scoring vina > {}/output.txt'.format(smina_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3373,7 +3435,7 @@ def scoring_start_PLANTS_chemplp(task):
         f.writelines('protein_file             {}\n'.format(config_['receptor']))
         f.writelines('ligand_file              {}\n'.format(task['output_path']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3415,7 +3477,7 @@ def scoring_start_PLANTS_plp(task):
         f.writelines('protein_file             {}\n'.format(config_['receptor']))
         f.writelines('ligand_file              {}\n'.format(task['output_path']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3457,7 +3519,7 @@ def scoring_start_PLANTS_plp95(task):
         f.writelines('protein_file             {}\n'.format(config_['receptor']))
         f.writelines('ligand_file              {}\n'.format(task['output_path']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3589,7 +3651,7 @@ def scoring_start_dock6_contact_score(task):
             f.writelines(['num_scored_conformers                                        1\n'])
             f.writelines(['rank_ligands                                                 no\n'])
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
 
     cmd = ['./{}'.format(run_sh_script)] 
     
@@ -3677,7 +3739,7 @@ def scoring_start_dock6_continuous_score(task):
         f.writelines(['num_scored_conformers                                        1\n'])
         f.writelines(['rank_ligands                                                 no\n'])
     
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
 
     cmd = ['./{}'.format(run_sh_script)]
             
@@ -3717,7 +3779,7 @@ def scoring_start_mm_gbsa(task):
         # Running MMPBSA.py
         f.writelines('MMPBSA.py -O -i {}/gbsa.in -cp complex.prmtop -rp receptor.prmtop -lp ligand.prmtop -y  min.rst\n'.format(task['tools_path']))
 
-    os.system(f'chmod 0700 {run_sh_script}')
+    os.chmod(run_sh_script, 0o700)
 
     cmd = [f'./{run_sh_script}']
 
@@ -3756,7 +3818,7 @@ def scoring_start_hawkins_gbsa(task):
         f.writelines(['$DOCK6/bin/nchemgrid_SA\n'])
         f.writelines(['$DOCK6/bin/dock6 -i Hawkins_GBSA_Score.in\n'])
 
-    os.system(f'chmod 0700 {run_sh_script}')  
+    os.chmod(run_sh_script, 0o700)  
 
     # Create INSPH File: 
     insph_path = os.path.join(task['tmp_run_dir'], "INSPH")
@@ -4176,24 +4238,22 @@ def setup_job_storage_mode(ctx):
 
     if(ctx['job_storage_mode'] == "s3"):
 
-        botoconfig = Config(
+        ctx['job_object'] = os.getenv('AFVS_CONFIG_JOB_OBJECT')
+        ctx['job_bucket'] = os.getenv('AFVS_CONFIG_JOB_BUCKET')
+
+        # Get the config information
+        ctx['s3'] = s3_client(
            region_name = os.getenv('AFVS_AWS_REGION'),
            retries = {
               'max_attempts': 50,
               'mode': 'standard'
            }
         )
-
-        ctx['job_object'] = os.getenv('AFVS_CONFIG_JOB_OBJECT')
-        ctx['job_bucket'] = os.getenv('AFVS_CONFIG_JOB_BUCKET')
-
-        # Get the config information
-        ctx['s3'] = boto3.client('s3', config=botoconfig)
     
-    elif(ctx['job_storage_mode'] == "sharedfs"):
+    elif(ctx['job_storage_mode'] == "sharedfs" or ctx['job_storage_mode'] == "local"):
         ctx['job_tar'] = os.getenv('AFVS_CONFIG_JOB_TGZ')
     else:
-        raise RuntimeError(f"Invalid jobstoragemode of {ctx['job_storage_mode']}. AFVS_JOB_STORAGE_MODE must be 's3' or 'sharedfs' ")
+        raise RuntimeError(f"Invalid jobstoragemode of {ctx['job_storage_mode']}. AFVS_JOB_STORAGE_MODE must be 's3', 'sharedfs' or 'local' ")
 
 
 def get_subjob_config(ctx, workunit_id, subjob_id):
@@ -4201,11 +4261,11 @@ def get_subjob_config(ctx, workunit_id, subjob_id):
     if(ctx['job_storage_mode'] == "s3"):
         get_workunit_from_s3(ctx, workunit_id, subjob_id, 
             ctx['job_bucket'], ctx['job_object'], ctx['temp_dir'])
-    elif(ctx['job_storage_mode'] == "sharedfs"):
+    elif(ctx['job_storage_mode'] == "sharedfs" or ctx['job_storage_mode'] == "local"):
         get_workunit_from_sharedfs(ctx, workunit_id, subjob_id,
             ctx['job_tar'], ctx['temp_dir'])
     else:
-        raise RuntimeError(f"Invalid jobstoragemode of {ctx['job_storage_mode']}. AFVS_JOB_STORAGE_MODE must be 's3' or 'sharedfs' ")
+        raise RuntimeError(f"Invalid jobstoragemode of {ctx['job_storage_mode']}. AFVS_JOB_STORAGE_MODE must be 's3', 'sharedfs' or 'local' ")
 
 
 

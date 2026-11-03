@@ -148,9 +148,13 @@ def check_parameters(config):
         config['object_store_job_addressing_mode'] = config['job_addressing_mode']
 
 
-    if(empty_value(config, 'job_storage_mode') or (config['job_storage_mode'] != "s3" and config['job_storage_mode'] != "sharedfs")):
-        print("* 'job_storage_mode' must be set to 's3' or 'sharedfs'")
+    if(empty_value(config, 'job_storage_mode') or config['job_storage_mode'] not in ("s3", "sharedfs", "local")):
+        print("* 'job_storage_mode' must be set to 's3', 'sharedfs' or 'local'")
         error = 1
+    elif(config['job_storage_mode'] == "local"):
+        if(empty_value(config, 'local_job_root')):
+            print("* 'local_job_root' must be set if job_storage_mode is 'local'")
+            error = 1
     else:
         if(config['job_storage_mode'] == "s3"):
             if(empty_value(config, 'object_store_job_bucket')):
@@ -162,9 +166,13 @@ def check_parameters(config):
             else:
                 config['object_store_job_prefix'].rstrip("/")
 
-    if(empty_value(config, 'data_storage_mode') or (config['data_storage_mode'] != "s3" and config['data_storage_mode'] != "sharedfs")):
+    if(empty_value(config, 'data_storage_mode') or config['data_storage_mode'] not in ("s3", "sharedfs", "local")):
         print("* 'job_storage_mode' must be set to 's3' or 'sharedfs'")
         error = 1
+    elif(config['data_storage_mode'] == "local"):
+        if(empty_value(config, 'local_data_root')):
+            print("* 'local_data_root' must be set if data_storage_mode is 'local'")
+            error = 1
     else:
         if(config['job_storage_mode'] == "s3"):
             if(empty_value(config, 'object_store_data_bucket')):
@@ -217,6 +225,14 @@ def check_parameters(config):
             if(empty_value(config, 'bash_template')):
                 print("* 'bash_template' must be set if batchsystem is 'bash'")
                 error = 1
+        elif(config['batchsystem'] == "local"):
+            if(config.get('job_storage_mode') != "local" or config.get('data_storage_mode') != "local"):
+                print("* batchsystem 'local' requires job_storage_mode=local and data_storage_mode=local")
+                error = 1
+            for local_key in ('local_workers', 'local_array_job_size'):
+                if(not empty_value(config, local_key) and not re.search(r'^[1-9][0-9]*$', config[local_key])):
+                    print(f"* '{local_key}' must be a positive integer")
+                    error = 1
         else:
             print(f"* batchsystem '{config['batchsystem']}' is not supported. Only awsbatch and slurm are supported")
 
@@ -250,7 +266,8 @@ def check_parameters(config):
         print("* 'summary_formats' must be set")
         error = 1
 
-    config['object_store_job_prefix_full'] = f"{config['object_store_job_prefix']}/{config['job_letter']}"
+    if('object_store_job_prefix' in config or config.get('job_storage_mode') != "local"):
+        config['object_store_job_prefix_full'] = f"{config['object_store_job_prefix']}/{config['job_letter']}"
 
     if(empty_value(config, 'prescreen_mode')):
         config['prescreen_mode'] = 0
@@ -325,6 +342,12 @@ then re-run afvs_prepare_folders.py --skip_errors (Not recommended!)
         config['sharedfs_workunit_path'] = workunits_path.resolve().as_posix()
         config['sharedfs_workflow_path'] = workflow_dir.resolve().as_posix()
         config['sharedfs_collection_path'] = Path(config['collection_folder']).resolve().as_posix()
+
+    if(config['job_storage_mode'] == "local"):
+        # Resolve now: afvs_run.py changes directory before it writes outputs
+        config['local_job_root'] = Path(config['local_job_root']).resolve().as_posix()
+    if(config['data_storage_mode'] == "local"):
+        config['local_data_root'] = Path(config['local_data_root']).resolve().as_posix()
      
 
     with open(workflow_config, "w") as json_out:

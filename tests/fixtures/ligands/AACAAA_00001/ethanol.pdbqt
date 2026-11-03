@@ -1,0 +1,14 @@
+REMARK    SMILES: CCO
+REMARK    * Heavy atom count: 3
+REMARK SMILES CCO
+REMARK SMILES IDX 1 1 2 2 3 3
+REMARK H PARENT 3 4
+ROOT
+ATOM      1  C   UNL     1      -0.863   0.220   0.203  1.00  0.00     0.034 C 
+ATOM      2  C   UNL     1       0.406  -0.375  -0.370  1.00  0.00     0.152 C 
+ENDROOT
+BRANCH   2   3
+ATOM      3  O   UNL     1       1.527   0.404   0.022  1.00  0.00    -0.397 OA
+ATOM      4  H   UNL     1       1.561   0.400   0.994  1.00  0.00     0.210 HD
+ENDBRANCH   2   3
+TORSDOF 1
