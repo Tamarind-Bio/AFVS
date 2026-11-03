@@ -26,6 +26,7 @@
 
 import os
 import json
+import time
 import argparse
 import sys
 import tempfile
@@ -325,9 +326,11 @@ def recover_local(args, config):
         return 2
 
     if afvs_local.runner_alive():
-        # Not finished yet: the running afvs_run_local.py will get to them
-        print("afvs_run_local.py is still running this workflow; nothing to recover yet")
-        return 0
+        # A running afvs_run_local.py does not retry what already failed in it,
+        # so wait for it to finish, then recover whatever it left
+        print("afvs_run_local.py is still running this workflow; waiting for it to finish...", flush=True)
+        while afvs_local.runner_alive():
+            time.sleep(5)
 
     with open(args.status_file, "r") as read_file:
         workunits = json.load(read_file)['workunits']

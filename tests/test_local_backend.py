@@ -145,6 +145,8 @@ def test_prepare_rejects_mixed_local_configs(screen, old, new, message):
     (lambda text: text.replace("../input-files/receptors/receptor.pdb", "receptors/receptor.pdb"), None),
     # An absolute receptor (e.g. under /app/inputs) is hashed where it is
     ("absolute", None),
+    # PLANTS-style "key value" lines prepare fine (their files are hashed)
+    (lambda text: text + "protein_file ../input-files/receptors/receptor.pdb\nbindingsite_radius 9\n", None),
     (lambda text: text.replace("../input-files/receptors/receptor.pdb", "/nonexistent/receptor.pdb"),
      "receptor = /nonexistent/receptor.pdb does not name a file"),
 ])
@@ -293,12 +295,11 @@ def test_resume_after_sigterm_skips_done_subjobs(screen):
     wait_for(running_marker.exists)
     child_pgid = json.loads(running_marker.read_text())['pid']
 
-    # Mid-run: the wrapper sees it as in progress, and recovery has nothing to do yet
+    # Mid-run: the wrapper sees it as in progress
     parsed = status(screen)
     assert parsed['complete'] == "0"
     assert parsed['succeeded'] == "1"
     assert parsed['running'] == "1"
-    assert "still running" in screen.run("afvs_recover_failed_subjobs.py", "--queue", "vf-queue-ondemand").stdout
 
     runner.send_signal(signal.SIGTERM)
     assert runner.wait(timeout=60) == 128 + signal.SIGTERM
@@ -405,6 +406,9 @@ def test_resume_across_a_fresh_prepare(screen):
     ("box", "2 subjobs to run, 0 already done"),
     ("receptor", "2 subjobs to run, 0 already done"),
     ("setting", "2 subjobs to run, 0 already done"),
+    # A PLANTS-style config line, and a file in the scenario folder that a config refers to
+    ("plants_line", "2 subjobs to run, 0 already done"),
+    ("scenario_file", "2 subjobs to run, 0 already done"),
     # A restaged tree that differs only in ways docking ignores still resumes
     ("config_formatting", "0 subjobs to run, 2 already done"),
     ("stray_file", "0 subjobs to run, 2 already done"),
@@ -412,6 +416,11 @@ def test_resume_across_a_fresh_prepare(screen):
 def test_done_markers_follow_the_work_they_describe(screen, change, expect):
     screen.prepare()
     screen.run("afvs_run_local.py")
+
+    # An output of a scenario this job no longer runs
+    stale = screen.job_dir / "vina" / "parquet" / "2" / "0.parquet"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("from an earlier run with another scenario")
 
     inputs = screen.tree / "input-files"
     box = inputs / "qvina02" / "config.txt"
@@ -426,6 +435,10 @@ def test_done_markers_follow_the_work_they_describe(screen, change, expect):
     elif change == "setting":
         ctrl = screen.tools / "templates" / "all.ctrl"
         ctrl.write_text(ctrl.read_text().replace("run_atom_check=1", "run_atom_check=0"))
+    elif change == "plants_line":
+        box.write_text(box.read_text() + "bindingsite_radius 9\n")
+    elif change == "scenario_file":
+        (inputs / "qvina02" / "grid.prm").write_text("RECEPTOR_FILE receptor.mol2\n")
     elif change == "config_formatting":
         box.write_text("# restaged\n" + "".join(f"{line.replace(' = ', '=')}   # x\n"
                                                 for line in reversed(box.read_text().splitlines())))
@@ -438,6 +451,7 @@ def test_done_markers_follow_the_work_they_describe(screen, change, expect):
     rerun = not expect.startswith("0 ")
     assert (".done markers ignored" in out) == rerun
     assert status(screen)['complete'] == "1"
+    assert not stale.exists()
 
 
 @pytest.mark.parametrize("output", [
@@ -513,9 +527,15 @@ def test_kill_orphans_spares_a_reused_pid(tmp_path, monkeypatch):
             (tmp_path / "1" / f"{name}.running").write_text(json.dumps({
                 'pid': process.pid, 'start_time': start_time + 1 if recorded == "wrong" else start_time}))
 
-        afvs_run_local.kill_orphans()
+        assert afvs_run_local.kill_orphans() is True
         assert processes[1].wait(timeout=30) == -signal.SIGKILL
         assert processes[0].poll() is None
+
+        # A group that will not go away (stuck in I/O) stops the run from starting
+        (tmp_path / "1" / "1.running").unlink()
+        (tmp_path / "1" / "0.running").write_text(json.dumps({'pid': processes[0].pid}))
+        monkeypatch.setattr(afvs_run_local, "wait_for_process_group", lambda pgid, timeout: False)
+        assert afvs_run_local.kill_orphans() is False
     finally:
         for process in processes:
             process.kill()
@@ -585,6 +605,27 @@ def ps_lines():
         except OSError:
             pass
     return lines
+
+
+def test_recover_waits_for_a_running_runner(screen):
+    """A live runner never retries what already failed in it, so recovery
+    waits for it to finish and then recovers what it left."""
+    screen.prepare()
+    crashing = ligand_names(COLLECTIONS[0])[0]
+    gate, gate_env = screen.gate(COLLECTIONS[1])
+    runner = screen.popen("afvs_run_local.py", FAKE_DOCK_CRASH=crashing, **gate_env)
+    wait_for((screen.tree / "workflow" / "local" / "2" / "0.running").exists)
+
+    recover = screen.popen("afvs_recover_failed_subjobs.py", "--queue", "vf-queue-ondemand")
+    time.sleep(3)
+    assert recover.poll() is None  # still waiting on the runner
+
+    gate.unlink()
+    assert runner.wait(timeout=120) == 1  # 1/0 crashed
+    out, _ = recover.communicate(timeout=300)
+    assert recover.returncode == 0, out
+    assert "waiting for it to finish" in out
+    assert status(screen)['total_succeeded'] == "6"
 
 
 @pytest.mark.parametrize("flag", ["--status-file", "--config-file"])

@@ -42,6 +42,7 @@ import hashlib
 import json
 import os
 import posixpath
+import re
 from pathlib import Path
 
 
@@ -97,11 +98,25 @@ def scenario_output_path(config, scenario_key, content_type, workunit_id, subjob
     return job_root(config) / scenario_key / content_type / str(workunit_id) / f"{subjob_id}.{extension}"
 
 
+def output_scenarios(config):
+    """The configured scenarios, plus any other scenario folder already in the
+    job root (left by an earlier run with other scenarios)."""
+    scenarios = list(config['docking_scenario_names'])
+    root = job_root(config)
+    if root.is_dir():
+        for path in sorted(root.iterdir()):
+            if path.is_dir() and path.name not in scenarios and path.name not in ("summary", "input", ".status") \
+                    and any((path / content_type).is_dir() for content_type in ('parquet', 'csv', 'logs')):
+                scenarios.append(path.name)
+    return scenarios
+
+
 def subjob_output_paths(config, workunit_id, subjob_id):
     """Every file afvs_run.py can write for one subjob (see generate_output_path),
-    including the .partial name each is written under before it is renamed."""
+    under the configured scenarios and any left from an earlier run, including
+    the .partial name each is written under before it is renamed."""
     paths = [summary_path(config, workunit_id, subjob_id)]
-    for scenario_key in config['docking_scenario_names']:
+    for scenario_key in output_scenarios(config):
         for content_type in ('parquet', 'csv', 'logs'):
             paths.append(scenario_output_path(config, scenario_key, content_type, workunit_id, subjob_id))
     return paths + [path.with_name(f"{path.name}.partial") for path in paths]
@@ -135,39 +150,64 @@ def outputs_complete(config, workunit_id, subjob_id):
     return True
 
 
+def _file_hash(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _resolve_scenario_value(base, value):
+    return Path(value) if os.path.isabs(value) else scenario_input_path(base, value)
+
+
 def inputs_digest(config):
-    """Hash of what each scenario docks against: its config.txt settings
-    (normalised, so comments, spacing and order do not count) and the files
-    those settings name, such as the receptor. Other files under
-    docking_scenario_basefolder are left out, so a stray file in a restaged
-    tree does not invalidate every .done."""
+    """Hash of what each scenario docks against:
+
+    - its config.txt, normalised (comments, blank lines, spacing and line
+      order do not count). Both "key = value" and PLANTS-style "key value"
+      lines are covered.
+    - every file a config.txt token names (the receptor, a PLANTS
+      protein_file, a reference ligand, ...)
+    - the files in the scenario's own folder (grids, rDock .prm files and
+      other inputs those configs refer to)
+
+    Other files under docking_scenario_basefolder are left out, so a stray
+    file in a restaged tree does not invalidate every .done."""
     base = Path(config['docking_scenario_basefolder'])
     scenarios = {}
     for scenario_key in config['docking_scenario_names']:
-        settings = {}
-        config_path = base / scenario_key / "config.txt"
+        scenario_dir = base / scenario_key
+        config_path = scenario_dir / "config.txt"
+        lines = []
+        files = {}
         if config_path.is_file():
             for line in config_path.read_text().splitlines():
-                key, sep, value = line.split('#')[0].partition("=")
-                if sep:
-                    settings[key.strip()] = value.strip()
+                line = " ".join(line.split('#')[0].split())
+                if not line:
+                    continue
+                lines.append(re.sub(r'\s*=\s*', '=', line))
 
-        # Docking runs with its cwd in a copy of docking_scenario_basefolder
-        # named input-files, so relative paths in config.txt resolve from
-        # there. A setting that names a file must resolve, or the fingerprint
-        # would silently stop covering it (a swapped receptor would then reuse
-        # old results).
-        files = {}
-        for key, value in settings.items():
-            path = Path(value) if os.path.isabs(value) else scenario_input_path(base, value)
-            if path is not None and path.is_file():
-                files[key] = hashlib.sha256(path.read_bytes()).hexdigest()
-            elif key == 'receptor' or (value and not os.path.isabs(value) and "/" in value
-                                       and not (path is not None and path.is_dir())):
-                # Absolute values (tool installs such as dock6_path) belong to
-                # the image and count as settings only
-                raise ValueError(f"{config_path}: {key} = {value} does not name a file under {base}")
-        scenarios[scenario_key] = {'settings': settings, 'files': files}
+                key, sep, value = line.partition("=")
+                key, value = key.strip(), value.strip()
+                tokens = [value] if sep else line.split()[1:]
+                for token in tokens:
+                    path = _resolve_scenario_value(base, token)
+                    if path is not None and path.is_file():
+                        files[token] = _file_hash(path)
+                    elif sep and (key == 'receptor' or (not os.path.isabs(token) and "/" in token
+                                                        and not (path is not None and path.is_dir()))):
+                        # A setting that names a file must resolve, or the
+                        # fingerprint would silently stop covering it (a
+                        # swapped receptor would then reuse old results).
+                        # Absolute values that are not files (tool installs
+                        # such as dock6_path) count as settings only.
+                        raise ValueError(f"{config_path}: {key} = {token} does not name a file under {base}")
+
+        if scenario_dir.is_dir():
+            for path in sorted(scenario_dir.rglob("*")):
+                relative = path.relative_to(scenario_dir)
+                if path.is_file() and path != config_path and not any(part.startswith(".") for part in relative.parts):
+                    files[f"{scenario_key}/{relative.as_posix()}"] = _file_hash(path)
+
+        scenarios[scenario_key] = {'config': sorted(lines), 'files': files}
 
     return hashlib.sha256(json.dumps(scenarios, sort_keys=True).encode()).hexdigest()
 

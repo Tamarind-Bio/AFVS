@@ -123,7 +123,9 @@ def kill_orphans():
     """An attempt whose runner was killed outright (SIGKILL, OOM) keeps running
     in its own session. Stop each one before its subjob is run again, so two
     attempts never write the same outputs. Called with the runner lock held,
-    so every .running marker left is a dead runner's."""
+    so every .running marker left is a dead runner's. Returns False if one
+    could not be stopped."""
+    stopped_all = True
     for running_path in sorted(afvs_local.LOCAL_STATE_DIR.glob("*/*.running")):
         marker = afvs_local.read_json(running_path) or {}
         pgid = marker.get('pid')
@@ -145,7 +147,9 @@ def kill_orphans():
         if wait_for_process_group(pgid, ORPHAN_WAIT_SECONDS):
             print(f"Stopped what was left of an earlier attempt at {running_path.parent.name}:{running_path.stem}", flush=True)
         else:
-            print(f"WARNING: process group {pgid} of an earlier attempt did not exit", flush=True)
+            print(f"ERROR: process group {pgid} of an earlier attempt did not exit", flush=True)
+            stopped_all = False
+    return stopped_all
 
 
 def parse_config(filename):
@@ -383,7 +387,10 @@ def run(config, workers):
     previous_handlers[signal.SIGCHLD] = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
     try:
-        kill_orphans()
+        if not kill_orphans():
+            # Rerunning its subjob now could interleave two attempts' outputs
+            print("Not starting: an earlier attempt is still running")
+            return 2
         afvs_local.RUN_STARTED.write_text(f"{time.time()}\n")
 
         workunits = get_workunits()
