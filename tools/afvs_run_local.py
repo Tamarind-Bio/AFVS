@@ -393,8 +393,9 @@ def run(config, workers):
         ignored_markers = 0
         for workunit_id, workunit in workunits.items():
             for subjob_id, subjob in workunit['subjobs'].items():
-                state, _ = afvs_local.subjob_state(config, workunit_id, subjob_id, subjob, alive=False)
+                state, marker = afvs_local.subjob_state(config, workunit_id, subjob_id, subjob, alive=False)
                 if state == afvs_local.SUCCEEDED:
+                    afvs_local.remove_unrecorded_outputs(config, workunit_id, subjob_id, marker)
                     skipped += 1
                 else:
                     todo.append((workunit_id, subjob_id))

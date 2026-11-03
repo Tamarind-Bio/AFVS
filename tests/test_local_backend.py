@@ -135,14 +135,32 @@ def test_prepare_rejects_mixed_local_configs(screen, old, new, message):
     assert message in ret.stdout
 
 
-def test_prepare_fails_when_a_scenario_file_does_not_resolve(screen):
-    """The fingerprint must cover the receptor; one it cannot find fails prepare."""
+@pytest.mark.parametrize("edit, error", [
+    # The fingerprint must cover the receptor; one it cannot find fails prepare
+    (lambda text: text.replace("receptors/receptor.pdb", "receptors/missing.pdb"),
+     "receptor = ../input-files/receptors/missing.pdb does not name a file"),
+    # Absolute tool locations (dock6_path, chimera_path, ...) are image paths, not inputs
+    (lambda text: text + "dock6_path = /opt/dock6\nchimera_path = /usr/bin\n", None),
+    # Relative to the folder itself, the way docking resolves it
+    (lambda text: text.replace("../input-files/receptors/receptor.pdb", "receptors/receptor.pdb"), None),
+    # An absolute receptor (e.g. under /app/inputs) is hashed where it is
+    ("absolute", None),
+    (lambda text: text.replace("../input-files/receptors/receptor.pdb", "/nonexistent/receptor.pdb"),
+     "receptor = /nonexistent/receptor.pdb does not name a file"),
+])
+def test_scenario_paths_at_prepare(screen, edit, error):
     box = screen.tree / "input-files" / "qvina02" / "config.txt"
-    box.write_text(box.read_text().replace("receptors/receptor.pdb", "receptors/missing.pdb"))
+    if edit == "absolute":
+        receptor = screen.tree / "input-files" / "receptors" / "receptor.pdb"
+        box.write_text(box.read_text().replace("../input-files/receptors/receptor.pdb", str(receptor)))
+    else:
+        box.write_text(edit(box.read_text()))
     screen.run("afvs_prepare_folders.py", "--overwrite")
     ret = screen.run("afvs_prepare_workunits.py", check=False)
-    assert ret.returncode != 0
-    assert "receptor = ../input-files/receptors/missing.pdb does not name a file" in ret.stderr
+    if error:
+        assert ret.returncode != 0 and error in ret.stderr
+    else:
+        assert ret.returncode == 0 and "Generated 2 workunits" in ret.stdout
 
 
 def test_submit_jobs_points_local_mode_at_the_runner(screen):
@@ -365,10 +383,15 @@ def test_resume_across_a_fresh_prepare(screen):
     screen.run("afvs_run_local.py")
     assert len(screen.dockings_run()) == 6
 
+    # A restore that also brought back a file the .done does not record
+    stray = screen.job_dir / "qvina02" / "csv" / "2" / "0.csv.gz.partial"
+    stray.write_text("from a failed attempt")
+
     screen.prepare()
     out = screen.run("afvs_run_local.py").stdout
     assert "0 subjobs to run, 2 already done" in out
     assert len(screen.dockings_run()) == 6
+    assert not stray.exists()
 
     parsed = status(screen)
     assert parsed['succeeded'] == "2" and parsed['total_succeeded'] == "6"
@@ -474,6 +497,31 @@ def test_liveness_is_read_after_the_running_marker(monkeypatch):
     assert afvs_local.subjob_state({}, "1", "0", {'fingerprint': "x"})[0] == afvs_local.SUCCEEDED
 
 
+def test_kill_orphans_spares_a_reused_pid(tmp_path, monkeypatch):
+    """A stale .running whose pid now belongs to another process (its start
+    time differs) must not be killed; one that matches is."""
+    monkeypatch.syspath_prepend(str(TOOLS))
+    import afvs_local
+    import afvs_run_local
+
+    monkeypatch.setattr(afvs_local, "LOCAL_STATE_DIR", tmp_path)
+    processes = [subprocess.Popen(["sleep", "60"], start_new_session=True) for _ in range(2)]
+    try:
+        for name, process, recorded in [("0", processes[0], "wrong"), ("1", processes[1], "right")]:
+            start_time = afvs_run_local.process_start_time(process.pid)
+            (tmp_path / "1").mkdir(exist_ok=True)
+            (tmp_path / "1" / f"{name}.running").write_text(json.dumps({
+                'pid': process.pid, 'start_time': start_time + 1 if recorded == "wrong" else start_time}))
+
+        afvs_run_local.kill_orphans()
+        assert processes[1].wait(timeout=30) == -signal.SIGKILL
+        assert processes[0].poll() is None
+    finally:
+        for process in processes:
+            process.kill()
+            process.wait()
+
+
 def test_a_second_runner_is_refused(screen):
     screen.prepare()
     lock_path = screen.tree / "workflow" / "local" / "runner.lock"
@@ -537,6 +585,16 @@ def ps_lines():
         except OSError:
             pass
     return lines
+
+
+@pytest.mark.parametrize("flag", ["--status-file", "--config-file"])
+def test_recover_refuses_another_workflows_files(screen, flag):
+    screen.prepare()
+    other = screen.base / "other.json"
+    source = "status.json" if flag == "--status-file" else "config.json"
+    other.write_text((screen.tree / "workflow" / source).read_text())
+    ret = screen.run("afvs_recover_failed_subjobs.py", flag, str(other), check=False)
+    assert ret.returncode == 2 and "not supported with batchsystem=local" in ret.stdout
 
 
 def test_recover_with_nothing_failed_is_a_no_op(screen):

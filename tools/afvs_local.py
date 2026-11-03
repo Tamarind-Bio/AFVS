@@ -41,6 +41,7 @@ import gzip
 import hashlib
 import json
 import os
+import posixpath
 from pathlib import Path
 
 
@@ -151,20 +152,37 @@ def inputs_digest(config):
                 if sep:
                     settings[key.strip()] = value.strip()
 
-        # Docking runs inside a copy of docking_scenario_basefolder, so that
-        # is where relative paths in config.txt resolve from. A setting that
-        # names a file must resolve, or the fingerprint would silently stop
-        # covering it (a swapped receptor would then reuse old results).
+        # Docking runs with its cwd in a copy of docking_scenario_basefolder
+        # named input-files, so relative paths in config.txt resolve from
+        # there. A setting that names a file must resolve, or the fingerprint
+        # would silently stop covering it (a swapped receptor would then reuse
+        # old results).
         files = {}
         for key, value in settings.items():
-            path = base / value
-            if value and path.is_file():
+            path = Path(value) if os.path.isabs(value) else scenario_input_path(base, value)
+            if path is not None and path.is_file():
                 files[key] = hashlib.sha256(path.read_bytes()).hexdigest()
-            elif "/" in value or key in ('receptor', 'flex'):
+            elif key == 'receptor' or (value and not os.path.isabs(value) and "/" in value
+                                       and not (path is not None and path.is_dir())):
+                # Absolute values (tool installs such as dock6_path) belong to
+                # the image and count as settings only
                 raise ValueError(f"{config_path}: {key} = {value} does not name a file under {base}")
         scenarios[scenario_key] = {'settings': settings, 'files': files}
 
     return hashlib.sha256(json.dumps(scenarios, sort_keys=True).encode()).hexdigest()
+
+
+def scenario_input_path(base, value):
+    """Where a relative config.txt path lands inside docking_scenario_basefolder
+    as docking sees it (cwd = a copy of the folder named input-files), or None
+    if it points outside the folder or is absolute."""
+    if not value or os.path.isabs(value):
+        return None
+    run_dir = "/run/input-files"
+    resolved = posixpath.normpath(posixpath.join(run_dir, value))
+    if resolved == run_dir or not resolved.startswith(run_dir + "/"):
+        return None
+    return base / resolved[len(run_dir) + 1:]
 
 
 def subjob_fingerprint(config, subjob, docking_inputs):
@@ -251,6 +269,16 @@ def read_done_marker(config, workunit_id, subjob_id, fingerprint):
     return marker
 
 
+def remove_unrecorded_outputs(config, workunit_id, subjob_id, marker):
+    """Delete outputs on disk that the subjob's .done does not record, e.g. a
+    failed attempt's table brought back by a restore."""
+    recorded = set(marker.get('outputs', {}))
+    root = job_root(config)
+    for path in subjob_output_paths(config, workunit_id, subjob_id):
+        if path.is_file() and path.relative_to(root).as_posix() not in recorded:
+            remove_file(path)
+
+
 def run_started():
     """Whether an afvs_run_local.py has started on this workflow (this wave)."""
     return RUN_STARTED.exists()
@@ -313,6 +341,10 @@ def subjob_state(config, workunit_id, subjob_id, subjob, alive=None):
         if alive is None:
             alive = runner_alive()
         if not alive:
+            # It may have been run, and finished, since the reads above
+            marker = read_done_marker(config, workunit_id, subjob_id, subjob.get('fingerprint'))
+            if marker is not None:
+                return SUCCEEDED, marker
             return FAILED, None
 
     return PENDING, None

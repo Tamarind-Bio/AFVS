@@ -318,8 +318,10 @@ def recover_local(args, config):
     place, on this machine. --queue has no meaning here and is ignored."""
     import afvs_run_local
 
-    if Path(args.status_file).resolve() != (afvs_local.WORKFLOW_DIR / "status.json").resolve():
-        print("--status-file is not supported with batchsystem=local (the runner reads ../workflow/status.json)")
+    if Path(args.status_file).resolve() != (afvs_local.WORKFLOW_DIR / "status.json").resolve() or \
+            Path(args.config_file).resolve() != (afvs_local.WORKFLOW_DIR / "config.json").resolve():
+        print("--status-file/--config-file are not supported with batchsystem=local "
+              "(the runner reads ../workflow/status.json and ../workflow/config.json)")
         return 2
 
     if afvs_local.runner_alive():
