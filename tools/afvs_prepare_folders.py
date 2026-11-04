@@ -154,10 +154,21 @@ def check_parameters(config):
     elif(config['job_storage_mode'] == "local"):
         # Outputs go to <local_job_root>/<job_name>/: a job_name that is not a
         # single plain path component would put them somewhere else
-        job_name = config.get('job_name', '')
-        if(job_name in ("", ".", "..") or "/" in job_name or "\\" in job_name or "\0" in job_name):
-            print("* 'job_name' must be a single path component (no '/', not '.' or '..') if job_storage_mode is 'local'")
+        if(empty_value(config, 'job_name')):
+            print("* 'job_name' must be set if job_storage_mode is 'local' (job_letter is not supported there)")
             error = 1
+        # ...and <local_job_root>/<job_name>/<scenario>/ under it
+        for name in [config.get('job_name', '')] + config['docking_scenario_names']:
+            if(name in (".", "..") or "/" in name or "\\" in name or "\0" in name):
+                print(f"* '{name}': job_name and docking_scenario_names must be single path components (no '/', not '.' or '..') if job_storage_mode is 'local'")
+                error = 1
+        # ...nor follow a symlink planted where those directories go
+        if(not empty_value(config, 'local_job_root') and not empty_value(config, 'job_name')):
+            job_dir = Path(config['local_job_root']) / config['job_name']
+            for path in [job_dir] + [job_dir / name for name in config['docking_scenario_names']]:
+                if(path.is_symlink()):
+                    print(f"* {path} is a symlink; local outputs must stay under local_job_root")
+                    error = 1
         if(empty_value(config, 'local_job_root')):
             print("* 'local_job_root' must be set if job_storage_mode is 'local'")
             error = 1

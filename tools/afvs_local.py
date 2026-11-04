@@ -333,8 +333,8 @@ def subjob_state(config, workunit_id, subjob_id, subjob, alive=None):
     SUCCEEDED  valid .done for this layout
     RUNNING    an attempt is in flight under a live runner
     FAILED     the last attempt failed, its runner died mid-attempt, or a run
-               ended without reaching it
-    PENDING    not attempted yet, and a runner may still get to it
+               ended without reaching it (and no runner is left to retry it)
+    PENDING    a live or future runner may still run it
     """
     marker = read_done_marker(config, workunit_id, subjob_id, subjob.get('fingerprint'))
     if marker is not None:
@@ -355,6 +355,12 @@ def subjob_state(config, workunit_id, subjob_id, subjob, alive=None):
 
     failed = read_json(attempt_path(workunit_id, subjob_id, "failed"))
     if failed is not None:
+        # A live runner retries everything not done before it exits, so
+        # nothing it may still run is final yet
+        if alive is None:
+            alive = runner_alive()
+        if alive:
+            return PENDING, failed
         return FAILED, failed
 
     # Never attempted. Once a run has started and no runner is left, nothing

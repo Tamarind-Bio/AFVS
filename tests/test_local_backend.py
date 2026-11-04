@@ -120,11 +120,15 @@ def test_prepare_writes_local_workunits(screen):
 @pytest.mark.parametrize("old, new, message", [
     # The job's outputs must stay under local_job_root
     ("job_name=fixture-job", "job_name=..",
-     "'job_name' must be a single path component"),
+     "must be single path components"),
     ("job_name=fixture-job", "job_name=../other",
-     "'job_name' must be a single path component"),
+     "must be single path components"),
     ("job_name=fixture-job", "job_name=/abs",
-     "'job_name' must be a single path component"),
+     "must be single path components"),
+    ("docking_scenario_names=qvina02", "docking_scenario_names=..",
+     "'..': job_name and docking_scenario_names must be single path components"),
+    ("job_name=fixture-job", "job_letter=fixture-job",
+     "'job_name' must be set if job_storage_mode is 'local'"),
     # all.ctrl has no inline comments: this parser would keep one as part of the path
     ("local_job_root=", "local_job_root=/out   # comment\nignored_",
      "'local_job_root' must not contain '#'"),
@@ -141,6 +145,17 @@ def test_prepare_rejects_mixed_local_configs(screen, old, new, message):
     ret = screen.run("afvs_prepare_folders.py", "--overwrite", check=False)
     assert ret.returncode == 1
     assert message in ret.stdout
+
+
+def test_prepare_refuses_a_symlinked_job_directory(screen):
+    elsewhere = screen.base / "elsewhere"
+    elsewhere.mkdir()
+    screen.job_root.mkdir(parents=True)
+    (screen.job_root / screen.job_name).symlink_to(elsewhere)
+
+    ret = screen.run("afvs_prepare_folders.py", "--overwrite", check=False)
+    assert ret.returncode == 1
+    assert "is a symlink; local outputs must stay under local_job_root" in ret.stdout
 
 
 def test_submit_jobs_points_local_mode_at_the_runner(screen):
@@ -511,14 +526,19 @@ def test_running_means_the_runner_lock_is_held(screen):
     running_marker.parent.mkdir(parents=True)
     # A stale marker naming a live pid (this test's own) must not read as running
     running_marker.write_text(json.dumps({'pid': os.getpid(), 'started': time.time(), 'attempts': 1}))
+    # ...and one that failed, which a live runner would retry
+    failed_marker = screen.tree / "workflow" / "local" / "2" / "0.failed"
+    failed_marker.parent.mkdir(parents=True)
+    failed_marker.write_text(json.dumps({'returncode': 1, 'attempts': 1}))
 
-    assert status(screen)['failed'] == "1"
+    assert status(screen)['failed'] == "2"
 
     lock_path = screen.tree / ".afvs_local_runner.lock"
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         parsed = status(screen)
-    assert parsed['running'] == "1" and parsed['complete'] == "0"
+    assert parsed['running'] == "1" and parsed['pending'] == "1" and parsed['failed'] == "0"
+    assert parsed['complete'] == "0"
 
 
 def test_liveness_is_read_after_the_running_marker(monkeypatch):
