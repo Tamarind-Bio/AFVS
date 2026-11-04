@@ -36,17 +36,14 @@ import gzip
 import os
 import json
 import re
-import boto3
 import multiprocessing
 import subprocess
-import botocore
 import logging
 import time
 import shutil
 import hashlib
 import pandas as pd
 from pathlib import Path
-from botocore.config import Config
 from statistics import mean
 from multiprocessing import Process
 from multiprocessing import Queue
@@ -60,6 +57,103 @@ import urllib.request
 import urllib.error
 
 logger = logging.getLogger(__name__)
+
+
+# boto3 is imported only by the S3 code paths, so a presigned job (which has no
+# AWS identity and no boto3) never reaches for it.
+def s3_client(**config_args):
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client('s3', config=Config(**config_args))
+
+
+def s3_client_error():
+    import botocore.exceptions
+
+    return botocore.exceptions.ClientError
+
+
+# job_storage_mode=presigned: the job has no AWS identity and reaches S3 only
+# through presigned URLs from its workunit manifest. A presigned URL is a
+# credential, so none may reach a log line, an error message or a traceback.
+
+_URL_PATTERN = re.compile(r'[a-zA-Z][a-zA-Z0-9+.-]*://\S+')
+# A path or query quoted without its scheme (http.client's InvalidURL does this)
+_SIGNED_QUERY_PATTERN = re.compile(r'[^\s\'"]*[?&](X-Amz-|Signature=|AWSAccessKeyId=)[^\s\'"]*', re.IGNORECASE)
+
+
+def redact(text):
+    return _SIGNED_QUERY_PATTERN.sub("<url>", _URL_PATTERN.sub("<url>", str(text)))
+
+
+class PresignedHTTPError(Exception):
+    """An HTTP error status from a presigned URL (the URL is not kept)."""
+
+    def __init__(self, method, status):
+        super().__init__(f"{method} returned HTTP {status}")
+        self.status = status
+
+
+def presigned_request(method, url, body_path=None, dest_path=None, attempts=8):
+    """GET (to dest_path, or returning the body) or PUT (from body_path) a
+    presigned URL. A 4xx other than 408/429 is raised at once as
+    PresignedHTTPError; anything else is retried with backoff. Every error
+    raised here is free of the URL, and of the exception it came from."""
+    import urllib.error
+    import urllib.request
+
+    import random
+
+    last_error = None
+    for attempt in range(attempts):
+        if attempt:
+            # Exponential with full jitter, so a fan-out does not retry in step
+            time.sleep(random.uniform(0, min(60, 2 ** attempt)))
+        try:
+            if method == "PUT":
+                with open(body_path, "rb") as body:
+                    request = urllib.request.Request(url, data=body, method="PUT")
+                    request.add_header("Content-Length", str(os.path.getsize(body_path)))
+                    request.add_header("Content-Type", "application/octet-stream")
+                    with urllib.request.urlopen(request, timeout=300) as response:
+                        response.read()
+                return None
+
+            with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=300) as response:
+                if dest_path is None:
+                    return response.read()
+                with open(dest_path, "wb") as dest:
+                    shutil.copyfileobj(response, dest)
+                return None
+
+        except urllib.error.HTTPError as error:
+            # S3 reports these transient conditions as 400s
+            transient = error.code == 400 and re.search(
+                rb"<Code>(RequestTimeout|IncompleteBody|RequestTimeTooSkewed)</Code>", error.read() or b"")
+            if 400 <= error.code < 500 and error.code not in (408, 429) and not transient:
+                status = error.code
+                break
+            last_error = f"HTTP {error.code}"
+        except Exception as error:
+            # Only the kind of error: its text can quote the URL
+            last_error = type(error).__name__
+            if getattr(error, 'errno', None) is not None:
+                last_error += f" (errno {error.errno})"
+    else:
+        raise RuntimeError(f"{method} of a presigned URL failed after {attempts} attempts ({last_error})")
+
+    raise PresignedHTTPError(method, status)
+
+
+def run_obabel(args):
+    """Run obabel with an argv list (no shell). Returns its exit status, or 127
+    if obabel is not installed. Callers ignore it, as they ignored os.system's."""
+    try:
+        return subprocess.run(["obabel", *args]).returncode
+    except OSError as err:
+        logger.error(f"Could not run obabel: {err}")
+        return 127
 
 # Progress tracking for Tamarind integration
 _last_progress_update = 0
@@ -110,22 +204,15 @@ def format_ligand(ligand_path: str, file_format: str) -> str:
         logger.info(f'Converting ligand file format to {file_format} using obabel.')
         ligand_path_as_list[-1] = file_format
         result = ''.join(ligand_path_as_list)
-        os.system('obabel {} -O {}'.format(ligand_path, result))
+        run_obabel([ligand_path, '-O', result])
         return result
         
     return ligand_path
 
 def downloader(download_queue, unpack_queue, summary_queue, tmp_dir):
 
-
-    botoconfig = Config(
-       retries = {
-          'max_attempts': 25,
-          'mode': 'standard'
-       }
-    )
-
-    s3 = boto3.client('s3', config=botoconfig)
+    # Created on the first S3 collection, so presigned jobs never import boto3
+    s3 = None
 
 
     while True:
@@ -147,10 +234,16 @@ def downloader(download_queue, unpack_queue, summary_queue, tmp_dir):
             remote_path = item['collection']['s3_download_path']
             job_bucket = item['collection']['s3_bucket']
 
+            if s3 is None:
+                s3 = s3_client(retries = {
+                    'max_attempts': 25,
+                    'mode': 'standard'
+                })
+
             try:
                 with open(item['local_path'], 'wb') as f:
                     s3.download_fileobj(job_bucket, remote_path, f)
-            except botocore.exceptions.ClientError as error:
+            except s3_client_error() as error:
                     reason = f"Failed to download from S3 {job_bucket}/{remote_path} to {item['local_path']}: ({error})"
                     logging.error(reason)
 
@@ -170,6 +263,28 @@ def downloader(download_queue, unpack_queue, summary_queue, tmp_dir):
         elif('sharedfs_path' in item['collection']):
             shutil.copyfile(Path(item['collection']['sharedfs_path']), item['local_path'])
 
+        elif('presigned_url' in item['collection']):
+            # A missing object is a failed download, as on S3. Any other
+            # error (an expired or rejected URL included) fails the subjob, so
+            # recovery re-signs and reruns it rather than skipping ligands.
+            try:
+                presigned_request("GET", item['collection']['presigned_url'], dest_path=item['local_path'])
+            except PresignedHTTPError as error:
+                if error.status != 404:
+                    raise
+                reason = f"Collection {item['collection_key']} was not found ({error})"
+                logging.error(reason)
+
+                summary_item = {
+                    'type': "download_failed",
+                    'log': {
+                        'base_collection_key': item['collection_key'],
+                        'reason': reason,
+                        'dockings': item['collection']['dockings']
+                    }
+                }
+                summary_queue.put(summary_item)
+                continue
 
         # Move it to the next step if there's space
 
@@ -853,15 +968,14 @@ def generate_tarfile(dir, tarname):
 
 def generate_output_path(ctx, scenario_key, content_type, extension):
 
-
     if scenario_key != None:
-        if(ctx['main_config']['job_storage_mode'] == "s3"):
+        if(ctx['main_config']['job_storage_mode'] in ("s3", "presigned")):
             return f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{scenario_key}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
         else:
             outputfiles_dir = Path(ctx['main_config']['sharedfs_output_files_path']) / scenario_key / content_type / str(ctx['workunit_id'])
             return f"{ctx['main_config']['sharedfs_output_files_path']}/{scenario_key}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
     else:
-        if(ctx['main_config']['job_storage_mode'] == "s3"):
+        if(ctx['main_config']['job_storage_mode'] in ("s3", "presigned")):
             return f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
         else:
             outputfiles_dir = Path(ctx['main_config']['sharedfs_output_files_path']) / content_type / str(ctx['workunit_id'])
@@ -1002,14 +1116,8 @@ def upload_process(ctx, upload_queue):
 
     print('Uploader: Running', flush=True)
 
-    botoconfig = Config(
-       retries = {
-          'max_attempts': 25,
-          'mode': 'standard'
-       }
-    )
-
-    s3 = boto3.client('s3', config=botoconfig)
+    # Created on the first S3 upload, so presigned jobs never import boto3
+    s3 = None
 
     while True:
         try:
@@ -1028,12 +1136,26 @@ def upload_process(ctx, upload_queue):
         # Basically.. if s3 then use boto3
 
         if(item['storage_type'] == "s3"):
+            if s3 is None:
+                s3 = s3_client(retries = {
+                    'max_attempts': 25,
+                    'mode': 'standard'
+                })
+
             try:
                 print(f"Uploading to {item['remote_path']}")
                 response = s3.upload_file(item['local_path'], item['s3_bucket'], item['remote_path'])
-            except botocore.exceptions.ClientError as e:
+            except s3_client_error() as e:
                 logging.error(e)
                 raise
+
+        elif(item['storage_type'] == "presigned"):
+            # Only the keys the manifest signed can be written
+            url = ctx['presigned_outputs'].get(item['remote_path'])
+            if url is None:
+                raise RuntimeError(f"The workunit manifest has no URL for output {item['remote_path']}")
+            print(f"Uploading to {item['remote_path']}")
+            presigned_request("PUT", url, body_path=item['local_path'])
 
         else:
             # if sharedfs.. .then just do a copy
@@ -1104,7 +1226,7 @@ def get_workunit_from_s3(ctx, workunit_id, subjob_id, job_bucket, job_object, do
     try:
         with open(download_to_workunit_file, 'wb') as f:
             ctx['s3'].download_fileobj(job_bucket, job_object, f)
-    except botocore.exceptions.ClientError as error:
+    except s3_client_error() as error:
         logging.error(
             f"Failed to download from S3 {job_bucket}/{job_object} to {download_to_workunit_file}, ({error})")
         sys.exit(1)
@@ -1140,6 +1262,49 @@ def get_workunit_from_s3(ctx, workunit_id, subjob_id, job_bucket, job_object, do
 
     ctx['main_config'] = all_config['config']
 
+
+
+def get_workunit_from_presigned(ctx, workunit_id, subjob_id, download_dir):
+    """Fetch the workunit manifest, then the workunit tarball it names, and
+    point every collection and output of this subjob at its presigned URL."""
+    try:
+        manifest = json.loads(presigned_request("GET", ctx['job_url']))
+    except Exception as err:
+        logging.error(f"Could not read the workunit manifest: {redact(err)}")
+        sys.exit(1)
+
+    if manifest.get('version') != 1:
+        logging.error(f"Unsupported workunit manifest version {manifest.get('version')}")
+        sys.exit(1)
+
+    subjob_urls = manifest['subjobs'].get(subjob_id)
+    if subjob_urls is None:
+        logging.error(f"There is no subjob ID with ID:{subjob_id}")
+        # AWS Batch requires that an array job have at least 2 elements,
+        # sometimes we only need 1 though. Only then is a missing subjob the
+        # padding; any other gap is lost work and must fail.
+        sys.exit(0 if (subjob_id == "1" and manifest.get('padded')) else 1)
+
+    tarball = os.path.join(download_dir, "presigned_input.tar.gz")
+    try:
+        presigned_request("GET", manifest['tarball_url'], dest_path=tarball)
+    except Exception as err:
+        logging.error(f"Could not download the workunit tarball: {redact(err)}")
+        sys.exit(1)
+
+    get_workunit_from_sharedfs(ctx, workunit_id, subjob_id, tarball, download_dir)
+    os.remove(tarball)  # copied in; the scratch area may be small
+
+    for collection_key, collection in ctx['subjob_config']['collections'].items():
+        if collection_key not in subjob_urls['collections']:
+            logging.error(f"The workunit manifest has no URL for collection {collection_key}")
+            sys.exit(1)
+        # The job reads collections through these URLs only (never boto3)
+        collection.pop('s3_download_path', None)
+        collection.pop('s3_bucket', None)
+        collection['presigned_url'] = subjob_urls['collections'][collection_key]
+
+    ctx['presigned_outputs'] = subjob_urls['outputs']
 
 
 def get_workunit_from_sharedfs(ctx, workunit_id, subjob_id, job_tar, download_dir):
@@ -1249,7 +1414,7 @@ def docking_start_MpSDockZN(task):
         f.writelines(['$DOCK6/bin/grid -i {} \n'.format(config_['grid_in'])])
         f.writelines(['./executables/MpSDock -i {} \n'.format(config_['dock_in'])])
         
-    os.system('chmod 0700 {}'.format(task['MpSDockZN_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['MpSDockZN_tmp_file'], 0o700) # Assign execution permisions on script
     cmd = ['./{}'.format(task['MpSDockZN_tmp_file'])]
         
     return cmd
@@ -1298,7 +1463,7 @@ def docking_start_SEED(task):
         f.writelines(["\t\t-out:suffix out\n"])
         f.writelines(['{}/seed4 {} > log'.format(task['tools_path'], config_['seed_inp_file'])])
         
-    os.system('chmod 0700 {}'.format(task['seed_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['seed_tmp_file'], 0o700) # Assign execution permisions on script
     cmd = ['./{}'.format(task['seed_tmp_file'])]
         
     return cmd
@@ -1334,7 +1499,7 @@ def docking_start_HDock(task):
         f.writelines(['{}/hdock {} {} -out Hdock.out'.format(task['tools_path'], config_['receptor'], task['lig_path'])])
         f.writelines(['{}/createpl Hdock.out top100.pdb -nmax 1 -complex -models'.format(task['tools_path']) ])
         
-    os.system('chmod 0700 {}'.format(task['HDock_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['HDock_tmp_file'], 0o700) # Assign execution permisions on script
     cmd = ['./{}'.format(task['HDock_tmp_file'])]
         
     return cmd
@@ -1435,7 +1600,11 @@ def docking_finish_dock6(item, ret):
     try:
         dock_file = [x for x in os.listdir(item['tmp_run_dir']) if 'ligand_out' in x]
         dock_file = [x for x in dock_file if 'mol2' in x][0]
-        os.system('cp {} {}'.format(dock_file, item['output_dir']))
+        try:
+            shutil.copy(dock_file, item['output_dir'])
+        except OSError as err:
+            # cp's failure never stopped the score parse below
+            logging.error(f"Could not copy {dock_file}: {err}")
 
         # Save the results:
         with open('./ligand_out_scored.mol2', 'r') as f:
@@ -1478,7 +1647,7 @@ def docking_start_rosetta_ligand(task):
         f.writelines(["\t\t-out:suffix out\n"])
         
 
-    os.system('chmod 0700 {}'.format(task['rosetta_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['rosetta_tmp_file'], 0o700) # Assign execution permisions on script
     cmd = ['./{}'.format(task['rosetta_tmp_file'])]
         
     return cmd
@@ -1537,7 +1706,7 @@ def docking_start_Molegro(task):
         f.writelines('cat {} {} > ligands.mol2\n'.format(config_['ref_ligand'], task['ligand_path']))
         f.writelines('$Molegro/bin/mvd docking.mvdscript -nogui\n')
 
-    os.system('chmod 0700 {}'.format(task['molegro_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['molegro_tmp_file'], 0o700) # Assign execution permisions on script
     cmd = ['./{}'.format(task['molegro_tmp_file'])]
         
     return cmd
@@ -1664,7 +1833,7 @@ def docking_start_LightDock(task):
         f.writelines('{}/bin/lightdock3.py setup.json 100 -c 1 -l 0\n')
         f.writelines('{}/bin/lgd_generate_conformations.py {} {} swarm_0/gso_100.out {}\n'.format(config_['lightdock_path'], config_['receptor'], task['ligand_path'], config_['exhaustiveness']))
 
-    os.system('chmod 0700 {}'.format(task['lightdock_tmp_file'])) # Assign execution permisions on script
+    os.chmod(task['lightdock_tmp_file'], 0o700) # Assign execution permisions on script
     
     cmd = ['./{}'.format(task['lightdock_tmp_file'])]
     
@@ -2951,7 +3120,8 @@ def convert_pose_to_sdf(output_path, input_format=None):
         sdf_path = output_path + '.sdf'
         try:
             # Use explicit input format flag for obabel
-            result = os.system(f'obabel -i{obabel_fmt} {output_path} -O {sdf_path} 2>/dev/null')
+            result = subprocess.run(['obabel', f'-i{obabel_fmt}', output_path, '-O', sdf_path],
+                                    stderr=subprocess.DEVNULL).returncode
             if result == 0 and os.path.exists(sdf_path) and os.path.getsize(sdf_path) > 0:
                 os.remove(output_path)  # Remove original to save space
                 logging.info(f"Successfully converted {output_path} to SDF")
@@ -2995,7 +3165,7 @@ def convert_ligand_format(ligand_, new_format):
             >>> convert_ligand_format('./ligands/ligand1.mol2', 'pdbqt')
     """
     input_format = ligand_.split('.')[-1]
-    os.system('obabel {} -O {}'.format(ligand_, ligand_.replace(input_format, new_format)))
+    run_obabel([ligand_, '-O', ligand_.replace(input_format, new_format)])
 
     
 ## nnscore2.0
@@ -3020,7 +3190,7 @@ def scoring_start_nnscore2(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('export VINA_EXEC={}; python {}/NNScore2.py -receptor {} -ligand {} -vina_executable $VINA_EXEC > output.txt'.format(vina_loc, task['tools_path'], config_['receptor'], task['output_path']))
     
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3071,7 +3241,7 @@ def _scoring_start_gold(task, scoring_function: str):
     with open(run_sh_script, 'w') as f:
         f.writelines(f'{gold_loc} {input_conf}')
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
 
     return cmd 
@@ -3136,7 +3306,7 @@ def scoring_start_rf(task):
         f.writelines('{} --receptor {} {} -O {}/ligands_rescored.pdbqt'.format(rf_score_vs_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
         f.writelines('{} --receptor {} {} -ocsv > {}/temp.csv'.format(rf_score_vs_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3177,7 +3347,7 @@ def scoring_start_smina(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('{} --receptor {} -l {} --score_only > {}/output.txt'.format(smina_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3216,7 +3386,7 @@ def scoring_start_gnina(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('{} --receptor {} -l {} --score_only > {}/output.txt'.format(smina_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3254,7 +3424,7 @@ def scoring_start_ad4(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('{} --receptor {} -l {} --score_only --scoring ad4_scoring > {}/output.txt'.format(smina_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3293,7 +3463,7 @@ def scoring_start_vinardo(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('{} --receptor {} -l {} --score_only --scoring vinardo > {}/output.txt'.format(smina_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3331,7 +3501,7 @@ def scoring_start_vina(task):
     with open(run_sh_script, 'w') as f:        
         f.writelines('{} --receptor {} -l {} --score_only --scoring vina > {}/output.txt'.format(smina_loc, config_['receptor'], task['output_path'], task['tmp_run_dir']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3373,7 +3543,7 @@ def scoring_start_PLANTS_chemplp(task):
         f.writelines('protein_file             {}\n'.format(config_['receptor']))
         f.writelines('ligand_file              {}\n'.format(task['output_path']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3415,7 +3585,7 @@ def scoring_start_PLANTS_plp(task):
         f.writelines('protein_file             {}\n'.format(config_['receptor']))
         f.writelines('ligand_file              {}\n'.format(task['output_path']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3457,7 +3627,7 @@ def scoring_start_PLANTS_plp95(task):
         f.writelines('protein_file             {}\n'.format(config_['receptor']))
         f.writelines('ligand_file              {}\n'.format(task['output_path']))
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
     cmd = ['./{}'.format(run_sh_script)] 
     
     return cmd 
@@ -3589,7 +3759,7 @@ def scoring_start_dock6_contact_score(task):
             f.writelines(['num_scored_conformers                                        1\n'])
             f.writelines(['rank_ligands                                                 no\n'])
 
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
 
     cmd = ['./{}'.format(run_sh_script)] 
     
@@ -3677,7 +3847,7 @@ def scoring_start_dock6_continuous_score(task):
         f.writelines(['num_scored_conformers                                        1\n'])
         f.writelines(['rank_ligands                                                 no\n'])
     
-    os.system('chmod 0700 {}'.format(run_sh_script))
+    os.chmod(run_sh_script, 0o700)
 
     cmd = ['./{}'.format(run_sh_script)]
             
@@ -3717,7 +3887,7 @@ def scoring_start_mm_gbsa(task):
         # Running MMPBSA.py
         f.writelines('MMPBSA.py -O -i {}/gbsa.in -cp complex.prmtop -rp receptor.prmtop -lp ligand.prmtop -y  min.rst\n'.format(task['tools_path']))
 
-    os.system(f'chmod 0700 {run_sh_script}')
+    os.chmod(run_sh_script, 0o700)
 
     cmd = [f'./{run_sh_script}']
 
@@ -3756,7 +3926,7 @@ def scoring_start_hawkins_gbsa(task):
         f.writelines(['$DOCK6/bin/nchemgrid_SA\n'])
         f.writelines(['$DOCK6/bin/dock6 -i Hawkins_GBSA_Score.in\n'])
 
-    os.system(f'chmod 0700 {run_sh_script}')  
+    os.chmod(run_sh_script, 0o700)  
 
     # Create INSPH File: 
     insph_path = os.path.join(task['tmp_run_dir'], "INSPH")
@@ -4176,24 +4346,28 @@ def setup_job_storage_mode(ctx):
 
     if(ctx['job_storage_mode'] == "s3"):
 
-        botoconfig = Config(
+        ctx['job_object'] = os.getenv('AFVS_CONFIG_JOB_OBJECT')
+        ctx['job_bucket'] = os.getenv('AFVS_CONFIG_JOB_BUCKET')
+
+        # Get the config information
+        ctx['s3'] = s3_client(
            region_name = os.getenv('AFVS_AWS_REGION'),
            retries = {
               'max_attempts': 50,
               'mode': 'standard'
            }
         )
-
-        ctx['job_object'] = os.getenv('AFVS_CONFIG_JOB_OBJECT')
-        ctx['job_bucket'] = os.getenv('AFVS_CONFIG_JOB_BUCKET')
-
-        # Get the config information
-        ctx['s3'] = boto3.client('s3', config=botoconfig)
     
     elif(ctx['job_storage_mode'] == "sharedfs"):
         ctx['job_tar'] = os.getenv('AFVS_CONFIG_JOB_TGZ')
+    elif(ctx['job_storage_mode'] == "presigned"):
+        # Out of the environment, so no docking program inherits it (the
+        # process's own /proc/<pid>/environ still shows the original)
+        ctx['job_url'] = os.environ.pop('AFVS_CONFIG_JOB_URL', None)
+        if(not ctx['job_url']):
+            raise RuntimeError("AFVS_CONFIG_JOB_URL must be set if AFVS_JOB_STORAGE_MODE is 'presigned'")
     else:
-        raise RuntimeError(f"Invalid jobstoragemode of {ctx['job_storage_mode']}. AFVS_JOB_STORAGE_MODE must be 's3' or 'sharedfs' ")
+        raise RuntimeError(f"Invalid jobstoragemode of {ctx['job_storage_mode']}. AFVS_JOB_STORAGE_MODE must be 's3', 'sharedfs' or 'presigned' ")
 
 
 def get_subjob_config(ctx, workunit_id, subjob_id):
@@ -4204,8 +4378,10 @@ def get_subjob_config(ctx, workunit_id, subjob_id):
     elif(ctx['job_storage_mode'] == "sharedfs"):
         get_workunit_from_sharedfs(ctx, workunit_id, subjob_id,
             ctx['job_tar'], ctx['temp_dir'])
+    elif(ctx['job_storage_mode'] == "presigned"):
+        get_workunit_from_presigned(ctx, workunit_id, subjob_id, ctx['temp_dir'])
     else:
-        raise RuntimeError(f"Invalid jobstoragemode of {ctx['job_storage_mode']}. AFVS_JOB_STORAGE_MODE must be 's3' or 'sharedfs' ")
+        raise RuntimeError(f"Invalid jobstoragemode of {ctx['job_storage_mode']}. AFVS_JOB_STORAGE_MODE must be 's3', 'sharedfs' or 'presigned' ")
 
 
 
@@ -4359,7 +4535,7 @@ def process(ctx):
         print(f"[TIMING] Total job time: {t_final - t0_total:.2f}s")
         print(f"[TIMING] Breakdown - Config: {t1_config-t0_total:.2f}s, Setup: {t2_setup-t1_config:.2f}s, Docking: {t3_docking-t_docking_start:.2f}s, Upload: {t_final-t3_docking:.2f}s")
     except Exception as e:
-        logging.error(f"Received exception {e}, terminating")
+        logging.error(f"Received exception {redact(e)}, terminating")
 
         for process in [*downloader_processes, *unpacker_processes, *collection_processes, *docking_processes, *summary_processes, *uploader_processes]:
             print(process.name)
@@ -4394,6 +4570,10 @@ def main():
     temp_path = os.getenv('AFVS_TMP_PATH', None)
     if(temp_path):
         temp_path = os.path.join(temp_path, '')
+        # Every tempfile (not only the prefixed ones) belongs there: in
+        # presigned mode the root filesystem is read-only
+        if(os.getenv('AFVS_JOB_STORAGE_MODE') == "presigned"):
+            tempfile.tempdir = temp_path
 
     with tempfile.TemporaryDirectory(prefix=temp_path) as temp_dir:
         ctx['temp_dir'] = temp_dir

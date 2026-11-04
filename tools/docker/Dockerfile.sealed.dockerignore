@@ -1,0 +1,6 @@
+# Build context is the repo root; the image only needs tools/
+*
+!tools
+tools/docker
+**/__pycache__
+**/*.pyc

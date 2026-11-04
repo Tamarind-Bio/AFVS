@@ -26,15 +26,14 @@
 
 import os
 import json
-import boto3
-import botocore
+import time
 import argparse
 import sys
 import tempfile
 import tarfile
 import shutil
 from pathlib import Path
-from botocore.config import Config
+import afvs_presign
 
 MAX_LIGANDS_ON_DEMAND = 100000 # This will be about 100 subjobs
 
@@ -162,8 +161,8 @@ def create_recovery_workunit(ctx, failed_subjobs, recovery_workunit_id):
     out.add(temp_dir.name, arcname="vf_input")
     out.close()
 
-    # Upload to S3 or copy to shared filesystem
-    if ctx['config']['job_storage_mode'] == "s3":
+    # Upload to S3 or copy to shared filesystem (presigned keeps the job in S3)
+    if ctx['config']['job_storage_mode'] in ("s3", "presigned"):
         object_path = [
             ctx['config']['object_store_job_prefix'],
             "recovery",
@@ -216,6 +215,8 @@ def submit_recovery_job(ctx, recovery_workunit, recovery_id, queue_name=None):
     """
     Submit recovery workunit to AWS Batch (optionally to a specific queue)
     """
+    import botocore
+
     config = ctx['config']
     client = ctx['batch']
 
@@ -313,6 +314,228 @@ def submit_recovery_job(ctx, recovery_workunit, recovery_id, queue_name=None):
         raise
 
 
+def latest_subjob_states(status, recovery_status):
+    """(workunit_id, subjob_id) of every original subjob -> where its latest
+    attempt: (state, tarball key, subjob id in that tarball, subjob entry,
+    round), from the latest recovery round that included it, else the main
+    run (round 0)."""
+    latest = {}
+    for workunit_id, workunit in status['workunits'].items():
+        for subjob_id, subjob in workunit.get('subjobs', {}).items():
+            latest[(workunit_id, subjob_id)] = (subjob.get('status'), workunit.get('s3_download_path'), subjob_id, subjob, 0)
+
+    for recovery_id, recovery in sorted(recovery_status['recovery_workunits'].items(),
+                                        key=lambda item: item[1].get('round', 0)):
+        for index, mapping in recovery.get('recovery_subjobs_mapping', {}).items():
+            subjob = recovery['subjobs'].get(index, {})
+            # Not yet seen by afvs_get_status.py: submitted, not failed
+            latest[(mapping['original_workunit_id'], mapping['original_subjob_id'])] = (
+                subjob.get('status', "SUBMITTED"), recovery.get('s3_download_path'), index, subjob,
+                recovery.get('round', 0))
+    return latest
+
+
+def submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, tarball_subjobs):
+    """Submit a recovery workunit whose job, like any presigned job, has no
+    AWS identity: it gets the presigned GET of a freshly signed manifest."""
+    config = ctx['config']
+    workunit_id = f"recovery-{recovery_id}"
+
+    subjobs_count = len(recovery_workunit['subjobs'])
+    manifest_url = afvs_presign.publish_manifest(
+        ctx['s3'], config, workunit_id, recovery_workunit['s3_download_path'], tarball_subjobs)
+
+    # The sealed queue (aws_batch_prefix=vf-sealed -> vf-sealed-queue1); --queue
+    # names the legacy on-demand queue and does not apply here
+    job_queue = f"{config['aws_batch_prefix']}-queue1"
+
+    response = ctx['batch'].submit_job(
+        jobName=f'afvs-{config["job_letter"]}-recovery-{recovery_id}',
+        timeout={
+            'attemptDurationSeconds': int(config["aws_batch_subjob_timeout"])
+        },
+        jobQueue=job_queue,
+        arrayProperties={
+            'size': 2 if subjobs_count == 1 else subjobs_count
+        },
+        jobDefinition=f"{config['aws_batch_jobdef']}",
+        containerOverrides={
+            'resourceRequirements': [
+                {'type': 'VCPU', 'value': config['aws_batch_subjob_vcpus']},
+                {'type': 'MEMORY', 'value': config['aws_batch_subjob_memory']},
+            ],
+            'environment': afvs_presign.job_environment(config, workunit_id, manifest_url)
+        }
+    )
+
+    return {
+        'status': 'SUBMITTED',
+        'job_id': response['jobId'],
+        'queue': job_queue,
+        'subjobs_count': subjobs_count
+    }
+
+
+def recover_presigned(args, config):
+    """job_storage_mode=presigned: resubmit every subjob whose LATEST attempt
+    failed (a later recovery round overrides the main run and earlier rounds),
+    as a new round appended to status.recovery.json, with freshly signed URLs."""
+    with afvs_presign.recovery_lock():
+        return _recover_presigned(args, config)
+
+
+def save_recovery_status(recovery_status_file, recovery_status):
+    with open(f"{recovery_status_file}.tmp", 'w') as f:
+        json.dump(recovery_status, f, indent=4)
+    os.replace(f"{recovery_status_file}.tmp", recovery_status_file)
+
+
+def resolve_pending_rounds(ctx, recovery_status_file, recovery_status):
+    """A recovery workunit is recorded (job_id None) before it is submitted.
+    If an earlier call died between the two, find out from Batch whether the
+    job exists (its name is unique): keep it if so, forget it if not."""
+    changed = False
+    for recovery_id, recovery in list(recovery_status['recovery_workunits'].items()):
+        if recovery.get('job_id'):
+            continue
+        response = ctx['batch'].list_jobs(jobQueue=recovery['queue'], filters=[
+            {'name': 'JOB_NAME', 'values': [recovery['job_name']]}])
+        jobs = response.get('jobSummaryList', [])
+        if jobs:
+            recovery['job_id'] = jobs[0]['jobId']
+            print(f"  Found recovery workunit {recovery_id} already submitted as job {recovery['job_id']}")
+        else:
+            del recovery_status['recovery_workunits'][recovery_id]
+            print(f"  Recovery workunit {recovery_id} was never submitted; its subjobs are retried")
+        changed = True
+    if changed:
+        save_recovery_status(recovery_status_file, recovery_status)
+
+
+def _recover_presigned(args, config):
+    if args.max_subjobs is not None and args.max_subjobs < 1:
+        print("--max-subjobs must be at least 1")
+        return 2
+    if args.from_round is not None and args.from_round < 1:
+        print("--from-round must be at least 1")
+        return 2
+
+    import boto3
+    from botocore.config import Config
+
+    ctx = {
+        'config': config,
+        's3': afvs_presign.s3_client(config),
+        'batch': boto3.client('batch', config=Config(region_name=config['aws_region'])),
+    }
+
+    with open(args.status_file, "r") as read_file:
+        status = json.load(read_file)
+
+    recovery_status_file = "../workflow/status.recovery.json"
+    recovery_status = {'recovery_workunits': {}}
+    if os.path.exists(recovery_status_file):
+        with open(recovery_status_file, "r") as read_file:
+            recovery_status = json.load(read_file)
+    resolve_pending_rounds(ctx, recovery_status_file, recovery_status)
+
+    print("Analyzing status files for subjobs whose latest attempt failed...")
+    tarballs = {}
+    failed_subjobs = []
+    for (workunit_id, subjob_id), (state, tarball_key, tarball_subjob_id, subjob, attempt_round) in latest_subjob_states(status, recovery_status).items():
+        if state != "FAILED":
+            continue
+        # --from-round R: only failures from before round R. A subjob that
+        # failed again in round R waits for round R+1, so it cannot crowd out
+        # this round's own starting failures.
+        if args.from_round is not None and attempt_round >= args.from_round:
+            continue
+        if tarball_key not in tarballs:
+            tarballs[tarball_key] = afvs_presign.tarball_subjobs(ctx['s3'], config, tarball_key)
+        failed_subjobs.append({
+            'workunit_id': workunit_id,
+            'subjob_id': subjob_id,
+            'subjob': status['workunits'][workunit_id]['subjobs'][subjob_id],
+            'collections': tarballs[tarball_key].get(tarball_subjob_id, {}).get('collections', {}),
+            'workunit': status['workunits'][workunit_id]
+        })
+
+    if not failed_subjobs:
+        print("No failed subjobs found!")
+        print("Remaining failed subjobs: 0")
+        return 0
+
+    # Recovery workunits are numbered densely from their collections: a
+    # subjob without any (only a malformed tarball has none) cannot be rerun
+    missing = [item for item in failed_subjobs if not item['collections']]
+    if missing:
+        for item in missing:
+            print(f"ERROR: no collections recorded for {item['workunit_id']}:{item['subjob_id']}")
+        return 1
+
+    # A window of at most --max-subjobs per call, in a stable order. What is
+    # submitted now is in this round, so its latest state is no longer FAILED
+    # and the next call carries on with the rest.
+    failed_subjobs.sort(key=lambda item: (int(item['workunit_id']), int(item['subjob_id'])))
+    remaining = []
+    if args.max_subjobs is not None:
+        failed_subjobs, remaining = failed_subjobs[:args.max_subjobs], failed_subjobs[args.max_subjobs:]
+
+    print(f"\nFound {len(failed_subjobs) + len(remaining)} failed subjobs, submitting {len(failed_subjobs)}:")
+    for item in failed_subjobs:
+        print(f"{item['workunit_id']:<15} {item['subjob_id']:<12} {item['subjob'].get('ligands_expected', 0):<20}")
+
+    if args.report_only:
+        print("\n[Report-only mode: No resubmission performed]")
+        print(f"Remaining failed subjobs: {len(failed_subjobs) + len(remaining)}")
+        return 0
+
+    # Every call with the same --from-round R belongs to round R; without it,
+    # each call is a new round
+    if args.from_round is not None:
+        recovery_round = args.from_round
+    else:
+        recovery_round = 1 + max([entry.get('round', 0) for entry in recovery_status['recovery_workunits'].values()] or [0])
+    already_in_round = sum(1 for entry in recovery_status['recovery_workunits'].values() if entry.get('round') == recovery_round)
+    print(f"\nCreating recovery round {recovery_round} (max {args.max_subjobs_per_workunit} subjobs per workunit)...")
+
+    for i in range(0, len(failed_subjobs), args.max_subjobs_per_workunit):
+        batch = failed_subjobs[i:i + args.max_subjobs_per_workunit]
+        already_in_round += 1
+        recovery_id = f"{config['job_letter']}-r{recovery_round}-{already_in_round}"
+
+        recovery_workunit = create_recovery_workunit(ctx, batch, recovery_id)
+        # The same indexing create_recovery_workunit uses (items without
+        # collections are skipped, keeping their index)
+        tarball_subjobs = {str(index): {'collections': item['collections']}
+                           for index, item in enumerate(batch) if item['collections']}
+
+        # Recorded BEFORE it is submitted (job_id None), so a crash between
+        # the two leaves a trace resolve_pending_rounds can settle; saved
+        # again with the job id right after
+        entry = {
+            'round': recovery_round,
+            'job_id': None,
+            'job_name': f'afvs-{config["job_letter"]}-recovery-{recovery_id}',
+            'queue': f"{config['aws_batch_prefix']}-queue1",
+            'subjobs_count': len(recovery_workunit['subjobs']),
+            's3_download_path': recovery_workunit['s3_download_path'],
+            'subjobs': recovery_workunit['subjobs'],
+            'recovery_subjobs_mapping': recovery_workunit['recovery_subjobs_mapping']
+        }
+        recovery_status['recovery_workunits'][recovery_id] = entry
+        save_recovery_status(recovery_status_file, recovery_status)
+
+        submission_result = submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, tarball_subjobs)
+        entry['job_id'] = submission_result['job_id']
+        save_recovery_status(recovery_status_file, recovery_status)
+        print(f"  Submitted recovery workunit {recovery_id} as job {submission_result['job_id']}")
+
+    print(f"\nRecovery status saved to {recovery_status_file}")
+    print(f"Remaining failed subjobs: {len(remaining)}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Identify and resubmit failed subjobs from AFVS workflow'
@@ -337,6 +560,16 @@ def main():
         help='AWS Batch queue name to submit recovery jobs (e.g., vf-queue-ondemand). If not specified, uses default spot queue.'
     )
     parser.add_argument(
+        '--max-subjobs',
+        type=int,
+        help='job_storage_mode=presigned: submit at most this many failed subjobs per call (repeat calls continue)'
+    )
+    parser.add_argument(
+        '--from-round',
+        type=int,
+        help='job_storage_mode=presigned: this call is part of recovery round R and takes only subjobs whose latest failure is from before R'
+    )
+    parser.add_argument(
         '--max-subjobs-per-workunit',
         type=int,
         default=100,
@@ -347,6 +580,12 @@ def main():
 
     # Parse configuration
     config = parse_config(args.config_file)
+
+    if afvs_presign.is_presigned(config):
+        return recover_presigned(args, config)
+
+    import boto3
+    from botocore.config import Config
 
     # Initialize AWS clients (needed to download workunit tarballs)
     aws_config = Config(region_name=config['aws_region'])

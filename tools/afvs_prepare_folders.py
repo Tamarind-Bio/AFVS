@@ -148,11 +148,12 @@ def check_parameters(config):
         config['object_store_job_addressing_mode'] = config['job_addressing_mode']
 
 
-    if(empty_value(config, 'job_storage_mode') or (config['job_storage_mode'] != "s3" and config['job_storage_mode'] != "sharedfs")):
-        print("* 'job_storage_mode' must be set to 's3' or 'sharedfs'")
+    if(empty_value(config, 'job_storage_mode') or config['job_storage_mode'] not in ("s3", "sharedfs", "presigned")):
+        print("* 'job_storage_mode' must be set to 's3', 'sharedfs' or 'presigned'")
         error = 1
     else:
-        if(config['job_storage_mode'] == "s3"):
+        # presigned keeps the job in S3 too: the head signs URLs for the jobs
+        if(config['job_storage_mode'] in ("s3", "presigned")):
             if(empty_value(config, 'object_store_job_bucket')):
                 print("* 'object_store_job_bucket' must be set if job_storage_mode is 's3'")
                 error = 1
@@ -166,7 +167,7 @@ def check_parameters(config):
         print("* 'job_storage_mode' must be set to 's3' or 'sharedfs'")
         error = 1
     else:
-        if(config['job_storage_mode'] == "s3"):
+        if(config['job_storage_mode'] in ("s3", "presigned")):
             if(empty_value(config, 'object_store_data_bucket')):
                 print("* 'object_store_data_bucket' must be set if job_storage_mode is 's3'")
                 error = 1
@@ -220,6 +221,16 @@ def check_parameters(config):
         else:
             print(f"* batchsystem '{config['batchsystem']}' is not supported. Only awsbatch and slurm are supported")
 
+
+    if(config.get('job_storage_mode') == "presigned"):
+        # Docking jobs get URLs, not credentials: the head (awsbatch) signs
+        # them for collections in S3
+        if(config.get('batchsystem') != "awsbatch" or config.get('data_storage_mode') != "s3"):
+            print("* job_storage_mode=presigned requires batchsystem=awsbatch and data_storage_mode=s3")
+            error = 1
+        if(empty_value(config, 'presigned_url_expiry_seconds') or not re.search(r'^[1-9][0-9]*$', config['presigned_url_expiry_seconds'])):
+            print("* 'presigned_url_expiry_seconds' must be a positive integer if job_storage_mode is 'presigned'")
+            error = 1
 
     if(empty_value(config, 'ligand_library_format')):
         print("* 'ligand_library_format' must be set in all.ctrl")

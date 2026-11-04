@@ -27,17 +27,15 @@
 
 import os
 import json
-import boto3
-import botocore
 import re
 import argparse
 import sys
 import time
-from botocore.config import Config
 from pathlib import Path
 import shutil
 import jinja2
 import subprocess
+import afvs_presign
 
 
 def parse_config(filename):
@@ -175,6 +173,7 @@ def submit_slurm(config, client, current_workunit, jobline):
 
 
 def submit_aws_batch(config, client, current_workunit, jobline):
+    import botocore
 
     jobline_str = str(jobline)
 
@@ -194,31 +193,7 @@ def submit_aws_batch(config, client, current_workunit, jobline):
     # Which queue to submit to
     batch_queue_number = ((jobline - 1) % int(config['aws_batch_number_of_queues'])) + 1
 
-
-    try:
-        response = client.submit_job(
-            jobName=f'afvs-{config["job_letter"]}-{jobline}',
-            timeout={
-                'attemptDurationSeconds': int(config["aws_batch_subjob_timeout"])
-            },
-            jobQueue=f"{config['aws_batch_prefix']}-queue{batch_queue_number}",
-            arrayProperties={
-                'size': subjobs_count
-            },
-            jobDefinition=f"{config['aws_batch_jobdef']}",
-            containerOverrides={
-                'resourceRequirements': [
-                    {
-                        'type': 'VCPU',
-                        'value': config['aws_batch_subjob_vcpus'],
-                    },
-                    {
-                        'type': 'MEMORY',
-                        'value': config['aws_batch_subjob_memory'],
-                    },
-                ],
-                'environment': [
-                
+    environment = [
                     {
                         'name': 'AFVS_RUN_MODE',
                         'value': "awsbatch"
@@ -252,6 +227,39 @@ def submit_aws_batch(config, client, current_workunit, jobline):
                         'value': config['object_store_job_bucket']
                     },
                 ]
+
+    if afvs_presign.is_presigned(config):
+        # The job has no AWS identity: it gets one presigned GET for its
+        # workunit manifest, and the manifest holds every other URL it needs
+        s3 = afvs_presign.s3_client(config)
+        subjobs = afvs_presign.tarball_subjobs(s3, config, current_workunit['s3_download_path'])
+        manifest_url = afvs_presign.publish_manifest(
+            s3, config, jobline_str, current_workunit['s3_download_path'], subjobs)
+        environment = afvs_presign.job_environment(config, jobline_str, manifest_url)
+
+    try:
+        response = client.submit_job(
+            jobName=f'afvs-{config["job_letter"]}-{jobline}',
+            timeout={
+                'attemptDurationSeconds': int(config["aws_batch_subjob_timeout"])
+            },
+            jobQueue=f"{config['aws_batch_prefix']}-queue{batch_queue_number}",
+            arrayProperties={
+                'size': subjobs_count
+            },
+            jobDefinition=f"{config['aws_batch_jobdef']}",
+            containerOverrides={
+                'resourceRequirements': [
+                    {
+                        'type': 'VCPU',
+                        'value': config['aws_batch_subjob_vcpus'],
+                    },
+                    {
+                        'type': 'MEMORY',
+                        'value': config['aws_batch_subjob_memory'],
+                    },
+                ],
+                'environment': environment
             }
         )
 
@@ -271,6 +279,8 @@ def submit_aws_batch(config, client, current_workunit, jobline):
     time.sleep(0.1)
 
 def process(config, start, stop):
+    import boto3
+    from botocore.config import Config
 
     aws_config = Config(
         region_name=config['aws_region']
@@ -345,6 +355,7 @@ def main():
         sys.exit()
 
     config = parse_config("../workflow/config.json")
+
     process(config, int(sys.argv[1]), int(sys.argv[2]))
 
 

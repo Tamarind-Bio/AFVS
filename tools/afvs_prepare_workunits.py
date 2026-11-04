@@ -99,7 +99,8 @@ def publish_workunit(ctx, index, workunit_subjobs):
     out.add(temp_dir.name, arcname="vf_input")
     out.close()
 
-    if(ctx['config']['job_storage_mode'] == "s3"):
+    # presigned stores the job in S3 like s3 mode; the head signs URLs for it at submit time
+    if(ctx['config']['job_storage_mode'] in ("s3", "presigned")):
 
         if(ctx['config']['object_store_job_addressing_mode'] == "hash"):
             hash_string = get_collection_hash(ctx['config']['job_letter'], index)
