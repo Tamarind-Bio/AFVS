@@ -99,6 +99,20 @@ def scenario_output_path(config, scenario_key, content_type, workunit_id, subjob
     return job_root(config) / scenario_key / content_type / str(workunit_id) / f"{subjob_id}.{extension}"
 
 
+def under_job_root(config, path):
+    """Whether `path`, with every symlink resolved, is inside the job root.
+    Checked before any output is written, deleted or trusted, so a symlink
+    planted anywhere in the tree cannot send one elsewhere."""
+    root = os.path.realpath(job_root(config))
+    return os.path.realpath(path).startswith(root + os.sep)
+
+
+def remove_output(config, path):
+    """remove_file, for a path that must be inside the job root."""
+    if under_job_root(config, path):
+        remove_file(path)
+
+
 def output_scenarios(config):
     """The configured scenarios, plus any other scenario folder already in the
     job root (left by an earlier run with other scenarios)."""
@@ -106,7 +120,8 @@ def output_scenarios(config):
     root = job_root(config)
     if root.is_dir():
         for path in sorted(root.iterdir()):
-            if path.is_dir() and path.name not in scenarios and path.name not in ("summary", "input", ".status") \
+            if path.is_dir() and not path.is_symlink() and path.name not in scenarios \
+                    and path.name not in ("summary", "input", ".status") \
                     and any((path / content_type).is_dir() for content_type in ('parquet', 'csv', 'logs')):
                 scenarios.append(path.name)
     return scenarios
@@ -131,21 +146,24 @@ def outputs_complete(config, workunit_id, subjob_id):
     exist when a docking succeeded; with several scenarios afvs_run.py only
     writes them up to the first scenario that had no success, so they are
     required here for the single-scenario case only."""
+    if not under_job_root(config, summary_path(config, workunit_id, subjob_id)):
+        return False
     summary = read_summary(config, workunit_id, subjob_id)
     if summary is None:
         return False
 
     if summary.get('total_dockings', 0) > 0:
         for scenario_key in config['docking_scenario_names']:
-            if not scenario_output_path(config, scenario_key, 'logs', workunit_id, subjob_id).is_file():
+            logs = scenario_output_path(config, scenario_key, 'logs', workunit_id, subjob_id)
+            if not logs.is_file() or not under_job_root(config, logs):
                 return False
 
     if summary.get('dockings_status', {}).get('success', 0) > 0 and len(config['docking_scenario_names']) == 1:
         scenario_key = config['docking_scenario_names'][0]
         summary_formats = config.get('summary_formats') or []
         for summary_format, content_type in (('parquet', 'parquet'), ('csv.gz', 'csv')):
-            if summary_format in summary_formats and \
-                    not scenario_output_path(config, scenario_key, content_type, workunit_id, subjob_id).is_file():
+            table = scenario_output_path(config, scenario_key, content_type, workunit_id, subjob_id)
+            if summary_format in summary_formats and (not table.is_file() or not under_job_root(config, table)):
                 return False
 
     return True
@@ -268,7 +286,7 @@ def output_manifest(config, workunit_id, subjob_id):
     root = job_root(config)
     manifest = {}
     for path in subjob_output_paths(config, workunit_id, subjob_id):
-        if not path.name.endswith(".partial") and path.is_file():
+        if not path.name.endswith(".partial") and path.is_file() and under_job_root(config, path):
             manifest[path.relative_to(root).as_posix()] = path.stat().st_size
     return manifest
 
@@ -285,7 +303,7 @@ def read_done_marker(config, workunit_id, subjob_id, fingerprint):
     root = job_root(config)
     for relative_path, size in marker['outputs'].items():
         try:
-            if (root / relative_path).stat().st_size != size:
+            if not under_job_root(config, root / relative_path) or (root / relative_path).stat().st_size != size:
                 return None
         except OSError:
             return None
@@ -299,7 +317,7 @@ def remove_unrecorded_outputs(config, workunit_id, subjob_id, marker):
     root = job_root(config)
     for path in subjob_output_paths(config, workunit_id, subjob_id):
         if path.is_file() and path.relative_to(root).as_posix() not in recorded:
-            remove_file(path)
+            remove_output(config, path)
 
 
 def run_started():
@@ -355,8 +373,8 @@ def subjob_state(config, workunit_id, subjob_id, subjob, alive=None):
 
     failed = read_json(attempt_path(workunit_id, subjob_id, "failed"))
     if failed is not None:
-        # A live runner retries everything not done before it exits, so
-        # nothing it may still run is final yet
+        # Not final while a runner is alive: it may be retried by a later run
+        # (recovery waits for this one to exit). FAILED once no runner is left.
         if alive is None:
             alive = runner_alive()
         if alive:

@@ -160,8 +160,8 @@ subjob is shown as:
 | --- | --- |
 | `SUCCEEDED` | It has a valid `.done` marker |
 | `RUNNING` | An attempt is in flight under a live runner |
-| `FAILED` | Its last attempt failed, its runner died mid-attempt, or a run ended without reaching it |
-| `PENDING` | It has not been attempted yet, and a runner may still reach it |
+| `FAILED` | No runner is alive, and its last attempt failed, its runner died mid-attempt, or a run ended without reaching it |
+| `PENDING` | A runner is alive and the subjob is not done (including one that already failed in this run), or no run has started yet |
 
 Workunits roll these up the way an AWS Batch array parent does. vCPU hours
 come from the `.done` markers, so they include subjobs that finished before a

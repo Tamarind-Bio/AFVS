@@ -159,7 +159,7 @@ def check_parameters(config):
             error = 1
         # ...and <local_job_root>/<job_name>/<scenario>/ under it
         for name in [config.get('job_name', '')] + config['docking_scenario_names']:
-            if(name in (".", "..") or "/" in name or "\\" in name or "\0" in name):
+            if(name in ("", ".", "..") or "/" in name or "\\" in name or "\0" in name):
                 print(f"* '{name}': job_name and docking_scenario_names must be single path components (no '/', not '.' or '..') if job_storage_mode is 'local'")
                 error = 1
         # ...nor follow a symlink planted where those directories go

@@ -154,6 +154,8 @@ def publish_workunit(ctx, index, workunit_subjobs):
         # Same place the S3 backend puts it: <job>/input/tasks/<index>.tar.gz
         local_workunit_path = afvs_local.job_root(ctx['config']) / "input" / "tasks" / f"{index}.tar.gz"
         local_workunit_path.parent.mkdir(parents=True, exist_ok=True)
+        if(not afvs_local.under_job_root(ctx['config'], local_workunit_path)):
+            raise RuntimeError(f"{local_workunit_path} resolves outside {afvs_local.job_root(ctx['config'])}")
         shutil.copyfile(f'{temp_dir_tar.name}/{index}.tar.gz', local_workunit_path)
 
         temp_dir.cleanup()

@@ -216,9 +216,9 @@ class Attempt:
     def start(self):
         # Clear what an earlier attempt (or an earlier wave) left, so nothing
         # stale survives into this attempt's outputs
-        afvs_local.remove_file(afvs_local.done_marker_path(self.config, self.workunit_id, self.subjob_id))
+        afvs_local.remove_output(self.config, afvs_local.done_marker_path(self.config, self.workunit_id, self.subjob_id))
         for output_path in afvs_local.subjob_output_paths(self.config, self.workunit_id, self.subjob_id):
-            afvs_local.remove_file(output_path)
+            afvs_local.remove_output(self.config, output_path)
         afvs_local.remove_file(self.failed_path)
 
         self.started = time.time()
@@ -279,7 +279,9 @@ class Attempt:
         self.finished = True
         vcpu_seconds = self.vcpu_seconds()
 
-        if returncode == 0 and afvs_local.outputs_complete(self.config, self.workunit_id, self.subjob_id):
+        done_path = afvs_local.done_marker_path(self.config, self.workunit_id, self.subjob_id)
+        if returncode == 0 and afvs_local.outputs_complete(self.config, self.workunit_id, self.subjob_id) \
+                and afvs_local.under_job_root(self.config, done_path):
             afvs_local.write_json_atomic(
                 afvs_local.done_marker_path(self.config, self.workunit_id, self.subjob_id), {
                     'fingerprint': self.subjob['fingerprint'],

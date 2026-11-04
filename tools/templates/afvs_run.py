@@ -1097,6 +1097,11 @@ def upload_process(ctx, upload_queue):
             parent_directory = Path(Path(item['remote_path']).parent)
             parent_directory.mkdir(parents=True, exist_ok=True)
 
+            # Never through a symlink that leads out of the job root
+            job_root = os.path.realpath(f"{ctx['main_config']['local_job_root']}/{ctx['main_config']['job_name']}")
+            if not os.path.realpath(item['remote_path']).startswith(job_root + os.sep):
+                raise RuntimeError(f"Output {item['remote_path']} resolves outside {job_root}")
+
             partial_path = f"{item['remote_path']}.partial"
             shutil.copyfile(item['local_path'], partial_path)
             os.replace(partial_path, item['remote_path'])

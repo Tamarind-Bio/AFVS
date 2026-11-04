@@ -125,6 +125,8 @@ def test_prepare_writes_local_workunits(screen):
      "must be single path components"),
     ("job_name=fixture-job", "job_name=/abs",
      "must be single path components"),
+    ("docking_scenario_names=qvina02", "docking_scenario_names=",
+     "'': job_name and docking_scenario_names must be single path components"),
     ("docking_scenario_names=qvina02", "docking_scenario_names=..",
      "'..': job_name and docking_scenario_names must be single path components"),
     ("job_name=fixture-job", "job_letter=fixture-job",
@@ -156,6 +158,26 @@ def test_prepare_refuses_a_symlinked_job_directory(screen):
     ret = screen.run("afvs_prepare_folders.py", "--overwrite", check=False)
     assert ret.returncode == 1
     assert "is a symlink; local outputs must stay under local_job_root" in ret.stdout
+
+
+def test_a_symlink_inside_the_job_root_cannot_redirect_outputs(screen):
+    """A symlink anywhere in the job tree (here a scenario's parquet folder,
+    and a stale unconfigured scenario folder) must neither receive outputs
+    nor have files deleted through it."""
+    screen.prepare()
+    elsewhere = screen.base / "elsewhere"
+    (elsewhere / "parquet" / "1").mkdir(parents=True)
+    bystander = elsewhere / "parquet" / "1" / "0.parquet"
+    bystander.write_text("another job's file")
+    (screen.job_dir / "qvina02").mkdir(parents=True)
+    (screen.job_dir / "qvina02" / "parquet").symlink_to(elsewhere / "parquet")
+    (screen.job_dir / "vina").symlink_to(elsewhere)
+
+    ret = screen.run("afvs_run_local.py", check=False)
+    assert ret.returncode == 1  # the subjobs whose tables would land outside fail
+    assert screen.done_markers() == []
+    assert bystander.read_text() == "another job's file"
+    assert sorted(p.name for p in (elsewhere / "parquet").rglob("*") if p.is_file()) == ["0.parquet"]
 
 
 def test_submit_jobs_points_local_mode_at_the_runner(screen):
