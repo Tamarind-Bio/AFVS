@@ -80,6 +80,11 @@ input/tasks/<wu>.tar.gz
 Each output file is written to a temporary name and then renamed into place, so
 a reader never sees a partial file.
 
+The job tree must contain no symlinks. It is only written by AFVS and
+restored from object storage, so a symlink in it means something planted it.
+Prepare and `afvs_run_local.py` refuse such a tree, and every output write
+and delete is also checked to resolve inside the job root.
+
 ## Completion markers and resume
 
 `.status/<wu>/<sj>.done` is written only after the subjob's `afvs_run.py`

@@ -457,6 +457,9 @@ def main():
 
     # Local mode never touches S3 (and must not import boto3)
     if(afvs_local.is_local(ctx['config'])):
+        symlinks = afvs_local.symlinks_in_job_tree(ctx['config'])
+        if(symlinks):
+            raise RuntimeError(f"The job tree contains symlinks, e.g. {symlinks[0]}")
         ctx['docking_inputs'] = afvs_local.inputs_digest(ctx['config'])
     else:
         import boto3

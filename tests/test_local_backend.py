@@ -160,24 +160,32 @@ def test_prepare_refuses_a_symlinked_job_directory(screen):
     assert "is a symlink; local outputs must stay under local_job_root" in ret.stdout
 
 
-def test_a_symlink_inside_the_job_root_cannot_redirect_outputs(screen):
-    """A symlink anywhere in the job tree (here a scenario's parquet folder,
-    and a stale unconfigured scenario folder) must neither receive outputs
-    nor have files deleted through it."""
+@pytest.mark.parametrize("link", [
+    "qvina02/parquet",           # a folder an output goes into
+    "qvina02/parquet/1/0.parquet.partial",  # the name an output is written under
+    "vina",                      # a stale scenario folder cleanup would sweep
+    ".status/1",                 # where .done markers go
+])
+def test_a_job_tree_with_a_symlink_is_refused(screen, link):
+    """The job tree is only written by AFVS and restored from object storage,
+    so a symlink in it was planted: nothing is written or deleted through it."""
     screen.prepare()
     elsewhere = screen.base / "elsewhere"
-    (elsewhere / "parquet" / "1").mkdir(parents=True)
-    bystander = elsewhere / "parquet" / "1" / "0.parquet"
+    elsewhere.mkdir()
+    bystander = elsewhere / "0.parquet"
     bystander.write_text("another job's file")
-    (screen.job_dir / "qvina02").mkdir(parents=True)
-    (screen.job_dir / "qvina02" / "parquet").symlink_to(elsewhere / "parquet")
-    (screen.job_dir / "vina").symlink_to(elsewhere)
+    path = screen.job_dir / link
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.symlink_to(bystander if link.endswith(".partial") else elsewhere)
 
     ret = screen.run("afvs_run_local.py", check=False)
-    assert ret.returncode == 1  # the subjobs whose tables would land outside fail
+    assert ret.returncode == 2 and "the job tree contains symlinks" in ret.stdout
     assert screen.done_markers() == []
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["0.parquet"]
     assert bystander.read_text() == "another job's file"
-    assert sorted(p.name for p in (elsewhere / "parquet").rglob("*") if p.is_file()) == ["0.parquet"]
+
+    ret = screen.run("afvs_prepare_workunits.py", check=False)
+    assert ret.returncode != 0 and "The job tree contains symlinks" in ret.stderr
 
 
 def test_submit_jobs_points_local_mode_at_the_runner(screen):

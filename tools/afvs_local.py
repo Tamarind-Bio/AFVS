@@ -107,6 +107,22 @@ def under_job_root(config, path):
     return os.path.realpath(path).startswith(root + os.sep)
 
 
+def symlinks_in_job_tree(config):
+    """Every symlink under the job root (and the job root itself, if it is
+    one). The tree is only ever written by AFVS and restored from object
+    storage, so a symlink in it means something planted it. The runner and
+    prepare refuse to work on such a tree."""
+    root = job_root(config)
+    found = [root] if root.is_symlink() else []
+    if root.is_dir() and not root.is_symlink():
+        for directory, dirnames, filenames in os.walk(root):
+            for name in dirnames + filenames:
+                path = Path(directory) / name
+                if path.is_symlink():
+                    found.append(path)
+    return found
+
+
 def remove_output(config, path):
     """remove_file, for a path that must be inside the job root."""
     if under_job_root(config, path):
@@ -295,7 +311,10 @@ def read_done_marker(config, workunit_id, subjob_id, fingerprint):
     """The subjob's .done contents if it is complete for THIS workunit layout,
     otherwise None (missing, unreadable, another wave's, or any output it
     recorded is gone or changed size, e.g. a restore that stopped part way)."""
-    marker = read_json(done_marker_path(config, workunit_id, subjob_id))
+    marker_path = done_marker_path(config, workunit_id, subjob_id)
+    if not under_job_root(config, marker_path):
+        return None
+    marker = read_json(marker_path)
     if not isinstance(marker, dict) or marker.get('fingerprint') != fingerprint:
         return None
     if not isinstance(marker.get('outputs'), dict) or not outputs_complete(config, workunit_id, subjob_id):

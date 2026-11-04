@@ -388,6 +388,10 @@ def run(config, workers):
     previous_handlers[signal.SIGCHLD] = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
     try:
+        symlinks = afvs_local.symlinks_in_job_tree(config)
+        if symlinks:
+            print(f"Not starting: the job tree contains symlinks, e.g. {symlinks[0]}")
+            return 2
         if not kill_orphans():
             # Rerunning its subjob now could interleave two attempts' outputs
             print("Not starting: an earlier attempt is still running")
