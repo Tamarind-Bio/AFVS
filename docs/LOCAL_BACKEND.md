@@ -107,6 +107,9 @@ the subjob runs again, when:
     whatever those refer to. So a run under the same `job_name` with another
     box or receptor does not match. Hidden files (a stray `.DS_Store`) don't
     count.
+  - absolute files a scenario `config.txt` names. These are read when the
+    subjob runs, not frozen into the workunit, so do not change them between
+    prepare and run.
   - the size of each staged collection tarball. This is a cheap guard
     against a restage that changed a collection under the same key; hashing
     the contents would mean reading the whole library on every prepare.

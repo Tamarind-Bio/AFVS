@@ -322,7 +322,6 @@ def acquire_runner_lock():
     """The runner lock, or None if another runner holds it. A status call
     probes the lock (shared, for an instant), so retry for a few seconds
     before giving up."""
-    afvs_local.LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock_file = open(afvs_local.RUNNER_LOCK, "w")
     deadline = time.time() + LOCK_WAIT_SECONDS
     while True:
@@ -391,6 +390,7 @@ def run(config, workers):
             # Rerunning its subjob now could interleave two attempts' outputs
             print("Not starting: an earlier attempt is still running")
             return 2
+        afvs_local.LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
         afvs_local.RUN_STARTED.write_text(f"{time.time()}\n")
 
         workunits = get_workunits()

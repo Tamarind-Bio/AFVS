@@ -183,6 +183,7 @@ def inputs_digest(config):
             continue
         for line in config_path.read_text().splitlines():
             for token in line.split('#')[0].replace("=", " ").split():
+                token = token.strip('"\',;')
                 if os.path.isabs(token) and os.path.isfile(token):
                     files[token] = _file_hash(Path(token))
     return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
