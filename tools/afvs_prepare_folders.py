@@ -152,6 +152,12 @@ def check_parameters(config):
         print("* 'job_storage_mode' must be set to 's3', 'sharedfs' or 'local'")
         error = 1
     elif(config['job_storage_mode'] == "local"):
+        # Outputs go to <local_job_root>/<job_name>/: a job_name that is not a
+        # single plain path component would put them somewhere else
+        job_name = config.get('job_name', '')
+        if(job_name in ("", ".", "..") or "/" in job_name or "\\" in job_name or "\0" in job_name):
+            print("* 'job_name' must be a single path component (no '/', not '.' or '..') if job_storage_mode is 'local'")
+            error = 1
         if(empty_value(config, 'local_job_root')):
             print("* 'local_job_root' must be set if job_storage_mode is 'local'")
             error = 1

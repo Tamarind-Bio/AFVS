@@ -118,6 +118,13 @@ def test_prepare_writes_local_workunits(screen):
 
 
 @pytest.mark.parametrize("old, new, message", [
+    # The job's outputs must stay under local_job_root
+    ("job_name=fixture-job", "job_name=..",
+     "'job_name' must be a single path component"),
+    ("job_name=fixture-job", "job_name=../other",
+     "'job_name' must be a single path component"),
+    ("job_name=fixture-job", "job_name=/abs",
+     "'job_name' must be a single path component"),
     # all.ctrl has no inline comments: this parser would keep one as part of the path
     ("local_job_root=", "local_job_root=/out   # comment\nignored_",
      "'local_job_root' must not contain '#'"),
