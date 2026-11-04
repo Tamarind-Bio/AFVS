@@ -346,7 +346,7 @@ then re-run afvs_prepare_folders.py --skip_errors (Not recommended!)
 
     lock_file = afvs_run_local.acquire_runner_lock()
     if(lock_file is None):
-        print("afvs_run_local.py is running this workflow; stop it before --overwrite")
+        print("afvs_run_local.py (or another prepare) is using this workflow; stop it before --overwrite")
         exit(1)
     # Held through the delete, so no runner can start in between
     with lock_file:

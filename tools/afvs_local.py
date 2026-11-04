@@ -182,8 +182,13 @@ def inputs_digest(config):
         if not config_path.is_file():
             continue
         for line in config_path.read_text().splitlines():
-            for token in line.split('#')[0].replace("=", " ").split():
-                token = token.strip('"\',;')
+            line = line.split('#')[0]
+            # A "key = value" value whole (paths may contain spaces), and each
+            # whitespace token (PLANTS-style "key value" lines)
+            key, sep, value = line.partition("=")
+            candidates = ([value] if sep else []) + line.replace("=", " ").split()
+            for token in candidates:
+                token = token.strip().strip('"\',;')
                 if os.path.isabs(token) and os.path.isfile(token):
                     files[token] = _file_hash(Path(token))
     return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()

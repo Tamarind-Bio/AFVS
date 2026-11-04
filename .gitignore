@@ -3,3 +3,6 @@
 *.pyc
 .dropbox.attr
 *.attr
+
+# Local backend runner lock (afvs_run_local.py, afvs_prepare_folders.py)
+/.afvs_local_runner.lock

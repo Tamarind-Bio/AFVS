@@ -446,7 +446,9 @@ def test_done_markers_follow_the_work_they_describe(screen, change, expect):
         screen.run("afvs_run_local.py")
         (outside / "grid.map").write_text("B")
     elif change == "absolute_receptor":
-        outside = screen.base / "receptor.pdb"
+        # A mounted path with a space in it
+        (screen.base / "customer A").mkdir()
+        outside = screen.base / "customer A" / "receptor.pdb"
         outside.write_text((inputs / "receptors" / "receptor.pdb").read_text())
         box.write_text(box.read_text().replace("../input-files/receptors/receptor.pdb", str(outside)))
         screen.prepare()
