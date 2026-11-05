@@ -9,6 +9,7 @@ import io
 import json
 import subprocess
 import sys
+import time
 from contextlib import redirect_stdout
 
 import pytest
@@ -87,7 +88,7 @@ def screen(tmp_path, boto, monkeypatch):
     tools = batch_tree(tmp_path)
     ctrl = tools / "templates" / "all.ctrl"
     ctrl.write_text(ctrl.read_text().replace("job_storage_mode=s3\n", "job_storage_mode=presigned\n")
-                    + "presigned_url_expiry_seconds=3600\n")
+                    + "presigned_url_expiry_seconds=43200\n")
     prepare_batch(tools, boto, monkeypatch)
 
     workflow = tools.parent / "workflow"
@@ -292,3 +293,88 @@ def test_unsupported_configuration_exits_nonzero(screen, boto, job_storage_mode,
     assert screen.output == (f"Configuration with job_storage_mode={job_storage_mode} and "
                              f"batchsystem={batchsystem} is not supported\n")
     assert boto.calls == []
+
+
+def recovery_entry(job_id, **extra):
+    return {
+        'round': 1, 'job_id': job_id, 'queue': "vf-queue1", 'subjobs_count': 1,
+        's3_download_path': "scores/someone/dataset/batch-job/input/recovery/a-r1-1.tar.gz",
+        'subjobs': {"0": {'ligands_expected': 3}},
+        'recovery_subjobs_mapping': {"0": {'original_workunit_id': "2", 'original_subjob_id': "0"}},
+        **extra,
+    }
+
+
+def test_a_recovery_workunit_recorded_but_not_submitted_is_not_asked_about(screen, boto):
+    """Recover records a workunit (job_id None) before SubmitJob. A status run
+    in between, or after a crash there, must not ask Batch about job None."""
+    boto.describe_jobs_responses = list(FIRST_ROUND)
+    screen()
+    (screen.workflow / "status.recovery.json").write_text(json.dumps({'recovery_workunits': {
+        "a-r1-1": recovery_entry(None, recorded_at=0)}}))
+
+    boto.describe_jobs_responses = [
+        {'jobs': [parent("j3", "RUNNING")]},
+        {'jobs': [{'jobId': "j3:0", 'status': "RUNNING", 'container': vcpu_requirement(32), 'attempts': []}]},
+    ]
+    screen()
+    assert boto.calls[1:] == [('describe_jobs', ["j3"]), ('describe_jobs', ["j3:0", "j3:1"])]
+    recovery = json.loads((screen.workflow / "status.recovery.json").read_text())
+    assert recovery['recovery_workunits']["a-r1-1"]['job_id'] is None
+
+
+@pytest.mark.parametrize("submitted_ago, expected", [
+    # DescribeJobs can lag a SubmitJob: a job just submitted is still coming
+    (60, "SUBMITTED"),
+    # Long gone (aged out of Batch): fail it closed, unbilled, so recovery reruns it
+    (3600, "FAILED"),
+])
+def test_a_parent_missing_from_describe_jobs_fails_only_after_a_grace(screen, boto, submitted_ago, expected):
+    status_file = screen.workflow / "status.json"
+    status = json.loads(status_file.read_text())
+    status['workunits']["3"]['submitted_at'] = time.time() - submitted_ago
+    status_file.write_text(json.dumps(status))
+
+    boto.describe_jobs_responses = [
+        {'jobs': [parent("j1", "RUNNING"), parent("j2", "RUNNING")]},
+        {'jobs': [{'jobId': f"j{n}:0", 'status': "RUNNING", 'container': vcpu_requirement(16), 'attempts': []}
+                  for n in (1, 2)]},
+    ]
+    screen()
+    subjob = json.loads(status_file.read_text())['workunits']["3"]['subjobs']["0"]
+    assert subjob['status'] == expected
+    assert subjob.get('vcpu_seconds') == (0 if expected == "FAILED" else None)
+
+
+def test_status_never_writes_back_an_older_state_over_a_final_one(screen, boto, monkeypatch):
+    """Two status runs overlap: the slower one read status.recovery.json before
+    the faster one wrote a final state. Its write-back must not undo that."""
+    boto.describe_jobs_responses = list(FIRST_ROUND)
+    screen()
+    recovery_file = screen.workflow / "status.recovery.json"
+    recovery_file.write_text(json.dumps({'recovery_workunits': {"a-r1-1": recovery_entry("r1")}}))
+
+    boto.describe_jobs_responses = [
+        {'jobs': [parent("j3", "RUNNING"), parent("r1", "RUNNING")]},
+        {'jobs': [
+            {'jobId': "j3:0", 'status': "RUNNING", 'container': vcpu_requirement(32), 'attempts': []},
+            {'jobId': "r1:0", 'status': "RUNNING", 'container': vcpu_requirement(16), 'attempts': []},
+        ]},
+    ]
+
+    # The faster run writes r1:0 FAILED (billed) after this run read the file
+    # and before it takes the lock to write back
+    afvs_presign = sys.modules['afvs_presign']
+    real_lock = afvs_presign.recovery_lock
+
+    def lock_after_faster_run():
+        done = recovery_entry("r1", status="FAILED")
+        done['subjobs']["0"].update(status="FAILED", vcpus=16, vcpu_seconds=480.0, vcpu_seconds_interrupted=0)
+        recovery_file.write_text(json.dumps({'recovery_workunits': {"a-r1-1": done}}))
+        return real_lock()
+
+    monkeypatch.setattr(afvs_presign, "recovery_lock", lock_after_faster_run)
+    screen()
+    entry = json.loads(recovery_file.read_text())['recovery_workunits']["a-r1-1"]
+    assert entry['status'] == "FAILED"
+    assert (entry['subjobs']["0"]['status'], entry['subjobs']["0"]['vcpu_seconds']) == ("FAILED", 480.0)

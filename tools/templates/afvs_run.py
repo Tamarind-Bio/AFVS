@@ -4516,8 +4516,12 @@ def process(ctx):
 
             download_queue.put(download_item)
 
-            # Don't overflow the queues
+            # Don't overflow the queues. A downloader exits on a transfer it
+            # cannot recover from (an expired or rejected URL), and with none
+            # left the queue never drains: fail now, not at the Batch timeout
             while download_queue.qsize() > 25:
+                if not any(process.is_alive() for process in downloader_processes):
+                    raise RuntimeError("Every downloader exited")
                 time.sleep(0.2)
 
         flush_queue(download_queue, downloader_processes, "download")

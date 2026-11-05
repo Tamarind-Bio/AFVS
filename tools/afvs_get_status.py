@@ -49,6 +49,10 @@ import shutil
 import sys
 import afvs_presign
 
+# How long a submitted job may be missing from DescribeJobs before it is
+# taken as gone (DescribeJobs can lag a SubmitJob)
+PARENT_GRACE_SECONDS = 900
+
 
 
 def downloader(download_queue, summary_queue, tmp_dir, config):
@@ -673,8 +677,10 @@ def process_presigned(config):
         recovery_workunits = sorted(recovery_complete['recovery_workunits'].items(),
                                     key=lambda item: item[1].get('round', 0))
 
-    submitted = [workunit for workunit in main_workunits.values() if 'job_id' in workunit] + \
-        [workunit for _, workunit in recovery_workunits if 'job_id' in workunit]
+    # A recovery workunit recorded but not yet submitted (job_id None) has no
+    # job to ask about: its subjobs count as submitted
+    submitted = [workunit for workunit in main_workunits.values() if workunit.get('job_id')] + \
+        [workunit for _, workunit in recovery_workunits if workunit.get('job_id')]
 
     print("Getting workunit status")
 
@@ -714,7 +720,10 @@ def process_presigned(config):
             # reports (aged out with its parent) would otherwise stay
             # SUBMITTED for good and the screen would never finish: fail it
             # closed, unbilled, and recovery reruns it
-            parent_gone = workunit['job_id'] in asked_parents and workunit['job_id'] not in parents
+            # DescribeJobs can lag a SubmitJob, so a job missing from it only
+            # counts as gone once it was submitted a while ago
+            parent_gone = (workunit['job_id'] in asked_parents and workunit['job_id'] not in parents
+                           and time.time() - workunit.get('submitted_at', workunit.get('recorded_at', 0)) > PARENT_GRACE_SECONDS)
             if workunit.get('status') in final_states or parent_gone:
                 subjob['status'] = 'FAILED'
                 subjob['vcpu_seconds'] = 0
@@ -745,7 +754,7 @@ def process_presigned(config):
             latest[(workunit_id, subjob_id)] = subjob
 
     for _, recovery_workunit in recovery_workunits:
-        if 'job_id' not in recovery_workunit:
+        if not recovery_workunit.get('job_id'):
             continue
         for recovery_subjob_id, mapping in recovery_workunit.get('recovery_subjobs_mapping', {}).items():
             key = (str(mapping['original_workunit_id']), str(mapping['original_subjob_id']))
@@ -857,13 +866,21 @@ def process_presigned(config):
                     target = current['recovery_workunits'].get(recovery_id)
                     if target is None:
                         continue
-                    for key in ('status', 'status_summary', 'padding'):
-                        if key in recovery:
-                            target[key] = recovery[key]
+                    # A concurrent status run may already have written a final
+                    # state from a newer read: never step back from it
+                    if target.get('status') not in final_states:
+                        for key in ('status', 'status_summary'):
+                            if key in recovery:
+                                target[key] = recovery[key]
+                    if 'padding' in recovery and target.get('padding', {}).get('status') not in final_states:
+                        target['padding'] = recovery['padding']
                     for index, subjob in recovery['subjobs'].items():
+                        target_subjob = target['subjobs'].setdefault(index, {})
+                        if target_subjob.get('status') in final_states:
+                            continue
                         for key in ('status', 'vcpus', 'vcpu_seconds', 'vcpu_seconds_interrupted'):
                             if key in subjob:
-                                target['subjobs'].setdefault(index, {})[key] = subjob[key]
+                                target_subjob[key] = subjob[key]
             with open("../workflow/status.recovery.tmp.json", "w") as json_out:
                 json.dump(current, json_out)
             shutil.move("../workflow/status.recovery.tmp.json", recovery_status_file)

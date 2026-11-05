@@ -231,6 +231,16 @@ def check_parameters(config):
         if(empty_value(config, 'presigned_url_expiry_seconds') or not re.search(r'^[1-9][0-9]*$', config['presigned_url_expiry_seconds'])):
             print("* 'presigned_url_expiry_seconds' must be a positive integer if job_storage_mode is 'presigned'")
             error = 1
+        elif(int(config['presigned_url_expiry_seconds']) > 604800):
+            # The longest a SigV4 presigned URL can be valid
+            print("* 'presigned_url_expiry_seconds' must be at most 604800 (7 days)")
+            error = 1
+        elif(re.search(r'^[0-9]+$', config.get('aws_batch_subjob_timeout', '')) and
+             int(config['presigned_url_expiry_seconds']) < int(config['aws_batch_subjob_timeout'])):
+            # A job uploads its outputs at the end of its run, so its URLs must
+            # outlast it (and its time in the queue)
+            print("* 'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout'")
+            error = 1
 
     if(empty_value(config, 'ligand_library_format')):
         print("* 'ligand_library_format' must be set in all.ctrl")

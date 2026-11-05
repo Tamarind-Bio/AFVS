@@ -20,8 +20,10 @@ aws_batch_jobdef=vf-jobdef-afvs-sealed
 
 The `object_store_*`, `aws_region` and other `aws_batch_*` keys are the same as
 in s3 mode. Prepare rejects presigned mode unless `batchsystem=awsbatch` and
-`data_storage_mode=s3`, and it requires a positive
-`presigned_url_expiry_seconds`.
+`data_storage_mode=s3`. It requires `presigned_url_expiry_seconds` to be at
+most 604800 (the SigV4 limit) and at least `aws_batch_subjob_timeout`, because a
+job uploads its outputs at the end of its run. URLs are signed at submit, so
+they must also outlast the time a job waits in the queue.
 
 ## What the head does
 
@@ -48,7 +50,9 @@ in s3 mode. Prepare rejects presigned mode unless `batchsystem=awsbatch` and
 - **`afvs_get_status.py`** reads nothing the jobs wrote. Job state and vCPU-hours
   come from Batch `DescribeJobs`. vCPU-hours are the attempts' run time × the
   job's vCPUs, summed over the main run and every recovery round. Docking
-  counts are not reported here.
+  counts are not reported here. A job that DescribeJobs does not return counts
+  as gone (its subjobs FAILED, unbilled) only when it was submitted more than
+  15 minutes earlier, because DescribeJobs can lag SubmitJob.
 - **`afvs_recover_failed_subjobs.py`** reruns every subjob whose latest attempt
   failed, as a new round (`<job>-r<N>-<n>`) appended to `status.recovery.json`.
   A later round overrides earlier rounds and the main run, so a subjob that
@@ -61,10 +65,18 @@ in s3 mode. Prepare rejects presigned mode unless `batchsystem=awsbatch` and
   `Remaining failed subjobs: K`. Later calls carry on from there.
 - Recovery holds a lock (`../workflow/status.recovery.lock`) for the whole
   call, and status holds it while writing `status.recovery.json` back.
-- Each recovery workunit is recorded before it is submitted. If a call dies
-  between the two, the next call asks Batch (`ListJobs`, by the workunit's
-  unique job name) whether the job exists, then keeps the record or retries
-  the subjobs.
+- Each recovery workunit is recorded before it is submitted, under a job name
+  with a random suffix. If a call dies between the two, the next call asks
+  Batch (`ListJobs`, all pages, by that name, created no earlier than the
+  record) whether the job exists:
+  - If it does, the call keeps the record.
+  - If it doesn't, the call waits 15 minutes for ListJobs to catch up, then
+    marks the record `abandoned` and retries its subjobs. An abandoned record
+    stays in the file, so its id and S3 keys are never reused.
+
+  `--report-only` changes nothing.
+- When two status runs overlap, the later write-back never replaces a final
+  state with an earlier one.
 - A Batch array of one is submitted as two. The padding child does no work,
   but its run time is billed with its workunit.
 
@@ -80,8 +92,11 @@ in s3 mode. Prepare rejects presigned mode unless `batchsystem=awsbatch` and
 
 ## What a docking job does
 
-The job command is `templates/afvs_run.py`, with `AFVS_JOB_STORAGE_MODE=presigned`
-and `AFVS_CONFIG_JOB_URL` set. The job:
+The job definition's command is
+`["/opt/AFVS/tools/templates/template1.presigned.sh"]`. The image has no
+ENTRYPOINT. The script takes the subjob from `AWS_BATCH_JOB_ARRAY_INDEX` and
+runs `templates/afvs_run.py`, with `AFVS_JOB_STORAGE_MODE=presigned` and
+`AFVS_CONFIG_JOB_URL` set by submit. The job:
 
 1. GETs its manifest, then the workunit tarball.
 2. Points each collection and each output at its URL.
@@ -96,6 +111,8 @@ How it handles failed transfers:
   of silently skipping ligands. That includes an expired or rejected URL, and
   a PUT that is refused.
 - Transient errors (5xx, 408, 429, network) are retried with backoff.
+- If every downloader has exited, the job fails at once instead of waiting
+  for the Batch timeout.
 
 ## URLs never reach a log
 
@@ -132,8 +149,8 @@ these use:
   `templates/afvs_run.py`
 - the T2 sealed tool container
 
-It has AFVS at `/opt/AFVS` (`AFVS_HOME`), the bundled docking binaries, Open
-Babel, pandas/pyarrow and torch/rdkit. It has no ENTRYPOINT, runs as UID 1000,
+It has AFVS at `/opt/AFVS` (`AFVS_HOME`), the bundled docking binaries (with
+gwovina rebuilt against the image's Boost), Open Babel, pandas/pyarrow and torch/rdkit. It has no ENTRYPOINT, runs as UID 1000,
 and has no boto3. It has not been pushed anywhere.
 
 ```bash

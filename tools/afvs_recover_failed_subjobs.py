@@ -27,6 +27,7 @@
 import os
 import json
 import time
+import secrets
 import argparse
 import sys
 import tempfile
@@ -326,6 +327,8 @@ def latest_subjob_states(status, recovery_status):
 
     for recovery_id, recovery in sorted(recovery_status['recovery_workunits'].items(),
                                         key=lambda item: item[1].get('round', 0)):
+        if recovery.get('abandoned'):
+            continue
         for index, mapping in recovery.get('recovery_subjobs_mapping', {}).items():
             subjob = recovery['subjobs'].get(index, {})
             # Not yet seen by afvs_get_status.py: submitted, not failed
@@ -335,7 +338,7 @@ def latest_subjob_states(status, recovery_status):
     return latest
 
 
-def submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, tarball_subjobs):
+def submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, tarball_subjobs, job_name):
     """Submit a recovery workunit whose job, like any presigned job, has no
     AWS identity: it gets the presigned GET of a freshly signed manifest."""
     config = ctx['config']
@@ -350,7 +353,7 @@ def submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, tarball_s
     job_queue = f"{config['aws_batch_prefix']}-queue1"
 
     response = ctx['batch'].submit_job(
-        jobName=f'afvs-{config["job_letter"]}-recovery-{recovery_id}',
+        jobName=job_name,
         timeout={
             'attemptDurationSeconds': int(config["aws_batch_subjob_timeout"])
         },
@@ -390,22 +393,49 @@ def save_recovery_status(recovery_status_file, recovery_status):
     os.replace(f"{recovery_status_file}.tmp", recovery_status_file)
 
 
+# How long a recorded recovery workunit may go unlisted by Batch before it is
+# taken as never submitted: ListJobs can lag a SubmitJob that went through
+PENDING_GRACE_SECONDS = 900
+# Clock skew allowed between this host and Batch's createdAt
+CLOCK_SKEW_SECONDS = 300
+
+
+def find_batch_jobs(ctx, queue, job_name, not_before):
+    """Every job named job_name on queue created at or after not_before
+    (epoch seconds), oldest first."""
+    jobs = []
+    kwargs = {'jobQueue': queue, 'filters': [{'name': 'JOB_NAME', 'values': [job_name]}]}
+    while True:
+        response = ctx['batch'].list_jobs(**kwargs)
+        jobs.extend(job for job in response.get('jobSummaryList', [])
+                    if job.get('createdAt', 0) >= (not_before - CLOCK_SKEW_SECONDS) * 1000)
+        if not response.get('nextToken'):
+            break
+        kwargs['nextToken'] = response['nextToken']
+    return sorted(jobs, key=lambda job: job.get('createdAt', 0))
+
+
 def resolve_pending_rounds(ctx, recovery_status_file, recovery_status):
     """A recovery workunit is recorded (job_id None) before it is submitted.
     If an earlier call died between the two, find out from Batch whether the
-    job exists (its name is unique): keep it if so, forget it if not."""
+    job exists: keep it if so. If not, wait out ListJobs' lag, then mark it
+    abandoned. It stays in the file so its id (and so its tarball and manifest
+    keys) is never reused, and its subjobs count as failed again."""
     changed = False
-    for recovery_id, recovery in list(recovery_status['recovery_workunits'].items()):
-        if recovery.get('job_id'):
+    for recovery_id, recovery in recovery_status['recovery_workunits'].items():
+        if recovery.get('job_id') or recovery.get('abandoned'):
             continue
-        response = ctx['batch'].list_jobs(jobQueue=recovery['queue'], filters=[
-            {'name': 'JOB_NAME', 'values': [recovery['job_name']]}])
-        jobs = response.get('jobSummaryList', [])
+        jobs = find_batch_jobs(ctx, recovery['queue'], recovery['job_name'], recovery.get('recorded_at', 0))
         if jobs:
             recovery['job_id'] = jobs[0]['jobId']
             print(f"  Found recovery workunit {recovery_id} already submitted as job {recovery['job_id']}")
+            if len(jobs) > 1:
+                print(f"  WARNING: {len(jobs)} jobs named {recovery['job_name']}; only the first is tracked")
+        elif time.time() - recovery.get('recorded_at', 0) < PENDING_GRACE_SECONDS:
+            print(f"  Recovery workunit {recovery_id} is not listed by Batch yet; its subjobs count as submitted")
+            continue
         else:
-            del recovery_status['recovery_workunits'][recovery_id]
+            recovery['abandoned'] = True
             print(f"  Recovery workunit {recovery_id} was never submitted; its subjobs are retried")
         changed = True
     if changed:
@@ -437,7 +467,9 @@ def _recover_presigned(args, config):
     if os.path.exists(recovery_status_file):
         with open(recovery_status_file, "r") as read_file:
             recovery_status = json.load(read_file)
-    resolve_pending_rounds(ctx, recovery_status_file, recovery_status)
+    # --report-only changes nothing, so a pending record is left as it is
+    if not args.report_only:
+        resolve_pending_rounds(ctx, recovery_status_file, recovery_status)
 
     print("Analyzing status files for subjobs whose latest attempt failed...")
     tarballs = {}
@@ -513,10 +545,14 @@ def _recover_presigned(args, config):
         # Recorded BEFORE it is submitted (job_id None), so a crash between
         # the two leaves a trace resolve_pending_rounds can settle; saved
         # again with the job id right after
+        # The random suffix makes the job name unique to this attempt, so
+        # resolve_pending_rounds cannot adopt another screen's job of the
+        # same name
         entry = {
             'round': recovery_round,
             'job_id': None,
-            'job_name': f'afvs-{config["job_letter"]}-recovery-{recovery_id}',
+            'recorded_at': time.time(),
+            'job_name': f'afvs-{config["job_letter"]}-recovery-{recovery_id}-{secrets.token_hex(4)}',
             'queue': f"{config['aws_batch_prefix']}-queue1",
             'subjobs_count': len(recovery_workunit['subjobs']),
             's3_download_path': recovery_workunit['s3_download_path'],
@@ -526,7 +562,7 @@ def _recover_presigned(args, config):
         recovery_status['recovery_workunits'][recovery_id] = entry
         save_recovery_status(recovery_status_file, recovery_status)
 
-        submission_result = submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, tarball_subjobs)
+        submission_result = submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, tarball_subjobs, entry['job_name'])
         entry['job_id'] = submission_result['job_id']
         save_recovery_status(recovery_status_file, recovery_status)
         print(f"  Submitted recovery workunit {recovery_id} as job {submission_result['job_id']}")

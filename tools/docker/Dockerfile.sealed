@@ -37,10 +37,27 @@
 #
 # ---------------------------------------------------------------------------
 
+# The bundled bin/gwovina is linked against Boost 1.65, which bookworm does not
+# have: rebuild it against the image's Boost, as tools/docker/Dockerfile does
+FROM --platform=linux/amd64 python:3.12.8-slim-bookworm AS gwovina
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential wget ca-certificates \
+        libboost-system-dev libboost-thread-dev libboost-program-options-dev libboost-filesystem-dev
+
+WORKDIR /build
+RUN wget -q -O gwovina-1.0.tar.gz https://sourceforge.net/projects/gwovina/files/gwovina-1.0.tar.gz/download \
+    && echo "2007503d9dd7ce34347f8a9fe6d8d76f97d3aec837c38d783da83cb573abafc5  gwovina-1.0.tar.gz" | sha256sum -c - \
+    && tar -xzf gwovina-1.0.tar.gz \
+    && cd gwovina-1.0/build/linux/release \
+    && make gwovina LIBS="-l boost_system -l boost_thread -l boost_program_options -l boost_filesystem" \
+    && mv gwovina /build/gwovina-bin
+
 FROM --platform=linux/amd64 python:3.12.8-slim-bookworm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openbabel procps \
+        libboost-system1.74.0 libboost-thread1.74.0 libboost-program-options1.74.0 libboost-filesystem1.74.0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Verify obabel is available
@@ -61,12 +78,14 @@ ENV AFVS_TOOLS_PATH=/opt/AFVS/tools/bin
 
 # The AFVS tools (scripts, templates, docking binaries, vendored molpal)
 COPY tools /opt/AFVS/tools
-RUN chmod +x /opt/AFVS/tools/*.py /opt/AFVS/tools/templates/*.py /opt/AFVS/tools/bin/* \
+COPY --from=gwovina /build/gwovina-bin /opt/AFVS/tools/bin/gwovina
+RUN chmod +x /opt/AFVS/tools/*.py /opt/AFVS/tools/templates/*.py /opt/AFVS/tools/templates/*.sh /opt/AFVS/tools/bin/* \
     && rm -rf /opt/AFVS/tools/docker
 
 # Fail the build if what run.sh relies on is missing, or if the docking job or
 # the active-learning stack cannot import
 RUN command -v bash stdbuf tee python3 \
+    && ! ldd /opt/AFVS/tools/bin/* 2> /dev/null | grep "not found" \
     && cd /opt/AFVS/tools \
     && python -c "import pandas, pyarrow, torch, rdkit" \
     && python -c "import ast; ast.parse(open('templates/afvs_run.py').read())" \

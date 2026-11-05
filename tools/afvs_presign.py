@@ -61,7 +61,10 @@ def s3_client(config):
     import boto3
     from botocore.config import Config
 
-    return boto3.client('s3', config=Config(region_name=config['aws_region'], signature_version='s3v4'))
+    # Submit records job ids only once its whole loop is done, so a transient
+    # S3 error must be retried, not end the loop
+    return boto3.client('s3', config=Config(region_name=config['aws_region'], signature_version='s3v4',
+                                            retries={'mode': 'standard', 'max_attempts': 10}))
 
 
 def expiry_seconds(config):

@@ -265,6 +265,9 @@ def submit_aws_batch(config, client, current_workunit, jobline):
 
         current_workunit['status'] = "SUBMITTED"
         current_workunit['job_id'] = response['jobId']
+        if afvs_presign.is_presigned(config):
+            # afvs_get_status.py gives a just-submitted job time to show up
+            current_workunit['submitted_at'] = time.time()
 
         for subjob_id, subjob in current_workunit['subjobs'].items():
             subjob['status'] = "SUBMITTED"

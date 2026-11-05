@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 import types
 import urllib.parse
 import uuid
@@ -136,7 +137,7 @@ class Head:
         self.submits = []
         self.presign_calls = []
         self.clients = []
-        self.existing_jobs = {}   # job name -> job id, for ListJobs
+        self.existing_jobs = {}   # job name -> [(job id, createdAt ms)], for ListJobs
         self.fail_next_submit = False
 
     def client(self, service, config=None, **kwargs):
@@ -166,13 +167,16 @@ class Head:
                     raise RuntimeError("SubmitJob failed")
                 head.submits.append(kwargs)
                 job_id = f"job-{len(head.submits)}"
-                head.existing_jobs[kwargs['jobName']] = job_id
+                head.existing_jobs.setdefault(kwargs['jobName'], []).append((job_id, int(time.time() * 1000)))
                 return {'jobId': job_id}
 
-            def list_jobs(self, jobQueue, filters):
+            def list_jobs(self, jobQueue, filters, nextToken=None):
+                # Always paged: an empty first page that only carries a token
+                if nextToken is None:
+                    return {'jobSummaryList': [], 'nextToken': "page-2"}
                 name = filters[0]['values'][0]
-                found = head.existing_jobs.get(name)
-                return {'jobSummaryList': [{'jobId': found, 'jobName': name}] if found else []}
+                return {'jobSummaryList': [{'jobId': job_id, 'jobName': name, 'createdAt': created}
+                                           for job_id, created in head.existing_jobs.get(name, [])]}
 
             def terminate_job(self, **kwargs):
                 raise AssertionError("presigned mode must never terminate jobs")
@@ -220,7 +224,7 @@ aws_ecr_repository_name=unused
 aws_region=us-west-2
 aws_batch_subjob_vcpus=16
 aws_batch_subjob_memory=32000
-aws_batch_subjob_timeout=20800
+aws_batch_subjob_timeout=1800
 data_storage_mode=s3
 job_storage_mode=presigned
 presigned_url_expiry_seconds={EXPIRY}
@@ -309,18 +313,21 @@ class Screen:
         return json.loads((self.tools.parent / "workflow" / "status.json").read_text())
 
     def run_job(self, submit, subjob_id="0", env_override=None):
-        """Run one array child of a submitted job the way Batch would: its
-        environment only (no AWS variables), boto3 unimportable."""
-        env = {key: value for key, value in os.environ.items() if not key.startswith("AWS_")}
+        """Run one array child of a submitted job the way Batch would: the job
+        definition's command, its environment only (no AWS variables) plus
+        the array index Batch sets, boto3 unimportable."""
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("AWS_") and key != "AFVS_WORKUNIT_SUBJOB"}
         env.update({item['name']: item['value'] for item in submit['containerOverrides']['environment']})
         env.update({
-            'AFVS_WORKUNIT_SUBJOB': subjob_id,
+            'AWS_BATCH_JOB_ARRAY_INDEX': subjob_id,
+            'AFVS_HOME': str(self.tools.parent),
             'AFVS_TOOLS_PATH': str(self.fakebin),
             'PYTHONPATH': str(GUARD_DIR),
             'AFVS_TEST_ALLOW_LOOPBACK': "1",
         })
         env.update(env_override or {})
-        return subprocess.run([sys.executable, "./templates/afvs_run.py"], cwd=self.tools, env=env,
+        return subprocess.run(["bash", str(self.tools / "templates" / "template1.presigned.sh")], cwd="/", env=env,
                               capture_output=True, text=True, timeout=300)
 
     def assert_no_url_leaked(self, *outputs):
@@ -407,15 +414,27 @@ def test_array_padding_child_exits_cleanly(screen):
     assert ret.returncode == 0, ret.stdout + ret.stderr
 
 
-@pytest.mark.parametrize("break_url", ["collection", "output", "manifest_unreachable", "manifest_malformed"])
+@pytest.mark.parametrize("break_url", ["collection", "every_collection_of_many", "output",
+                                       "manifest_unreachable", "manifest_malformed"])
 def test_a_failing_url_fails_the_subjob_without_leaking_it(screen, break_url):
     """An expired/rejected URL must fail the subjob (recovery re-signs it),
     and no URL may reach the job's output, its errors or tracebacks."""
+    many = [f"AACAAD_{n:05d}" for n in range(1, 31)]
+    if break_url == "every_collection_of_many":
+        # One subjob of 30 collections: more than the job queues for its one
+        # downloader at a time, so the job must notice that downloader died
+        (screen.tools / "templates" / "todo.all").write_text("".join(f"{key} 3\n" for key in many))
+        ctrl = screen.tools / "templates" / "all.ctrl"
+        ctrl.write_text(ctrl.read_text().replace("dockings_per_subjob=3\n", "dockings_per_subjob=90\n"))
     screen.prepare()
     screen.submit(1, 1)
     submit = screen.head.submits[0]
     env_override = None
-    if break_url == "collection":
+    if break_url == "every_collection_of_many":
+        assert len(manifest_of(screen, submit)['subjobs']['0']['collections']) == 30
+        for key in many:
+            screen.s3.revoke("GET", DATA_BUCKET, f"{DATA_PREFIX}/{data_key(key)}")
+    elif break_url == "collection":
         screen.s3.revoke("GET", DATA_BUCKET, f"{DATA_PREFIX}/{data_key(COLLECTIONS[0])}")
     elif break_url == "output":
         screen.s3.revoke("PUT", JOB_BUCKET, f"{JOB_PREFIX}/{JOB_NAME}/qvina02/parquet/1/0.parquet")
@@ -581,41 +600,65 @@ def test_a_subjob_that_keeps_failing_does_not_starve_the_round(screen):
     assert code == 0 and originals_of_round(2) == ["1"]
 
 
-@pytest.mark.parametrize("submitted", [True, False])
-def test_recovery_survives_dying_between_record_and_submit(screen, submitted):
+@pytest.mark.parametrize("case", ["submitted", "not_listed_yet", "never_submitted", "namesake_from_before"])
+def test_recovery_survives_dying_between_record_and_submit(screen, case):
     """A recovery workunit is recorded before SubmitJob; the next call settles
     a record left without a job id by asking Batch for the job by name."""
     screen.prepare()
     screen.submit(1, 1)
     fail_all(screen)
     recover = screen.load("afvs_recover_failed_subjobs.py")
+    recovery_file = screen.tools.parent / "workflow" / "status.recovery.json"
 
-    if submitted:
+    if case == "submitted":
         # SubmitJob succeeded, then the head died before saving the job id
         recover_call(screen, recover)
         entries = recovery_entries(screen)
         (entry,) = entries.values()
         job_id = entry['job_id']
         entry['job_id'] = None
-        (screen.tools.parent / "workflow" / "status.recovery.json").write_text(json.dumps({'recovery_workunits': entries}))
+        recovery_file.write_text(json.dumps({'recovery_workunits': entries}))
     else:
         screen.head.fail_next_submit = True
         with pytest.raises(RuntimeError):
             recover_call(screen, recover)
-        assert [entry['job_id'] for entry in recovery_entries(screen).values()] == [None]
+        entries = recovery_entries(screen)
+        assert [entry['job_id'] for entry in entries.values()] == [None]
+        (entry,) = entries.values()
+        if case in ("never_submitted", "namesake_from_before"):
+            # Long enough ago that ListJobs would list it by now
+            entry['recorded_at'] -= 3600
+        if case == "namesake_from_before":
+            # A job of that name exists, but from before this record (another
+            # screen's, or a re-prepared one): it is not this workunit's job
+            screen.head.existing_jobs[entry['job_name']] = [("job-old", int((entry['recorded_at'] - 7200) * 1000))]
+        recovery_file.write_text(json.dumps({'recovery_workunits': entries}))
+
+    # --report-only changes nothing
+    before = recovery_file.read_text()
+    code, _ = recover_call(screen, recover, "--report-only")
+    assert code == 0 and recovery_file.read_text() == before
 
     submits = len(screen.head.submits)
     code, out = recover_call(screen, recover)
     assert code == 0
     entries = recovery_entries(screen)
-    if submitted:
-        # Found by name: kept, and its subjob is not submitted again
+    if case == "submitted":
+        # Found by name (past an empty first page): kept, and not submitted again
         assert [entry['job_id'] for entry in entries.values()] == [job_id]
         assert len(screen.head.submits) == submits and "No failed subjobs found!" in out
+    elif case == "not_listed_yet":
+        # ListJobs may lag SubmitJob: still pending, its subjob not rerun yet
+        assert [entry['job_id'] for entry in entries.values()] == [None]
+        assert len(screen.head.submits) == submits and "No failed subjobs found!" in out
     else:
-        # Never submitted: forgotten, and the subjob is submitted now
-        assert len(entries) == 1 and list(entries.values())[0]['job_id'] is not None
+        # Never submitted: kept as abandoned (its id is never reused), and the
+        # subjob is submitted now under a new id
+        (old_id, old), (new_id, new) = entries.items()
+        assert old['abandoned'] and old['job_id'] is None
+        assert new_id != old_id and new['job_id'] is not None
         assert len(screen.head.submits) == submits + 1
+        assert screen.head.submits[-1]['jobName'] == new['job_name'] != old['job_name']
 
 
 def test_the_job_guard_bites(tmp_path):
@@ -676,6 +719,10 @@ def test_killall_refuses_in_presigned_mode(screen):
      "job_storage_mode=presigned requires batchsystem=awsbatch and data_storage_mode=s3"),
     (f"presigned_url_expiry_seconds={EXPIRY}", "presigned_url_expiry_seconds=soon",
      "'presigned_url_expiry_seconds' must be a positive integer"),
+    (f"presigned_url_expiry_seconds={EXPIRY}", "presigned_url_expiry_seconds=604801",
+     "'presigned_url_expiry_seconds' must be at most 604800"),
+    (f"presigned_url_expiry_seconds={EXPIRY}", "presigned_url_expiry_seconds=1799",
+     "'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout'"),
 ])
 def test_prepare_validates_presigned_configs(screen, old, new, message):
     ctrl = screen.tools / "templates" / "all.ctrl"
