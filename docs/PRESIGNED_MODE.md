@@ -107,6 +107,26 @@ between them.
 - URLs live as long as the credentials that signed them, so they expire at
   `presigned_url_expiry_seconds` at the latest.
 
+## What the caller must do with short-lived sessions
+
+The prepare check only compares two configured numbers. A URL's real lifetime
+is the smaller of `presigned_url_expiry_seconds` and the time the signing
+session has left. With one-hour sessions, keeping each job inside its URLs is
+up to the caller that runs submit and recover:
+
+- Run every submit and recover call on a fresh session. URLs signed late in an
+  old session die early, whatever `X-Amz-Expires` says.
+- Size the subjobs so the real run time stays well under
+  `aws_batch_subjob_timeout`. Size the windows so jobs start within the
+  300 s margin. A job that waits or runs past its URLs fails, and so does
+  every rerun that hits the same queue backlog.
+- A Batch retry strategy reuses the job's original URLs. Rely on AFVS recovery,
+  which re-signs, rather than Batch retries.
+- A subjob that fails partway through uploading can leave some outputs at its
+  original keys, and its rerun writes them again under `recovery-<id>`.
+  Whatever reads results should take each subjob's latest attempt (from
+  `status.json` and `status.recovery.json`), not every object under the prefix.
+
 ## What a docking job does
 
 The job definition's command is
