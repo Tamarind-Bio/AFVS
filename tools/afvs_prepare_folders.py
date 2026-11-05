@@ -241,7 +241,11 @@ def check_parameters(config):
             # end of its run, so they must outlast the run plus time queued
             print("* 'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout' + 3600")
             error = 1
-        if(len(config.get('job_name') or config.get('job_letter') or '') > 100):
+        if(empty_value(config, 'job_name')):
+            # Job outputs, manifests and status all key on job_name
+            print("* 'job_name' must be set if job_storage_mode is 'presigned' (job_letter is not supported)")
+            error = 1
+        elif(len(config['job_name']) > 100):
             # Batch job names are at most 128 characters, and recovery jobs
             # are named afvs-r-<job_name>-r<round>-<n>-<8 hex>
             print("* 'job_name' must be at most 100 characters if job_storage_mode is 'presigned'")

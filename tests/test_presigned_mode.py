@@ -141,6 +141,7 @@ class Head:
         self.existing_jobs = {}   # job name -> [(job id, createdAt ms)], for ListJobs
         self.fail_next_submit = False
         self.before_submit = None  # called with SubmitJob's arguments
+        self.fail_put = None       # S3 keys whose put_object fails
 
     def client(self, service, config=None, **kwargs):
         head = self
@@ -152,6 +153,8 @@ class Head:
                     head.store.objects[(bucket, key)] = f.read()
 
             def put_object(self, Bucket, Key, Body, **kwargs):
+                if head.fail_put and head.fail_put(Key):
+                    raise OSError("S3 unreachable")
                 head.store.objects[(Bucket, Key)] = Body
 
             def download_fileobj(self, bucket, key, f):
@@ -643,7 +646,7 @@ def test_a_subjob_that_keeps_failing_does_not_starve_the_round(screen):
 
 
 @pytest.mark.parametrize("case", ["submitted", "not_listed_yet", "never_submitted", "namesake", "rejected",
-                                  "throttled"])
+                                  "throttled", "manifest_upload_failed"])
 def test_recovery_survives_dying_between_record_and_submit(screen, case):
     """A recovery workunit is recorded before SubmitJob; the next call settles
     a record left without a job id by asking Batch for the job by name."""
@@ -661,6 +664,15 @@ def test_recovery_survives_dying_between_record_and_submit(screen, case):
         job_id = entry['job_id']
         entry['job_id'] = None
         recovery_file.write_text(json.dumps({'recovery_workunits': entries}))
+    elif case == "manifest_upload_failed":
+        # Its manifest never reached S3, so Batch was never called
+        screen.head.fail_put = lambda key: "/_manifests/" in key
+        submits = len(screen.head.submits)
+        with pytest.raises(OSError):
+            recover_call(screen, recover)
+        screen.head.fail_put = None
+        assert len(screen.head.submits) == submits
+        assert [entry['abandoned'] for entry in recovery_entries(screen).values()] == [True]
     elif case in ("rejected", "throttled"):
         # Batch rejected the SubmitJob (no job to wait for), or throttled a
         # retry whose first attempt may have created it
@@ -783,6 +795,7 @@ def test_killall_refuses_in_presigned_mode(screen):
     (f"presigned_url_expiry_seconds={EXPIRY}", "presigned_url_expiry_seconds=5399",
      "'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout' + 3600"),
     (f"job_name={JOB_NAME}", "job_name=" + "j" * 101, "'job_name' must be at most 100 characters"),
+    (f"job_name={JOB_NAME}", f"job_letter={JOB_NAME}", "'job_name' must be set if job_storage_mode is 'presigned'"),
 ])
 def test_prepare_validates_presigned_configs(screen, old, new, message):
     ctrl = screen.tools / "templates" / "all.ctrl"

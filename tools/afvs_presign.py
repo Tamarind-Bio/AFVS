@@ -42,10 +42,11 @@ RECOVERY_LOCK = "../workflow/status.recovery.lock"
 
 @contextlib.contextmanager
 def recovery_lock():
-    """Held for a whole call by afvs_recover_failed_subjobs.py and by
-    afvs_get_status.py, so each reads status.json and status.recovery.json
-    as the other last wrote them: no round is lost, no window is submitted
-    twice, and no status run writes back an older read."""
+    """Held for a whole call by afvs_submit_jobs.py,
+    afvs_recover_failed_subjobs.py and afvs_get_status.py, so each reads
+    status.json and status.recovery.json as the others last wrote them: no
+    round is lost, no window is submitted twice, and no status run writes
+    back an older read."""
     with open(RECOVERY_LOCK, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         yield
@@ -78,8 +79,8 @@ def s3_client(config):
     import boto3
     from botocore.config import Config
 
-    # Submit records job ids only once its whole loop is done, so a transient
-    # S3 error must be retried, not end the loop
+    # A transient S3 error must be retried, not end a submit or recovery
+    # call partway
     return boto3.client('s3', config=Config(region_name=config['aws_region'], signature_version='s3v4',
                                             retries={'mode': 'standard', 'max_attempts': 10}))
 

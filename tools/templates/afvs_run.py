@@ -129,8 +129,12 @@ def presigned_request(method, url, body_path=None, dest_path=None, attempts=8):
 
         except urllib.error.HTTPError as error:
             # S3 reports these transient conditions as 400s
+            try:
+                body = error.read() or b"" if error.code == 400 else b""
+            except Exception:
+                body = b""
             transient = error.code == 400 and re.search(
-                rb"<Code>(RequestTimeout|IncompleteBody|RequestTimeTooSkewed)</Code>", error.read() or b"")
+                rb"<Code>(RequestTimeout|IncompleteBody|RequestTimeTooSkewed)</Code>", body)
             if 400 <= error.code < 500 and error.code not in (408, 429) and not transient:
                 status = error.code
                 break

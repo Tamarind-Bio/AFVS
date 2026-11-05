@@ -338,7 +338,7 @@ def process_unlocked(config, start, stop):
                 if(submit_type == "awsbatch"):
                     try:
                         submit_aws_batch(config, client, current_workunit, jobline)
-                    except Exception:
+                    except BaseException:
                         # The jobs already submitted keep their ids: a rerun
                         # skips them instead of submitting them again
                         if afvs_presign.is_presigned(config):

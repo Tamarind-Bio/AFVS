@@ -343,15 +343,19 @@ def latest_subjob_states(status, recovery_status):
     return latest
 
 
-def submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, tarball_subjobs, job_name):
+def publish_recovery_manifest(ctx, recovery_workunit, recovery_id, tarball_subjobs):
+    """Sign and upload a recovery workunit's manifest; its presigned GET."""
+    return afvs_presign.publish_manifest(
+        ctx['s3'], ctx['config'], f"recovery-{recovery_id}", recovery_workunit['s3_download_path'], tarball_subjobs)
+
+
+def submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, manifest_url, job_name):
     """Submit a recovery workunit whose job, like any presigned job, has no
     AWS identity: it gets the presigned GET of a freshly signed manifest."""
     config = ctx['config']
     workunit_id = f"recovery-{recovery_id}"
 
     subjobs_count = len(recovery_workunit['subjobs'])
-    manifest_url = afvs_presign.publish_manifest(
-        ctx['s3'], config, workunit_id, recovery_workunit['s3_download_path'], tarball_subjobs)
 
     # The sealed queue (aws_batch_prefix=vf-sealed -> vf-sealed-queue1); --queue
     # names the legacy on-demand queue and does not apply here
@@ -560,7 +564,15 @@ def _recover_presigned(args, config):
         save_recovery_status(recovery_status_file, recovery_status)
 
         try:
-            submission_result = submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, tarball_subjobs, entry['job_name'])
+            manifest_url = publish_recovery_manifest(ctx, recovery_workunit, recovery_id, tarball_subjobs)
+        except BaseException:
+            # Batch was never called: there is no job, so the next call
+            # retries its subjobs at once
+            entry['abandoned'] = True
+            save_recovery_status(recovery_status_file, recovery_status)
+            raise
+        try:
+            submission_result = submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, manifest_url, entry['job_name'])
         except ctx['client_error'] as error:
             # Batch rejected the request itself (ClientException, HTTP 400):
             # there is no job, so the next call retries its subjobs at once.

@@ -25,8 +25,10 @@ most 604800 (the SigV4 limit) and at least `aws_batch_subjob_timeout` + 3600.
 URLs are signed at submit, and a job uploads its outputs at the end of its run,
 so they must outlast the run plus its time in the queue. A job queued for longer
 than that hour can find its URLs expired: it fails, and recovery re-signs it.
-`job_name` can be at most 100 characters, so recovery job names stay within
-Batch's 128.
+`job_name` must be set (`job_letter` is not supported) and can be at most 100
+characters, so recovery job names (`afvs-r-<job_name>-r<round>-<n>-<8 hex>`)
+stay within Batch's 128 while round and workunit numbers have 9 digits
+between them.
 
 ## What the head does
 
@@ -73,8 +75,9 @@ Batch's 128.
   submitted are still written, so a rerun skips those jobs.
 - Each recovery workunit is recorded before it is submitted, under a job name
   unique to that attempt (`afvs-r-<id>-<random>`).
-  - If Batch rejects the SubmitJob itself (`ClientException`), the record is
-    marked `abandoned` at once. Throttling or a server error leaves the record
+  - If its manifest cannot be uploaded (Batch is never called), or Batch
+    rejects the SubmitJob itself (`ClientException`), the record is marked
+    `abandoned` at once. Throttling or a server error leaves the record
     pending, because a retried call's first attempt may have created the job.
   - If a call dies between record and submit, the next call asks Batch
     (`ListJobs`, all pages, by that name) whether the job exists. If it does,
