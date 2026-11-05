@@ -449,6 +449,9 @@ def _recover_presigned(args, config):
     if args.from_round is not None and args.from_round < 1:
         print("--from-round must be at least 1")
         return 2
+    if args.max_subjobs_per_workunit < 1:
+        print("--max-subjobs-per-workunit must be at least 1")
+        return 2
 
     import boto3
     import botocore.exceptions

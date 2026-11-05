@@ -660,6 +660,8 @@ def test_a_subjob_that_keeps_failing_does_not_starve_the_round(screen):
 @pytest.mark.parametrize("args, message", [
     (["--max-subjobs", "0"], "--max-subjobs must be at least 1"),
     (["--from-round", "0"], "--from-round must be at least 1"),
+    (["--max-subjobs-per-workunit", "0"], "--max-subjobs-per-workunit must be at least 1"),
+    (["--max-subjobs-per-workunit", "-1"], "--max-subjobs-per-workunit must be at least 1"),
     # A round number so long that its recovery job names pass Batch's 128
     (["--from-round", "9" * 110], "would give Batch job names over 128 characters"),
 ])
