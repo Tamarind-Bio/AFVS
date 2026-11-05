@@ -26,7 +26,7 @@ URLs are signed at submit, and a job uploads its outputs at the end of its run,
 so they must outlast the run plus its time in the queue. A job queued for longer
 than that hour can find its URLs expired: it fails, and recovery re-signs it.
 `job_name` must be set (`job_letter` is not supported) and can be at most 100
-characters, so recovery job names (`afvs-r-<job_name>-r<round>-<n>-<8 hex>`)
+letters, digits, `-` or `_`, so recovery job names (`afvs-r-<job_name>-r<round>-<n>-<8 hex>`)
 stay within Batch's 128 while round and workunit numbers have 9 digits
 between them.
 

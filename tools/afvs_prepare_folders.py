@@ -245,10 +245,11 @@ def check_parameters(config):
             # Job outputs, manifests and status all key on job_name
             print("* 'job_name' must be set if job_storage_mode is 'presigned' (job_letter is not supported)")
             error = 1
-        elif(len(config['job_name']) > 100):
-            # Batch job names are at most 128 characters, and recovery jobs
-            # are named afvs-r-<job_name>-r<round>-<n>-<8 hex>
-            print("* 'job_name' must be at most 100 characters if job_storage_mode is 'presigned'")
+        elif(not re.search(r'^[A-Za-z0-9_-]{1,100}$', config['job_name'])):
+            # Batch job names are at most 128 characters of letters, digits,
+            # hyphens and underscores, and recovery jobs are named
+            # afvs-r-<job_name>-r<round>-<n>-<8 hex>
+            print("* 'job_name' must be at most 100 characters, all letters, digits, '-' or '_', if job_storage_mode is 'presigned'")
             error = 1
 
     if(empty_value(config, 'ligand_library_format')):
