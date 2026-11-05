@@ -321,37 +321,35 @@ def process_unlocked(config, start, stop):
         status = json.load(read_file)
         workunits = status['workunits']
 
-    for jobline in range(start, stop + 1):
+    try:
+        for jobline in range(start, stop + 1):
 
-        jobline_str = str(jobline)
-        if jobline_str not in workunits:
-            print(f"Jobline {jobline_str} was not found")
-        else:
-            current_workunit = workunits[jobline_str]
-
-            print(f"Submitting jobline {jobline_str}... ")
-
-            # Now see if any of them have been submitted before
-            if 'status' in current_workunit:
-                print("jobs were already submitted for this....")
+            jobline_str = str(jobline)
+            if jobline_str not in workunits:
+                print(f"Jobline {jobline_str} was not found")
             else:
-                if(submit_type == "awsbatch"):
-                    try:
-                        submit_aws_batch(config, client, current_workunit, jobline)
-                    except BaseException:
-                        # The jobs already submitted keep their ids: a rerun
-                        # skips them instead of submitting them again
-                        if afvs_presign.is_presigned(config):
-                            write_status(status)
-                        raise
-                elif(submit_type == "slurm"):
-                    submit_slurm(config, client, current_workunit, jobline)
-                elif(submit_type == "bash"):
-                    run_bash(config, current_workunit, jobline)
+                current_workunit = workunits[jobline_str]
+
+                print(f"Submitting jobline {jobline_str}... ")
+
+                # Now see if any of them have been submitted before
+                if 'status' in current_workunit:
+                    print("jobs were already submitted for this....")
                 else:
-                    print(f"Unknown submit type {submit_type}")
-
-
+                    if(submit_type == "awsbatch"):
+                        submit_aws_batch(config, client, current_workunit, jobline)
+                    elif(submit_type == "slurm"):
+                        submit_slurm(config, client, current_workunit, jobline)
+                    elif(submit_type == "bash"):
+                        run_bash(config, current_workunit, jobline)
+                    else:
+                        print(f"Unknown submit type {submit_type}")
+    except BaseException:
+        # However the loop ends, the jobs already submitted keep their ids:
+        # a rerun skips them instead of submitting them again
+        if afvs_presign.is_presigned(config):
+            write_status(status)
+        raise
 
 
     # Output all of the information about the workunits into JSON so we can easily grab this data in the future

@@ -67,7 +67,8 @@ between them.
   `TerminateJob`, so a stopped screen just stops submitting.
 - Any configuration `afvs_get_status.py` does not support exits nonzero.
 - `--max-subjobs N` makes recovery submit at most N subjobs per call and print
-  `Remaining failed subjobs: K`. Later calls carry on from there.
+  `Remaining failed subjobs: K`. Later calls carry on from there, oldest failure
+  first, so a subjob that keeps failing cannot hold the others back.
 - Submit, recovery and status each hold a lock
   (`../workflow/status.recovery.lock`) for their whole call. Each one reads
   `status.json` and `status.recovery.json` as the others last wrote them.

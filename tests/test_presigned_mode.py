@@ -411,16 +411,21 @@ def test_submit_keeps_the_job_ids_it_got_and_holds_the_lock(screen):
 
     def before_submit(kwargs):
         assert held, "SubmitJob outside the lock"
-        if kwargs['jobName'].endswith("-2"):
-            raise RuntimeError("SubmitJob failed")
+
+    def interrupted_between_jobs(*args, **kwargs):
+        # The loop is interrupted between two SubmitJobs, not inside one
+        if args and str(args[0]).startswith("Submitting jobline 2"):
+            raise KeyboardInterrupt
+        print(*args, **kwargs)
 
     screen.head.before_submit = before_submit
-    with pytest.raises(RuntimeError), redirect_stdout(io.StringIO()):
+    screen.monkeypatch.setattr(module, "print", interrupted_between_jobs, raising=False)
+    with pytest.raises(KeyboardInterrupt), redirect_stdout(io.StringIO()):
         module.process(module.parse_config("../workflow/config.json"), 1, 3)
+    screen.monkeypatch.delattr(module, "print")
     workunits = screen.status()['workunits']
     assert workunits["1"]['job_id'] == "job-1" and 'job_id' not in workunits["2"]
 
-    screen.head.before_submit = lambda kwargs: None
     with redirect_stdout(io.StringIO()):
         module.process(module.parse_config("../workflow/config.json"), 1, 3)
     assert [submit['jobName'] for submit in screen.head.submits] == [
@@ -643,6 +648,32 @@ def test_a_subjob_that_keeps_failing_does_not_starve_the_round(screen):
     # Its renewed failure is round 2's
     code, out = recover_call(screen, recover, "--max-subjobs", "1", "--from-round", "2")
     assert code == 0 and originals_of_round(2) == ["1"]
+
+
+def test_windowed_recovery_without_from_round_takes_the_oldest_failures_first(screen):
+    """Without --from-round each call is a new round. A subjob that fails
+    again at once must not be picked ahead of failures still waiting."""
+    screen.prepare()
+    screen.submit(1, 3)
+    fail_all(screen)
+    recover = screen.load("afvs_recover_failed_subjobs.py")
+
+    picked = []
+    for _ in range(4):
+        before = set(recovery_entries(screen)) if (screen.tools.parent / "workflow" / "status.recovery.json").exists() else set()
+        code, _ = recover_call(screen, recover, "--max-subjobs", "1")
+        assert code == 0
+        entries = recovery_entries(screen)
+        (new,) = set(entries) - before
+        picked.extend(mapping['original_workunit_id'] for mapping in entries[new]['recovery_subjobs_mapping'].values())
+        # Workunit 1 fails again at once, every time it is retried
+        for entry in entries.values():
+            for index, mapping in entry['recovery_subjobs_mapping'].items():
+                if mapping['original_workunit_id'] == "1":
+                    entry['subjobs'][index]['status'] = "FAILED"
+        (screen.tools.parent / "workflow" / "status.recovery.json").write_text(json.dumps({'recovery_workunits': entries}))
+
+    assert picked == ["1", "2", "3", "1"]
 
 
 @pytest.mark.parametrize("case", ["submitted", "not_listed_yet", "never_submitted", "namesake", "rejected",

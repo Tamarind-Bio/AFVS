@@ -491,7 +491,8 @@ def _recover_presigned(args, config):
             'subjob_id': subjob_id,
             'subjob': status['workunits'][workunit_id]['subjobs'][subjob_id],
             'collections': tarballs[tarball_key].get(tarball_subjob_id, {}).get('collections', {}),
-            'workunit': status['workunits'][workunit_id]
+            'workunit': status['workunits'][workunit_id],
+            'attempt_round': attempt_round,
         })
 
     if not failed_subjobs:
@@ -507,10 +508,11 @@ def _recover_presigned(args, config):
             print(f"ERROR: no collections recorded for {item['workunit_id']}:{item['subjob_id']}")
         return 1
 
-    # A window of at most --max-subjobs per call, in a stable order. What is
-    # submitted now is in this round, so its latest state is no longer FAILED
-    # and the next call carries on with the rest.
-    failed_subjobs.sort(key=lambda item: (int(item['workunit_id']), int(item['subjob_id'])))
+    # A window of at most --max-subjobs per call, oldest failure first, then
+    # in a stable order. What is submitted now is in this round, so its latest
+    # state is no longer FAILED and the next call carries on with the rest; a
+    # subjob that fails again goes behind those that have waited longer.
+    failed_subjobs.sort(key=lambda item: (item['attempt_round'], int(item['workunit_id']), int(item['subjob_id'])))
     remaining = []
     if args.max_subjobs is not None:
         failed_subjobs, remaining = failed_subjobs[:args.max_subjobs], failed_subjobs[args.max_subjobs:]
