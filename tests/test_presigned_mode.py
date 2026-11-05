@@ -6,6 +6,7 @@ head side runs against a boto3 stub whose generate_presigned_url mints them.
 Docking jobs (templates/afvs_run.py) run as real subprocesses under the test
 guard, with boto3 unimportable and only loopback reachable."""
 
+import contextlib
 import gzip
 import http.server
 import importlib.util
@@ -139,6 +140,7 @@ class Head:
         self.clients = []
         self.existing_jobs = {}   # job name -> [(job id, createdAt ms)], for ListJobs
         self.fail_next_submit = False
+        self.before_submit = None  # called with SubmitJob's arguments
 
     def client(self, service, config=None, **kwargs):
         head = self
@@ -162,6 +164,8 @@ class Head:
 
         class Batch:
             def submit_job(self, **kwargs):
+                if head.before_submit:
+                    head.before_submit(kwargs)
                 if head.fail_next_submit:
                     error, head.fail_next_submit = head.fail_next_submit, False
                     raise error if isinstance(error, Exception) else RuntimeError("SubmitJob failed")
@@ -382,6 +386,44 @@ def test_submit_gives_each_job_one_presigned_url_and_no_credentials(screen):
     assert {bucket for _, bucket, _, _ in screen.head.presign_calls} == {JOB_BUCKET, DATA_BUCKET}
 
 
+def test_submit_keeps_the_job_ids_it_got_and_holds_the_lock(screen):
+    """A submit that fails partway keeps the ids of the jobs already
+    submitted, so a rerun does not submit them again. Status holds the lock
+    for its whole run, so submit takes it too and no stale status write can
+    drop those ids."""
+    screen.prepare()
+    module = screen.load("afvs_submit_jobs.py")
+    screen.monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    held = []
+    real_lock = module.afvs_presign.recovery_lock
+
+    @contextlib.contextmanager
+    def lock():
+        with real_lock():
+            held.append(True)
+            yield
+            held.pop()
+
+    screen.monkeypatch.setattr(module.afvs_presign, "recovery_lock", lock)
+
+    def before_submit(kwargs):
+        assert held, "SubmitJob outside the lock"
+        if kwargs['jobName'].endswith("-2"):
+            raise RuntimeError("SubmitJob failed")
+
+    screen.head.before_submit = before_submit
+    with pytest.raises(RuntimeError), redirect_stdout(io.StringIO()):
+        module.process(module.parse_config("../workflow/config.json"), 1, 3)
+    workunits = screen.status()['workunits']
+    assert workunits["1"]['job_id'] == "job-1" and 'job_id' not in workunits["2"]
+
+    screen.head.before_submit = lambda kwargs: None
+    with redirect_stdout(io.StringIO()):
+        module.process(module.parse_config("../workflow/config.json"), 1, 3)
+    assert [submit['jobName'] for submit in screen.head.submits] == [
+        f"afvs-{JOB_NAME}-1", f"afvs-{JOB_NAME}-2", f"afvs-{JOB_NAME}-3"]
+
+
 def test_jobs_dock_through_presigned_urls_only(screen):
     screen.prepare()
     screen.submit(1, 3)
@@ -600,7 +642,8 @@ def test_a_subjob_that_keeps_failing_does_not_starve_the_round(screen):
     assert code == 0 and originals_of_round(2) == ["1"]
 
 
-@pytest.mark.parametrize("case", ["submitted", "not_listed_yet", "never_submitted", "namesake", "rejected"])
+@pytest.mark.parametrize("case", ["submitted", "not_listed_yet", "never_submitted", "namesake", "rejected",
+                                  "throttled"])
 def test_recovery_survives_dying_between_record_and_submit(screen, case):
     """A recovery workunit is recorded before SubmitJob; the next call settles
     a record left without a job id by asking Batch for the job by name."""
@@ -618,13 +661,16 @@ def test_recovery_survives_dying_between_record_and_submit(screen, case):
         job_id = entry['job_id']
         entry['job_id'] = None
         recovery_file.write_text(json.dumps({'recovery_workunits': entries}))
-    elif case == "rejected":
-        # Batch rejected the SubmitJob: there is no job to wait for
+    elif case in ("rejected", "throttled"):
+        # Batch rejected the SubmitJob (no job to wait for), or throttled a
+        # retry whose first attempt may have created it
         client_error = sys.modules["botocore.exceptions"].ClientError
-        screen.head.fail_next_submit = client_error("SubmitJob rejected")
+        error = client_error("SubmitJob failed")
+        error.response = {'Error': {'Code': "ClientException" if case == "rejected" else "TooManyRequestsException"}}
+        screen.head.fail_next_submit = error
         with pytest.raises(client_error):
             recover_call(screen, recover)
-        assert [entry['abandoned'] for entry in recovery_entries(screen).values()] == [True]
+        assert [entry.get('abandoned', False) for entry in recovery_entries(screen).values()] == [case == "rejected"]
     else:
         screen.head.fail_next_submit = True
         with pytest.raises(RuntimeError):
@@ -638,7 +684,7 @@ def test_recovery_survives_dying_between_record_and_submit(screen, case):
         if case == "namesake":
             # A job named as this workunit's id alone (an earlier attempt, or
             # another screen's) is not this attempt's job
-            screen.head.existing_jobs[f"afvs-recovery-{recovery_id}"] = [("job-other", 0)]
+            screen.head.existing_jobs[f"afvs-r-{recovery_id}"] = [("job-other", 0)]
         recovery_file.write_text(json.dumps({'recovery_workunits': entries}))
 
     # --report-only changes nothing, and counts the subjob as the real call
@@ -647,7 +693,7 @@ def test_recovery_survives_dying_between_record_and_submit(screen, case):
     before = recovery_file.read_text()
     code, out = recover_call(screen, recover, "--report-only")
     assert code == 0 and recovery_file.read_text() == before
-    in_flight = case in ("submitted", "not_listed_yet")
+    in_flight = case in ("submitted", "not_listed_yet", "throttled")
     recorded = sum(len(entry['recovery_subjobs_mapping']) for entry in recovery_entries(screen).values())
     assert out.rsplit("Remaining failed subjobs: ", 1)[1].split()[0] == ("0" if in_flight else str(recorded))
 
@@ -659,7 +705,7 @@ def test_recovery_survives_dying_between_record_and_submit(screen, case):
         # Found by name (past an empty first page): kept, and not submitted again
         assert [entry['job_id'] for entry in entries.values()] == [job_id]
         assert len(screen.head.submits) == submits and "No failed subjobs found!" in out
-    elif case == "not_listed_yet":
+    elif case in ("not_listed_yet", "throttled"):
         # ListJobs may lag SubmitJob: still pending, its subjob not rerun yet
         assert [entry['job_id'] for entry in entries.values()] == [None]
         assert len(screen.head.submits) == submits and "No failed subjobs found!" in out
@@ -736,7 +782,7 @@ def test_killall_refuses_in_presigned_mode(screen):
     # aws_batch_subjob_timeout=1800: URLs must outlast it plus an hour queued
     (f"presigned_url_expiry_seconds={EXPIRY}", "presigned_url_expiry_seconds=5399",
      "'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout' + 3600"),
-    (f"job_name={JOB_NAME}", "job_name=" + "j" * 81, "'job_name' must be at most 80 characters"),
+    (f"job_name={JOB_NAME}", "job_name=" + "j" * 101, "'job_name' must be at most 100 characters"),
 ])
 def test_prepare_validates_presigned_configs(screen, old, new, message):
     ctrl = screen.tools / "templates" / "all.ctrl"

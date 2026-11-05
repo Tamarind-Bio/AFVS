@@ -282,6 +282,22 @@ def submit_aws_batch(config, client, current_workunit, jobline):
     time.sleep(0.1)
 
 def process(config, start, stop):
+    if afvs_presign.is_presigned(config):
+        # Status writes status.json under this lock for its whole run, so it
+        # cannot write an older read over the job ids recorded here
+        with afvs_presign.recovery_lock():
+            return process_unlocked(config, start, stop)
+    return process_unlocked(config, start, stop)
+
+
+def write_status(status):
+    with open("../workflow/status.json.tmp", "w") as json_out:
+        json.dump(status, json_out, indent=4)
+
+    Path("../workflow/status.json.tmp").rename("../workflow/status.json")
+
+
+def process_unlocked(config, start, stop):
     import boto3
     from botocore.config import Config
 
@@ -320,7 +336,14 @@ def process(config, start, stop):
                 print("jobs were already submitted for this....")
             else:
                 if(submit_type == "awsbatch"):
-                    submit_aws_batch(config, client, current_workunit, jobline)
+                    try:
+                        submit_aws_batch(config, client, current_workunit, jobline)
+                    except Exception:
+                        # The jobs already submitted keep their ids: a rerun
+                        # skips them instead of submitting them again
+                        if afvs_presign.is_presigned(config):
+                            write_status(status)
+                        raise
                 elif(submit_type == "slurm"):
                     submit_slurm(config, client, current_workunit, jobline)
                 elif(submit_type == "bash"):
@@ -335,10 +358,7 @@ def process(config, start, stop):
     
     print("Writing the json status file out")
 
-    with open("../workflow/status.json.tmp", "w") as json_out:
-        json.dump(status, json_out, indent=4)
-
-    Path("../workflow/status.json.tmp").rename("../workflow/status.json")
+    write_status(status)
 
     print("Making copy for status.submission as backup")
     shutil.copyfile("../workflow/status.json", "../workflow/status.submission.json")

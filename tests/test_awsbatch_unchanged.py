@@ -48,7 +48,9 @@ class Recorder:
 
             def describe_jobs(self, jobs):
                 recorder.calls.append(('describe_jobs', list(jobs)))
-                return recorder.describe_jobs_responses.pop(0)
+                # As DescribeJobs: only the jobs asked about
+                response = recorder.describe_jobs_responses.pop(0)
+                return {**response, 'jobs': [job for job in response['jobs'] if job['jobId'] in jobs]}
 
             def download_fileobj(self, bucket, key, f):
                 recorder.calls.append(('download_fileobj', bucket, key))
@@ -380,6 +382,57 @@ def deadline():
 
 GOOD_SUMMARY = {'total_dockings': 3, 'dockings_status': {'success': 2, 'failed': 1}, 'skipped_ligands': 1,
                 'failed_downloads': 0, 'failed_downloads_dockings': 0, 'failed_downloads_log': []}
+
+
+def test_get_status_s3_failed_closed_workunit_is_still_described(tmp_path, boto, monkeypatch, deadline):
+    """A subjob failed closed while its array is still running leaves the
+    workunit's Batch status alone: it is described again (its other subjobs
+    still matter) and reported FAILED only once Batch has finished it."""
+    tools = batch_tree(tmp_path)
+    prepare_batch(tools, boto, monkeypatch)
+
+    status_path = tools.parent / "workflow" / "status.json"
+    status = json.loads(status_path.read_text())
+    for index, workunit in enumerate(status['workunits'].values(), start=1):
+        workunit['status'] = "SUBMITTED"
+        workunit['job_id'] = f"j{index}"
+    status_path.write_text(json.dumps(status))
+    boto.downloads[("job-bucket", "scores/someone/dataset/batch-job/summary/1/0.json.gz")] = \
+        gzip.compress(json.dumps(GOOD_SUMMARY).encode())
+    boto.downloads[("job-bucket", "scores/someone/dataset/batch-job/summary/2/0.json.gz")] = b"\x00not gzip"
+    boto.downloads[("job-bucket", "scores/someone/dataset/batch-job/summary/3/0.json.gz")] = \
+        gzip.compress(json.dumps(GOOD_SUMMARY).encode())
+
+    def run(parent_state):
+        boto.describe_jobs_responses = [
+            {'jobs': [{'jobId': f"j{index}", 'status': parent_state, 'arrayProperties': {'statusSummary': {}}}
+                      for index in (1, 2, 3)]},
+            {'jobs': [{'jobId': f"j{index}:0", 'status': "SUCCEEDED", 'createdAt': 1000, 'startedAt': 3000,
+                       'attempts': [{'startedAt': 3000, 'stoppedAt': 63000}]} for index in (1, 2, 3)]},
+        ]
+        boto.calls.clear()
+        module = load("afvs_get_status.py", monkeypatch)
+        monkeypatch.setattr(sys, "argv", ["afvs_get_status.py"])
+        monkeypatch.setattr(module, "Process", multiprocessing.get_context("fork").Process)
+        monkeypatch.setattr(module, "Queue", multiprocessing.get_context("fork").Queue)
+        monkeypatch.setattr(module.multiprocessing, "cpu_count", lambda: 1)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            module.main()
+        return out.getvalue().splitlines()
+
+    # The arrays still run: workunit 2 stays PENDING, not FAILED
+    lines = run("PENDING")
+    assert f"{'PENDING':>15}   {3:^10}   {0:^15}   {0:^15}" in lines
+    assert f"{'FAILED':>15}   {0:^10}   {1:^15}   {3:^15}" in lines
+    after = json.loads(status_path.read_text())
+    assert [w['status'] for w in after['workunits'].values()] == ["PENDING"] * 3
+
+    # Still described next time, and FAILED once Batch has finished it
+    lines = run("SUCCEEDED")
+    assert ('describe_jobs', ["j1", "j2", "j3"]) in boto.calls
+    assert f"{'SUCCEEDED':>15}   {2:^10}   {2:^15}   {6:^15}" in lines
+    assert f"{'FAILED':>15}   {1:^10}   {1:^15}   {3:^15}" in lines
 
 
 @pytest.mark.parametrize("bad", [

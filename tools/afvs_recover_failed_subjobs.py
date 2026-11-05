@@ -549,7 +549,7 @@ def _recover_presigned(args, config):
             'round': recovery_round,
             'job_id': None,
             'recorded_at': time.time(),
-            'job_name': f'afvs-recovery-{recovery_id}-{secrets.token_hex(4)}',
+            'job_name': f'afvs-r-{recovery_id}-{secrets.token_hex(4)}',
             'queue': f"{config['aws_batch_prefix']}-queue1",
             'subjobs_count': len(recovery_workunit['subjobs']),
             's3_download_path': recovery_workunit['s3_download_path'],
@@ -562,10 +562,14 @@ def _recover_presigned(args, config):
         try:
             submission_result = submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, tarball_subjobs, entry['job_name'])
         except ctx['client_error'] as error:
-            # Batch rejected it: there is no job, so its subjobs are retried
-            # by the next call at once
-            entry['abandoned'] = True
-            save_recovery_status(recovery_status_file, recovery_status)
+            # Batch rejected the request itself (ClientException, HTTP 400):
+            # there is no job, so the next call retries its subjobs at once.
+            # Anything else (throttling, a 5xx after a retry whose first
+            # attempt may have gone through) stays pending for
+            # resolve_pending_rounds to adopt or abandon
+            if getattr(error, 'response', {}).get('Error', {}).get('Code') == 'ClientException':
+                entry['abandoned'] = True
+                save_recovery_status(recovery_status_file, recovery_status)
             raise error
         entry['job_id'] = submission_result['job_id']
         save_recovery_status(recovery_status_file, recovery_status)

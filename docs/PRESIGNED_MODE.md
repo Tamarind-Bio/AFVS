@@ -25,7 +25,7 @@ most 604800 (the SigV4 limit) and at least `aws_batch_subjob_timeout` + 3600.
 URLs are signed at submit, and a job uploads its outputs at the end of its run,
 so they must outlast the run plus its time in the queue. A job queued for longer
 than that hour can find its URLs expired: it fails, and recovery re-signs it.
-`job_name` can be at most 80 characters, so recovery job names stay within
+`job_name` can be at most 100 characters, so recovery job names stay within
 Batch's 128.
 
 ## What the head does
@@ -66,12 +66,16 @@ Batch's 128.
 - Any configuration `afvs_get_status.py` does not support exits nonzero.
 - `--max-subjobs N` makes recovery submit at most N subjobs per call and print
   `Remaining failed subjobs: K`. Later calls carry on from there.
-- Recovery and status each hold a lock (`../workflow/status.recovery.lock`)
-  for their whole call. Each one reads `status.json` and
-  `status.recovery.json` as the other last wrote them.
+- Submit, recovery and status each hold a lock
+  (`../workflow/status.recovery.lock`) for their whole call. Each one reads
+  `status.json` and `status.recovery.json` as the others last wrote them.
+- If a SubmitJob fails partway through submit, the ids of the jobs already
+  submitted are still written, so a rerun skips those jobs.
 - Each recovery workunit is recorded before it is submitted, under a job name
-  unique to that attempt (`afvs-recovery-<id>-<random>`).
-  - If Batch rejects the SubmitJob, the record is marked `abandoned` at once.
+  unique to that attempt (`afvs-r-<id>-<random>`).
+  - If Batch rejects the SubmitJob itself (`ClientException`), the record is
+    marked `abandoned` at once. Throttling or a server error leaves the record
+    pending, because a retried call's first attempt may have created the job.
   - If a call dies between record and submit, the next call asks Batch
     (`ListJobs`, all pages, by that name) whether the job exists. If it does,
     the call keeps the record. If it doesn't, the record counts as submitted

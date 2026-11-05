@@ -391,4 +391,7 @@ def test_status_reads_and_writes_under_the_lock(screen, boto, monkeypatch):
     # children still to bill (a stale read would ask about r1 and r1:0 too)
     assert boto.calls[1:] == [('describe_jobs', ["j3"]), ('describe_jobs', ["j3:0", "j3:1", "r1:1"])]
     entry = json.loads(recovery_file.read_text())['recovery_workunits']["a-r1-1"]
+    assert entry['status'] == "FAILED"
     assert (entry['subjobs']["0"]['status'], entry['subjobs']["0"]['vcpu_seconds']) == ("FAILED", 480.0)
+    # Its padding child never reported and its array is final: failed closed
+    assert entry['padding']['status'] == "FAILED"
