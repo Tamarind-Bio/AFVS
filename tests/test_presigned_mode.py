@@ -732,6 +732,45 @@ def test_slices_of_a_screen_keep_to_their_own_folders(tmp_path, s3, head, monkey
     assert folders == {"s0001", "s0002", "_manifests", "recovery"} | job_names
 
 
+class TableCreated(Exception):
+    pass
+
+
+@pytest.mark.parametrize("script, argv, extra_config", [
+    ("afvs_get_top_results.py", [], {}),
+    ("afvs_gen_sparse.py", ["--tranches", "1"], {'athena_s3_location': f"s3://{JOB_BUCKET}/athena"}),
+])
+def test_athena_tools_read_a_slices_outputs_from_its_folder(tmp_path, s3, head, monkeypatch, script, argv, extra_config):
+    """The Athena tools build their table on the parquet outputs, which a
+    slice writes to slices/<sid>/, not under its job_name."""
+    screen = slice_screen(tmp_path, s3, head, monkeypatch, "s0001", 1)
+    screen.prepare()
+    config_path = screen.tools.parent / "workflow" / "config.json"
+    config_path.write_text(json.dumps({**json.loads(config_path.read_text()), **extra_config}))
+
+    class Athena:
+        def start_query_execution(self, QueryString, **kwargs):
+            if "CREATE EXTERNAL TABLE" in QueryString:
+                raise TableCreated(QueryString)
+            return {'QueryExecutionId': "q"}
+
+        def get_query_execution(self, QueryExecutionId):
+            return {'QueryExecution': {'Status': {'State': "SUCCEEDED"},
+                                       'ResultConfiguration': {'OutputLocation': f"s3://{JOB_BUCKET}/athena/tmp/q.csv"}}}
+
+        def delete_object(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(sys.modules["boto3"], "client", lambda *args, **kwargs: Athena())
+    monkeypatch.chdir(screen.tools)
+    monkeypatch.setattr(sys, "argv", [script] + argv)
+    tool = screen.load(script)
+    monkeypatch.setattr(tool.time, "sleep", lambda seconds: None)
+    with pytest.raises(TableCreated) as created:
+        tool.main()
+    assert f"LOCATION 's3://{JOB_BUCKET}/{JOB_PREFIX}/{JOB_NAME}/slices/s0001/qvina02/parquet'" in str(created.value)
+
+
 @pytest.mark.parametrize("args, message", [
     (["--max-subjobs", "0"], "--max-subjobs must be at least 1"),
     (["--from-round", "0"], "--from-round must be at least 1"),

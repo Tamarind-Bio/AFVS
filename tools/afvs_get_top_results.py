@@ -127,7 +127,11 @@ def main():
   table_name = f"{ctx['config']['job_name']}__{scenario}".replace("-","_")
 
   database_name = f"{ctx['config']['aws_batch_prefix']}_afvs"
-  job_location = f"{ctx['config']['object_store_job_prefix_full']}/{scenario}/parquet"
+  # The job's outputs: under object_store_job_folder if set (presigned mode)
+  output_prefix = ctx['config']['object_store_job_prefix_full']
+  if ctx['config'].get('object_store_job_folder'):
+    output_prefix = f"{ctx['config']['object_store_job_prefix']}/{ctx['config']['object_store_job_folder']}"
+  job_location = f"{output_prefix}/{scenario}/parquet"
   object_store_job_bucket = ctx['config']['object_store_job_bucket']
   scenario_info = ctx['config']['docking_scenarios_internal'][scenario]
   athena_location = f"s3://{object_store_job_bucket}/{ctx['config']['object_store_job_prefix_full']}/athena"

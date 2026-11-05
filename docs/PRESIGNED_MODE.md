@@ -38,11 +38,15 @@ between them.
 the job's outputs under `object_store_job_prefix` apart from `job_name`: one
 folder of at most 100 letters, digits, `-` or `_`, and not `_manifests` or
 `recovery`. Only outputs move there (`summary/`, and per scenario `logs/`,
-`parquet/` and `csv/`, recovery outputs included). Input tarballs
-(`<prefix>/<job_name>/input/`), manifests (`<prefix>/_manifests/<job_name>/`)
+`parquet/` and `csv/`, recovery outputs included), and
+`afvs_get_top_results.py` and `afvs_gen_sparse.py` read them there. Input
+tarballs (`<prefix>/<job_name>/input/`, or `<prefix>/hh/hh/<job_name>/input/`
+when addressing is hashed), manifests (`<prefix>/_manifests/<job_name>/`)
 and recovery tarballs (`<prefix>/recovery/<job_name>/`) stay keyed by
 `job_name`, as do Batch job names. Without it the folder is `job_name` and
-nothing changes.
+nothing changes. Prepare sees one job only, so it cannot stop a folder from
+equalling another job's `job_name` or folder under the same prefix: keep each
+folder distinct from every `job_name` there.
 
 ### Slices of a screen
 
@@ -85,8 +89,8 @@ once.
 
   It uploads the manifest to `<prefix>/_manifests/<job_name>/<wu>.json`. That is
   beside the job's output prefix, not inside it, because a manifest grants
-  write access to the job's outputs, so whatever copies `<prefix>/<job>/`
-  must not pick manifests up. It then submits the job with only
+  write access to the job's outputs, so whatever copies the job's output
+  folder must not pick manifests up. It then submits the job with only
   `AFVS_CONFIG_JOB_URL` (a presigned GET for that manifest) and `TMPDIR` (the
   scratch area, since the job's root filesystem is read-only). It passes no
   tags.
