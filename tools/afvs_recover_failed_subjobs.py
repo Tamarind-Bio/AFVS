@@ -533,6 +533,11 @@ def _recover_presigned(args, config):
     else:
         recovery_round = 1 + max([entry.get('round', 0) for entry in recovery_status['recovery_workunits'].values()] or [0])
     already_in_round = sum(1 for entry in recovery_status['recovery_workunits'].values() if entry.get('round') == recovery_round)
+    # Batch job names are at most 128 characters; the longest this call makes
+    last_n = already_in_round + -(-len(failed_subjobs) // args.max_subjobs_per_workunit)
+    if len(f"afvs-r-{config['job_letter']}-r{recovery_round}-{last_n}-{'0' * 8}") > 128:
+        print(f"ERROR: recovery round {recovery_round} would give Batch job names over 128 characters")
+        return 2
     print(f"\nCreating recovery round {recovery_round} (max {args.max_subjobs_per_workunit} subjobs per workunit)...")
 
     for i in range(0, len(failed_subjobs), args.max_subjobs_per_workunit):

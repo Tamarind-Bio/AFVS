@@ -657,6 +657,24 @@ def test_a_subjob_that_keeps_failing_does_not_starve_the_round(screen):
     assert code == 0 and originals_of_round(2) == ["1"]
 
 
+@pytest.mark.parametrize("args, message", [
+    (["--max-subjobs", "0"], "--max-subjobs must be at least 1"),
+    (["--from-round", "0"], "--from-round must be at least 1"),
+    # A round number so long that its recovery job names pass Batch's 128
+    (["--from-round", "9" * 110], "would give Batch job names over 128 characters"),
+])
+def test_recovery_refuses_bad_arguments_before_recording_anything(screen, args, message):
+    screen.prepare()
+    screen.submit(1, 3)
+    fail_all(screen)
+    recover = screen.load("afvs_recover_failed_subjobs.py")
+    submits = len(screen.head.submits)
+    code, out = recover_call(screen, recover, *args)
+    assert code == 2 and message in out
+    assert len(screen.head.submits) == submits
+    assert not (screen.tools.parent / "workflow" / "status.recovery.json").exists()
+
+
 def test_windowed_recovery_without_from_round_takes_the_oldest_failures_first(screen):
     """Without --from-round each call is a new round. A subjob that fails
     again at once must not be picked ahead of failures still waiting."""
