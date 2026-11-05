@@ -854,7 +854,10 @@ def test_killall_refuses_in_presigned_mode(screen):
      "'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout' + 300"),
     # int() takes it, but the expiry check must not be skipped for it
     ("aws_batch_subjob_timeout=1800", "aws_batch_subjob_timeout=+1800",
-     "'aws_batch_subjob_timeout' must be a positive integer"),
+     "'aws_batch_subjob_timeout' must be an integer of at least 60"),
+    # Batch's smallest attempt timeout is 60 s
+    ("aws_batch_subjob_timeout=1800", "aws_batch_subjob_timeout=59",
+     "'aws_batch_subjob_timeout' must be an integer of at least 60"),
     (f"job_name={JOB_NAME}", "job_name=" + "j" * 101, "'job_name' must be at most 100 characters"),
     (f"job_name={JOB_NAME}", "job_name=screen.prod", "'job_name' must be at most 100 characters, all letters"),
     (f"job_name={JOB_NAME}", f"job_letter={JOB_NAME}", "'job_name' must be set if job_storage_mode is 'presigned'"),
@@ -870,6 +873,8 @@ def test_prepare_validates_presigned_configs(screen, old, new, message):
 @pytest.mark.parametrize("expiry, timeout", [
     # The smallest expiry the 300 s margin allows
     (2100, 1800),
+    # The smallest timeout Batch takes
+    (360, 60),
     # What the production head writes under its one-hour AWS sessions
     (3300, 2700),
 ])
@@ -880,7 +885,7 @@ def test_prepare_accepts_expiry_within_an_hour_session(screen, expiry, timeout):
                     .replace("aws_batch_subjob_timeout=1800", f"aws_batch_subjob_timeout={timeout}"))
     ret = subprocess.run([sys.executable, "./afvs_prepare_folders.py", "--overwrite"], cwd=screen.tools,
                          capture_output=True, text=True)
-    # (the fixture's tempdir draws an unrelated recommendation, so the exit
-    # code is not the signal here; that recommendation proves the checks ran)
-    assert "RECOMMENDED that 'tempdir_default'" in ret.stdout, ret.stdout
-    assert "'presigned_url_expiry_seconds'" not in ret.stdout, ret.stdout
+    # The fixture's tempdir draws an unrelated recommendation, so prepare
+    # exits 1 anyway: that must be the only complaint
+    assert [line for line in ret.stdout.splitlines() if line.startswith("* ")] == \
+        ["* RECOMMENDED that 'tempdir_default' be '/dev/shm' if awsbatch is used"], ret.stdout

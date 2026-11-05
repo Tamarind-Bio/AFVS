@@ -243,9 +243,11 @@ def check_parameters(config):
             # The longest a SigV4 presigned URL can be valid
             print("* 'presigned_url_expiry_seconds' must be at most 604800 (7 days)")
             error = 1
-        elif(not re.search(r'^[1-9][0-9]*$', config.get('aws_batch_subjob_timeout') or '')):
-            # The URLs' lifetime is checked against it, so it must be a plain number
-            print("* 'aws_batch_subjob_timeout' must be a positive integer if job_storage_mode is 'presigned'")
+        elif(not re.search(r'^[1-9][0-9]*$', config.get('aws_batch_subjob_timeout') or '')
+             or int(config['aws_batch_subjob_timeout']) < 60):
+            # The URLs' lifetime is checked against it, so it must be a plain
+            # number, and Batch takes no attempt timeout under 60 s
+            print("* 'aws_batch_subjob_timeout' must be an integer of at least 60 if job_storage_mode is 'presigned'")
             error = 1
         elif(int(config['presigned_url_expiry_seconds']) < int(config['aws_batch_subjob_timeout']) + PRESIGNED_QUEUE_MARGIN_SECONDS):
             # See PRESIGNED_QUEUE_MARGIN_SECONDS

@@ -23,7 +23,7 @@ The `object_store_*`, `aws_region` and other `aws_batch_*` keys are the same as
 in s3 mode. Prepare rejects presigned mode unless `batchsystem=awsbatch` and
 `data_storage_mode=s3`. It requires `presigned_url_expiry_seconds` to be at
 most 604800 (the SigV4 limit) and at least `aws_batch_subjob_timeout` + 300,
-with `aws_batch_subjob_timeout` a positive integer.
+with `aws_batch_subjob_timeout` an integer of at least 60 (Batch's minimum).
 URLs are signed at submit, and a job uploads its outputs at the end of its run,
 so they must outlast the run plus a little time in the queue. A URL also dies
 with the AWS session that signed it, and the production head's sessions last an
