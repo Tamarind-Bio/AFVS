@@ -852,6 +852,9 @@ def test_killall_refuses_in_presigned_mode(screen):
     # aws_batch_subjob_timeout=1800: URLs must outlast it plus 300 s queued
     (f"presigned_url_expiry_seconds={EXPIRY}", "presigned_url_expiry_seconds=2099",
      "'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout' + 300"),
+    # int() takes it, but the expiry check must not be skipped for it
+    ("aws_batch_subjob_timeout=1800", "aws_batch_subjob_timeout=+1800",
+     "'aws_batch_subjob_timeout' must be a positive integer"),
     (f"job_name={JOB_NAME}", "job_name=" + "j" * 101, "'job_name' must be at most 100 characters"),
     (f"job_name={JOB_NAME}", "job_name=screen.prod", "'job_name' must be at most 100 characters, all letters"),
     (f"job_name={JOB_NAME}", f"job_letter={JOB_NAME}", "'job_name' must be set if job_storage_mode is 'presigned'"),
@@ -878,5 +881,6 @@ def test_prepare_accepts_expiry_within_an_hour_session(screen, expiry, timeout):
     ret = subprocess.run([sys.executable, "./afvs_prepare_folders.py", "--overwrite"], cwd=screen.tools,
                          capture_output=True, text=True)
     # (the fixture's tempdir draws an unrelated recommendation, so the exit
-    # code is not the signal here)
+    # code is not the signal here; that recommendation proves the checks ran)
+    assert "RECOMMENDED that 'tempdir_default'" in ret.stdout, ret.stdout
     assert "'presigned_url_expiry_seconds'" not in ret.stdout, ret.stdout

@@ -22,7 +22,8 @@ aws_batch_jobdef=vf-jobdef-afvs-sealed
 The `object_store_*`, `aws_region` and other `aws_batch_*` keys are the same as
 in s3 mode. Prepare rejects presigned mode unless `batchsystem=awsbatch` and
 `data_storage_mode=s3`. It requires `presigned_url_expiry_seconds` to be at
-most 604800 (the SigV4 limit) and at least `aws_batch_subjob_timeout` + 300.
+most 604800 (the SigV4 limit) and at least `aws_batch_subjob_timeout` + 300,
+with `aws_batch_subjob_timeout` a positive integer.
 URLs are signed at submit, and a job uploads its outputs at the end of its run,
 so they must outlast the run plus a little time in the queue. A URL also dies
 with the AWS session that signed it, and the production head's sessions last an
@@ -114,12 +115,18 @@ is the smaller of `presigned_url_expiry_seconds` and the time the signing
 session has left. With one-hour sessions, keeping each job inside its URLs is
 up to the caller that runs submit and recover:
 
-- Run every submit and recover call on a fresh session. URLs signed late in an
-  old session die early, whatever `X-Amz-Expires` says.
+- Run every submit and recover call on a fresh session, and keep each call
+  short. They sign one workunit at a time, so only URLs signed within
+  (session length − `presigned_url_expiry_seconds`) of the session's start get
+  their full `X-Amz-Expires`: 300 s at 3300 under one-hour sessions. Split a
+  window that takes longer to sign across calls, or lower the expiry, and lower
+  the timeout and subjob size to match.
 - Size the subjobs so the real run time stays well under
-  `aws_batch_subjob_timeout`. Size the windows so jobs start within the
-  300 s margin. A job that waits or runs past its URLs fails, and so does
-  every rerun that hits the same queue backlog.
+  `aws_batch_subjob_timeout`. Size the windows so every job starts within
+  `presigned_url_expiry_seconds` − `aws_batch_subjob_timeout` of being signed.
+  Prepare enforces at least 300 s; 3300 / 2700 gives 600 s. A job whose queue
+  wait, run and upload outlast its URLs fails, and so does every rerun that
+  hits the same queue backlog.
 - A Batch retry strategy reuses the job's original URLs. Rely on AFVS recovery,
   which re-signs, rather than Batch retries.
 - A subjob that fails partway through uploading can leave some outputs at its
