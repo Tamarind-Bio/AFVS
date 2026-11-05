@@ -263,6 +263,19 @@ def check_parameters(config):
             # afvs-r-<job_name>-r<round>-<n>-<8 hex>
             print("* 'job_name' must be at most 100 characters, all letters, digits, '-' or '_', if job_storage_mode is 'presigned'")
             error = 1
+        if(not empty_value(config, 'object_store_job_folder') and
+           not re.search(r'^[A-Za-z0-9_-]{1,100}$', config['object_store_job_folder'])):
+            # One folder under object_store_job_prefix, never a path
+            print("* 'object_store_job_folder' must be at most 100 characters, all letters, digits, '-' or '_'")
+            error = 1
+        elif(config.get('object_store_job_folder') in ("_manifests", "recovery")):
+            # Manifests and recovery tarballs of every job under the prefix
+            # live in these folders
+            print("* 'object_store_job_folder' cannot be '_manifests' or 'recovery'")
+            error = 1
+    elif(not empty_value(config, 'object_store_job_folder')):
+        print("* 'object_store_job_folder' is only supported if job_storage_mode is 'presigned'")
+        error = 1
 
     if(empty_value(config, 'ligand_library_format')):
         print("* 'ligand_library_format' must be set in all.ctrl")

@@ -89,9 +89,17 @@ def expiry_seconds(config):
     return int(config['presigned_url_expiry_seconds'])
 
 
+def job_folder(config):
+    """The folder of the job's outputs under object_store_job_prefix:
+    object_store_job_folder if set, else job_name. A slice of a screen keeps a
+    short job_name, unique per attempt, for Batch names, inputs and manifests,
+    while its outputs go to the slice's folder."""
+    return config.get('object_store_job_folder') or config['job_name']
+
+
 def job_prefix(config):
-    # The same prefix afvs_run.generate_output_path uses for s3 outputs
-    return f"{config['object_store_job_prefix']}/{config['job_name']}"
+    # The same prefix afvs_run.generate_output_path uses for outputs
+    return f"{config['object_store_job_prefix']}/{job_folder(config)}"
 
 
 def manifest_key(config, workunit_id):

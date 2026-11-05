@@ -34,6 +34,43 @@ letters, digits, `-` or `_`, so recovery job names (`afvs-r-<job_name>-r<round>-
 stay within Batch's 128 while round and workunit numbers have 9 digits
 between them.
 
+`object_store_job_folder` (optional, presigned mode only) names the folder of
+the job's outputs under `object_store_job_prefix` apart from `job_name`: one
+folder of at most 100 letters, digits, `-` or `_`, and not `_manifests` or
+`recovery`. Only outputs move there (`summary/`, and per scenario `logs/`,
+`parquet/` and `csv/`, recovery outputs included). Input tarballs
+(`<prefix>/<job_name>/input/`), manifests (`<prefix>/_manifests/<job_name>/`)
+and recovery tarballs (`<prefix>/recovery/<job_name>/`) stay keyed by
+`job_name`, as do Batch job names. Without it the folder is `job_name` and
+nothing changes.
+
+### Slices of a screen
+
+A screen split into slices runs each slice as an ordinary AFVS run, in its own
+working directory (its own `all.ctrl`, `collections.json` and `workflow/`),
+with the tools run from that directory's `tools/`. For slice `<sid>` of a
+screen whose results go to `<screen prefix>`:
+
+```
+job_name=vs-<8 hex of the screen's job id>-<sid>-a<attempt>
+object_store_job_prefix=<screen prefix>/slices
+object_store_job_folder=<sid>
+```
+
+Outputs then land at `<screen prefix>/slices/<sid>/…`. `job_name` must be
+unique per attempt, not only per slice: a fresh attempt of a slice that reused
+it would overwrite the earlier attempt's input tarballs and manifests while
+that attempt's jobs may still be queued, and its Batch names would match.
+Outputs, though, share the slice's folder, keyed by workunit and subjob as in
+any run, so attempts write the same keys. Before starting a fresh attempt,
+terminate the old attempt's Batch jobs: one already running keeps valid PUT
+URLs until they expire (`presigned_url_expiry_seconds` after signing) and can
+overwrite the new attempt's output for the same subjob. Read the outputs of
+the attempt you keep through its own `status.json` and `status.recovery.json`.
+Slices on one head share its Batch queues, credentials and
+`/dev/shm` (`tempdir_default`), so size the head for the slices it runs at
+once.
+
 ## What the head does
 
 - **`afvs_prepare_workunits.py`** uploads each workunit tarball to
@@ -46,7 +83,7 @@ between them.
     `logs/…tar.gz`, `parquet/…parquet` and `csv/…csv.gz` as `summary_formats`
     asks)
 
-  It uploads the manifest to `<prefix>/_manifests/<job>/<wu>.json`. That is
+  It uploads the manifest to `<prefix>/_manifests/<job_name>/<wu>.json`. That is
   beside the job's output prefix, not inside it, because a manifest grants
   write access to the job's outputs, so whatever copies `<prefix>/<job>/`
   must not pick manifests up. It then submits the job with only
