@@ -428,6 +428,17 @@ def main():
     )
     ctx['s3'] = boto3.client('s3', config=aws_config)
 
+    if ctx['config'].get('object_store_job_folder'):
+        # The output folder is not the job's own (a slice's attempts share
+        # it), so it must start empty: whatever an earlier attempt left there
+        # would read as this job's results
+        output_folder = f"{ctx['config']['object_store_job_prefix']}/{ctx['config']['object_store_job_folder']}/"
+        listing = ctx['s3'].list_objects_v2(Bucket=ctx['config']['object_store_job_bucket'],
+                                            Prefix=output_folder, MaxKeys=1)
+        if listing.get('KeyCount', 0):
+            print(f"The output folder {output_folder} is not empty: delete it once the jobs that wrote to it are done")
+            sys.exit(1)
+
     ctx['base_dir'] = pathlib.Path(__file__).parent.resolve()
 
 

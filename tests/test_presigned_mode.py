@@ -160,6 +160,10 @@ class Head:
             def download_fileobj(self, bucket, key, f):
                 f.write(head.store.objects[(bucket, key)])
 
+            def list_objects_v2(self, Bucket, Prefix, MaxKeys=1000):
+                keys = sorted(key for bucket, key in head.store.objects if bucket == Bucket and key.startswith(Prefix))
+                return {'KeyCount': len(keys[:MaxKeys]), 'Contents': [{'Key': key} for key in keys[:MaxKeys]]}
+
             def generate_presigned_url(self, ClientMethod, Params, ExpiresIn):
                 head.presign_calls.append((ClientMethod, Params['Bucket'], Params['Key'], ExpiresIn))
                 method = {'get_object': "GET", 'put_object': "PUT"}[ClientMethod]
@@ -673,9 +677,10 @@ def slice_screen(tmp_path, s3, head, monkeypatch, sid, attempt):
 def test_slices_of_a_screen_keep_to_their_own_folders(tmp_path, s3, head, monkeypatch):
     """Two slices, and a fresh second attempt of one of them, run side by side
     against one bucket and one queue. Outputs, recovery outputs included, go
-    to slices/<sid>/; inputs, manifests and recovery tarballs key on the
-    attempt's job_name, so no attempt reads or overwrites another's; Batch
-    names are each attempt's own and fit in 128 characters."""
+    to slices/<sid>/, which a fresh attempt must find empty; inputs,
+    manifests and recovery tarballs key on the attempt's job_name, so no
+    attempt reads or overwrites another's; Batch names are each attempt's own
+    and fit in 128 characters."""
     slices_prefix = f"{JOB_PREFIX}/{JOB_NAME}/slices"
     attempts = [("s0001", 1), ("s0002", 1), ("s0002", 2)]
     screens = {(sid, attempt): slice_screen(tmp_path, s3, head, monkeypatch, sid, attempt)
@@ -683,6 +688,13 @@ def test_slices_of_a_screen_keep_to_their_own_folders(tmp_path, s3, head, monkey
 
     manifest_keys = set()
     for (sid, attempt), screen in screens.items():
+        if attempt > 1:
+            # A fresh attempt starts from an empty folder: what the earlier
+            # one wrote there would read as its results
+            with pytest.raises(SystemExit):
+                screen.prepare()
+            for key in [key for key in s3.objects if key[1].startswith(f"{slices_prefix}/{sid}/")]:
+                del s3.objects[key]
         screen.prepare()
         before = len(head.submits)
         screen.submit(1, 1)

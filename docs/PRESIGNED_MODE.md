@@ -41,9 +41,10 @@ folder of at most 100 letters, digits, `-` or `_`, and not `_manifests` or
 `parquet/` and `csv/`, recovery outputs included), and
 `afvs_get_top_results.py` and `afvs_gen_sparse.py` read them there. Input
 tarballs (`<prefix>/<job_name>/input/`, or `<prefix>/hh/hh/<job_name>/input/`
-when addressing is hashed), manifests (`<prefix>/_manifests/<job_name>/`)
-and recovery tarballs (`<prefix>/recovery/<job_name>/`) stay keyed by
-`job_name`, as do Batch job names. Without it the folder is `job_name` and
+when addressing is hashed), manifests (`<prefix>/_manifests/<job_name>/`),
+recovery tarballs (`<prefix>/recovery/<job_name>/`) and the Athena tools'
+query results (`<prefix>/<job_name>/athena/`) stay keyed by `job_name`, as do
+Batch job names. Without it the folder is `job_name` and
 nothing changes. Prepare sees one job only, so it cannot stop a folder from
 equalling another job's `job_name` or folder under the same prefix: keep each
 folder distinct from every `job_name` there.
@@ -66,11 +67,15 @@ unique per attempt, not only per slice: a fresh attempt of a slice that reused
 it would overwrite the earlier attempt's input tarballs and manifests while
 that attempt's jobs may still be queued, and its Batch names would match.
 Outputs, though, share the slice's folder, keyed by workunit and subjob as in
-any run, so attempts write the same keys. Before starting a fresh attempt,
-terminate the old attempt's Batch jobs: one already running keeps valid PUT
-URLs until they expire (`presigned_url_expiry_seconds` after signing) and can
-overwrite the new attempt's output for the same subjob. Read the outputs of
-the attempt you keep through its own `status.json` and `status.recovery.json`.
+any run, so attempts write to one place. Start a fresh attempt from an empty
+folder: terminate the old attempt's Batch jobs, wait until their URLs have
+expired (`presigned_url_expiry_seconds` after the last signing), since a job
+already running can still upload, then delete `<screen prefix>/slices/<sid>/`.
+Otherwise whatever reads the folder sees both attempts: the Athena tools
+build their table on every parquet under it, so the old attempt's outputs,
+its `recovery-<job_name>-…` ones included, show up as duplicate or extra rows.
+`afvs_prepare_workunits.py` refuses to start while the folder holds anything,
+but it cannot see an upload still to come.
 Slices on one head share its Batch queues, credentials and
 `/dev/shm` (`tempdir_default`), so size the head for the slices it runs at
 once.
