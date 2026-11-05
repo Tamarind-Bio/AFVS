@@ -889,3 +889,5 @@ def test_prepare_accepts_expiry_within_an_hour_session(screen, expiry, timeout):
     # exits 1 anyway: that must be the only complaint
     assert [line for line in ret.stdout.splitlines() if line.startswith("* ")] == \
         ["* RECOMMENDED that 'tempdir_default' be '/dev/shm' if awsbatch is used"], ret.stdout
+    # ...and prepare got through every check without crashing
+    assert ret.stderr == "" and "Workflow has validation errors" in ret.stdout, ret.stdout + ret.stderr
