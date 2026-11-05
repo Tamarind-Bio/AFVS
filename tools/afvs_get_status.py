@@ -804,7 +804,9 @@ def process_presigned_locked(config):
             overview_status[subjob_status]['ligands'] += subjob['ligands_expected']
 
             if subjob_status in ('RUNNING', 'STARTING'):
-                active_vcpus += latest_subjob.get('vcpus', int(config['aws_batch_subjob_vcpus']))
+                if 'vcpus' not in latest_subjob:
+                    latest_subjob = {**latest_subjob, 'vcpus': batch_job_vcpus({}, config)}
+                active_vcpus += latest_subjob['vcpus']
 
         if not subjob_states:
             continue

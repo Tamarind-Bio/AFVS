@@ -395,3 +395,22 @@ def test_status_reads_and_writes_under_the_lock(screen, boto, monkeypatch):
     assert (entry['subjobs']["0"]['status'], entry['subjobs']["0"]['vcpu_seconds']) == ("FAILED", 480.0)
     # Its padding child never reported and its array is final: failed closed
     assert entry['padding']['status'] == "FAILED"
+
+
+def test_fractional_vcpus_in_the_config_are_not_truncated_or_fatal(screen, boto):
+    """Batch takes fractional vCPUs (Fargate); a running child Batch reports
+    is counted as it reports, one it has not reported as configured."""
+    config_file = screen.workflow / "config.json"
+    config = json.loads(config_file.read_text())
+    config['aws_batch_subjob_vcpus'] = "0.5"
+    config_file.write_text(json.dumps(config))
+
+    boto.describe_jobs_responses = [
+        {'jobs': [parent("j1", "RUNNING"), parent("j2", "RUNNING"), parent("j3", "RUNNING")]},
+        {'jobs': [{'jobId': "j1:0", 'status': "RUNNING", 'container': vcpu_requirement(0.5), 'attempts': []},
+                  {'jobId': "j2:0", 'status': "RUNNING", 'container': {}, 'attempts': []}]},
+    ]
+    out = screen()
+    assert "Active vCPUs: 1.0" in out.splitlines()
+    after = json.loads((screen.workflow / "status.json").read_text())
+    assert [after['workunits'][n]['subjobs']['0'].get('vcpus') for n in ("1", "2")] == [0.5, 0.5]
