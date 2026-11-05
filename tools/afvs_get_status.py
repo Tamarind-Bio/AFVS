@@ -424,10 +424,9 @@ def process(config):
 
         if item['result'] is None:
             # No usable summary: FAILED, so recovery reruns it, and no counts.
-            # The workunit too, since the wrapper decides on recovery from the
-            # workunit column.
+            # The workunit keeps the status Batch reported, so it is still
+            # described; the report counts it FAILED once it is final.
             subjob['status'] = 'FAILED'
-            status[workunit_id]['status'] = 'FAILED'
             workunits_to_recompute[workunit_id] = 1
             continue
 
@@ -449,7 +448,6 @@ def process(config):
     for workunit_id, subjob_id in sorted(not_parsed):
         logging.error(f"No summary was received for {workunit_id}:{subjob_id}")
         status[workunit_id]['subjobs'][subjob_id]['status'] = 'FAILED'
-        status[workunit_id]['status'] = 'FAILED'
         workunits_to_recompute[workunit_id] = 1
 
     print("")
@@ -472,7 +470,14 @@ def process(config):
                 'subjobs': 0
             }
 
-        workunit['overview_status'][workunit['status']]['workunits'] += 1
+        # A final workunit with a failed subjob counts as FAILED, as Batch
+        # fails an array with a failed child: a subjob failed closed above
+        # (no usable summary) fails its workunit in the report, which the
+        # wrapper starts recovery from
+        workunit_status = workunit['status']
+        if workunit_status in final_states and any(subjob['status'] == 'FAILED' for subjob in workunit['subjobs'].values()):
+            workunit_status = 'FAILED'
+        workunit['overview_status'][workunit_status]['workunits'] += 1
 
         for subjob_id, subjob in workunit['subjobs'].items():
             subjob_status = subjob['status']
@@ -640,6 +645,11 @@ def describe_batch_jobs(client, job_ids):
 
 
 def process_presigned(config):
+    with afvs_presign.recovery_lock():
+        process_presigned_locked(config)
+
+
+def process_presigned_locked(config):
     """Status of a job_storage_mode=presigned screen. Reads nothing the docking
     jobs wrote: states and vCPU time come only from AWS Batch DescribeJobs (a
     source the jobs cannot alter). Docking counts are not reported here; the
@@ -678,7 +688,7 @@ def process_presigned(config):
                                     key=lambda item: item[1].get('round', 0))
 
     # A recovery workunit recorded but not yet submitted (job_id None) has no
-    # job to ask about: its subjobs count as submitted
+    # job to ask about (see afvs_presign.pending_in_grace for how it counts)
     submitted = [workunit for workunit in main_workunits.values() if workunit.get('job_id')] + \
         [workunit for _, workunit in recovery_workunits if workunit.get('job_id')]
 
@@ -753,13 +763,21 @@ def process_presigned(config):
         for subjob_id, subjob in workunit['subjobs'].items():
             latest[(workunit_id, subjob_id)] = subjob
 
+    now = time.time()
     for _, recovery_workunit in recovery_workunits:
-        if not recovery_workunit.get('job_id'):
+        pending = afvs_presign.pending_in_grace(recovery_workunit, now)
+        if not recovery_workunit.get('job_id') and not pending:
             continue
         for recovery_subjob_id, mapping in recovery_workunit.get('recovery_subjobs_mapping', {}).items():
             key = (str(mapping['original_workunit_id']), str(mapping['original_subjob_id']))
             recovery_subjob = recovery_workunit['subjobs'].get(recovery_subjob_id)
-            if key in latest and recovery_subjob is not None and 'status' in recovery_subjob:
+            if key not in latest or recovery_subjob is None:
+                continue
+            if pending:
+                # Its job may exist and not be listed yet: in flight, as
+                # recovery counts it
+                latest[key] = {**recovery_subjob, 'status': 'SUBMITTED'}
+            elif 'status' in recovery_subjob:
                 latest[key] = recovery_subjob
 
     overview_status = {}
@@ -855,35 +873,9 @@ def process_presigned(config):
     shutil.move("../workflow/status.tmp.json", status_file)
 
     if recovery_complete is not None:
-        with afvs_presign.recovery_lock():
-            # Merge into a fresh read: a round recover appended meanwhile must not
-            # be lost (only the fields status owns are written back)
-            current = recovery_complete
-            if os.path.exists(recovery_status_file):
-                with open(recovery_status_file, "r") as read_file:
-                    current = json.load(read_file)
-                for recovery_id, recovery in recovery_complete['recovery_workunits'].items():
-                    target = current['recovery_workunits'].get(recovery_id)
-                    if target is None:
-                        continue
-                    # A concurrent status run may already have written a final
-                    # state from a newer read: never step back from it
-                    if target.get('status') not in final_states:
-                        for key in ('status', 'status_summary'):
-                            if key in recovery:
-                                target[key] = recovery[key]
-                    if 'padding' in recovery and target.get('padding', {}).get('status') not in final_states:
-                        target['padding'] = recovery['padding']
-                    for index, subjob in recovery['subjobs'].items():
-                        target_subjob = target['subjobs'].setdefault(index, {})
-                        if target_subjob.get('status') in final_states:
-                            continue
-                        for key in ('status', 'vcpus', 'vcpu_seconds', 'vcpu_seconds_interrupted'):
-                            if key in subjob:
-                                target_subjob[key] = subjob[key]
-            with open("../workflow/status.recovery.tmp.json", "w") as json_out:
-                json.dump(current, json_out)
-            shutil.move("../workflow/status.recovery.tmp.json", recovery_status_file)
+        with open("../workflow/status.recovery.tmp.json", "w") as json_out:
+            json.dump(recovery_complete, json_out)
+        shutil.move("../workflow/status.recovery.tmp.json", recovery_status_file)
 
 
 def main():

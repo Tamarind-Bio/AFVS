@@ -236,10 +236,15 @@ def check_parameters(config):
             print("* 'presigned_url_expiry_seconds' must be at most 604800 (7 days)")
             error = 1
         elif(re.search(r'^[0-9]+$', config.get('aws_batch_subjob_timeout', '')) and
-             int(config['presigned_url_expiry_seconds']) < int(config['aws_batch_subjob_timeout'])):
-            # A job uploads its outputs at the end of its run, so its URLs must
-            # outlast it (and its time in the queue)
-            print("* 'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout'")
+             int(config['presigned_url_expiry_seconds']) < int(config['aws_batch_subjob_timeout']) + 3600):
+            # URLs are signed at submit and a job uploads its outputs at the
+            # end of its run, so they must outlast the run plus time queued
+            print("* 'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout' + 3600")
+            error = 1
+        if(len(config.get('job_name') or config.get('job_letter') or '') > 80):
+            # Batch job names are at most 128 characters, and recovery jobs
+            # are named afvs-recovery-<job_name>-r<round>-<n>-<suffix>
+            print("* 'job_name' must be at most 80 characters if job_storage_mode is 'presigned'")
             error = 1
 
     if(empty_value(config, 'ligand_library_format')):

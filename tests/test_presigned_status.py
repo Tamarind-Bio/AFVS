@@ -305,13 +305,21 @@ def recovery_entry(job_id, **extra):
     }
 
 
-def test_a_recovery_workunit_recorded_but_not_submitted_is_not_asked_about(screen, boto):
+@pytest.mark.parametrize("recorded_ago, rerun_counts_as", [
+    # Its job may exist and not be listed yet: in flight, as recovery counts it
+    (60, "SUBMITTED"),
+    # Too old to be in flight unseen: the previous attempt (FAILED) stands, so
+    # recovery runs and abandons or adopts it
+    (3600, "FAILED"),
+])
+def test_a_recovery_workunit_recorded_but_not_submitted_is_not_asked_about(screen, boto, recorded_ago, rerun_counts_as):
     """Recover records a workunit (job_id None) before SubmitJob. A status run
-    in between, or after a crash there, must not ask Batch about job None."""
+    in between, or after a crash there, must not ask Batch about job None,
+    and must count its subjobs as recovery does."""
     boto.describe_jobs_responses = list(FIRST_ROUND)
     screen()
     (screen.workflow / "status.recovery.json").write_text(json.dumps({'recovery_workunits': {
-        "a-r1-1": recovery_entry(None, recorded_at=0)}}))
+        "a-r1-1": recovery_entry(None, recorded_at=time.time() - recorded_ago)}}))
 
     boto.describe_jobs_responses = [
         {'jobs': [parent("j3", "RUNNING")]},
@@ -321,6 +329,10 @@ def test_a_recovery_workunit_recorded_but_not_submitted_is_not_asked_about(scree
     assert boto.calls[1:] == [('describe_jobs', ["j3"]), ('describe_jobs', ["j3:0", "j3:1"])]
     recovery = json.loads((screen.workflow / "status.recovery.json").read_text())
     assert recovery['recovery_workunits']["a-r1-1"]['job_id'] is None
+    # Workunit 2's only subjob is the one rerun
+    overview = json.loads((screen.workflow / "status.json").read_text())['overview_status']
+    assert overview[rerun_counts_as]['subjobs'] == 1
+    assert overview['SUCCEEDED']['subjobs'] == 1 and overview['RUNNING']['subjobs'] == 1
 
 
 @pytest.mark.parametrize("submitted_ago, expected", [
@@ -346,9 +358,10 @@ def test_a_parent_missing_from_describe_jobs_fails_only_after_a_grace(screen, bo
     assert subjob.get('vcpu_seconds') == (0 if expected == "FAILED" else None)
 
 
-def test_status_never_writes_back_an_older_state_over_a_final_one(screen, boto, monkeypatch):
-    """Two status runs overlap: the slower one read status.recovery.json before
-    the faster one wrote a final state. Its write-back must not undo that."""
+def test_status_reads_and_writes_under_the_lock(screen, boto, monkeypatch):
+    """Status holds the lock from its read to its write-back, so an
+    overlapping status run (or recover) that wrote a final state first is
+    read, not overwritten with an older read."""
     boto.describe_jobs_responses = list(FIRST_ROUND)
     screen()
     recovery_file = screen.workflow / "status.recovery.json"
@@ -362,8 +375,7 @@ def test_status_never_writes_back_an_older_state_over_a_final_one(screen, boto, 
         ]},
     ]
 
-    # The faster run writes r1:0 FAILED (billed) after this run read the file
-    # and before it takes the lock to write back
+    # Another run writes r1:0 FAILED (billed) while this one waits for the lock
     afvs_presign = sys.modules['afvs_presign']
     real_lock = afvs_presign.recovery_lock
 
@@ -375,6 +387,8 @@ def test_status_never_writes_back_an_older_state_over_a_final_one(screen, boto, 
 
     monkeypatch.setattr(afvs_presign, "recovery_lock", lock_after_faster_run)
     screen()
+    # It read r1 as final, so asked Batch only about j3 and the padding
+    # children still to bill (a stale read would ask about r1 and r1:0 too)
+    assert boto.calls[1:] == [('describe_jobs', ["j3"]), ('describe_jobs', ["j3:0", "j3:1", "r1:1"])]
     entry = json.loads(recovery_file.read_text())['recovery_workunits']["a-r1-1"]
-    assert entry['status'] == "FAILED"
     assert (entry['subjobs']["0"]['status'], entry['subjobs']["0"]['vcpu_seconds']) == ("FAILED", 480.0)

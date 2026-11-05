@@ -21,9 +21,12 @@ aws_batch_jobdef=vf-jobdef-afvs-sealed
 The `object_store_*`, `aws_region` and other `aws_batch_*` keys are the same as
 in s3 mode. Prepare rejects presigned mode unless `batchsystem=awsbatch` and
 `data_storage_mode=s3`. It requires `presigned_url_expiry_seconds` to be at
-most 604800 (the SigV4 limit) and at least `aws_batch_subjob_timeout`, because a
-job uploads its outputs at the end of its run. URLs are signed at submit, so
-they must also outlast the time a job waits in the queue.
+most 604800 (the SigV4 limit) and at least `aws_batch_subjob_timeout` + 3600.
+URLs are signed at submit, and a job uploads its outputs at the end of its run,
+so they must outlast the run plus its time in the queue. A job queued for longer
+than that hour can find its URLs expired: it fails, and recovery re-signs it.
+`job_name` can be at most 80 characters, so recovery job names stay within
+Batch's 128.
 
 ## What the head does
 
@@ -63,20 +66,23 @@ they must also outlast the time a job waits in the queue.
 - Any configuration `afvs_get_status.py` does not support exits nonzero.
 - `--max-subjobs N` makes recovery submit at most N subjobs per call and print
   `Remaining failed subjobs: K`. Later calls carry on from there.
-- Recovery holds a lock (`../workflow/status.recovery.lock`) for the whole
-  call, and status holds it while writing `status.recovery.json` back.
+- Recovery and status each hold a lock (`../workflow/status.recovery.lock`)
+  for their whole call. Each one reads `status.json` and
+  `status.recovery.json` as the other last wrote them.
 - Each recovery workunit is recorded before it is submitted, under a job name
-  with a random suffix. If a call dies between the two, the next call asks
-  Batch (`ListJobs`, all pages, by that name, created no earlier than the
-  record) whether the job exists:
-  - If it does, the call keeps the record.
-  - If it doesn't, the call waits 15 minutes for ListJobs to catch up, then
-    marks the record `abandoned` and retries its subjobs. An abandoned record
-    stays in the file, so its id and S3 keys are never reused.
+  unique to that attempt (`afvs-recovery-<id>-<random>`).
+  - If Batch rejects the SubmitJob, the record is marked `abandoned` at once.
+  - If a call dies between record and submit, the next call asks Batch
+    (`ListJobs`, all pages, by that name) whether the job exists. If it does,
+    the call keeps the record. If it doesn't, the record counts as submitted
+    for 15 minutes, because ListJobs can lag SubmitJob. After that, the record
+    is marked `abandoned` and its subjobs are retried.
+  - Status counts a recorded record's subjobs the same way: as submitted for
+    those 15 minutes, then as their previous attempt.
+  - An abandoned record stays in the file, so its id and S3 keys are never
+    reused.
 
   `--report-only` changes nothing.
-- When two status runs overlap, the later write-back never replaces a final
-  state with an earlier one.
 - A Batch array of one is submitted as two. The padding child does no work,
   but its run time is billed with its workunit.
 

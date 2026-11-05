@@ -423,8 +423,8 @@ def test_get_status_s3_bad_summaries_fail_closed(tmp_path, boto, monkeypatch, de
         module.main()
 
     lines = out.getvalue().splitlines()
-    # The workunits of the bad summaries fail too: the wrapper starts recovery
-    # from the workunit column
+    # The workunits of the bad summaries are reported FAILED too: the wrapper
+    # starts recovery from the workunit column
     assert f"{'SUCCEEDED':>15}   {1:^10}   {1:^15}   {3:^15}" in lines
     assert f"{'FAILED':>15}   {2:^10}   {2:^15}   {6:^15}" in lines
     assert "* Total Dockings  : 3\n  - Succeeded     : 2\n  - Failed        : 1\n" \
@@ -432,7 +432,9 @@ def test_get_status_s3_bad_summaries_fail_closed(tmp_path, boto, monkeypatch, de
 
     after = json.loads(status_path.read_text())
     assert [w['subjobs']['0']['status'] for w in after['workunits'].values()] == ["SUCCEEDED", "FAILED", "FAILED"]
-    assert [w['status'] for w in after['workunits'].values()] == ["SUCCEEDED", "FAILED", "FAILED"]
+    # ...but keep the status Batch reported, so a workunit whose array is still
+    # running keeps being described for its other subjobs
+    assert [w['status'] for w in after['workunits'].values()] == ["SUCCEEDED", "SUCCEEDED", "SUCCEEDED"]
     assert ['overview' in w['subjobs']['0'] for w in after['workunits'].values()] == [True, False, False]
     assert after['summary']['total_dockings'] == 3
     assert after['overview_status']['FAILED']['subjobs'] == 2

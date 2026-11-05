@@ -42,12 +42,29 @@ RECOVERY_LOCK = "../workflow/status.recovery.lock"
 
 @contextlib.contextmanager
 def recovery_lock():
-    """Held by afvs_recover_failed_subjobs.py for a whole call and by
-    afvs_get_status.py while it writes status.recovery.json back, so no
-    round is lost and no window is submitted twice."""
+    """Held for a whole call by afvs_recover_failed_subjobs.py and by
+    afvs_get_status.py, so each reads status.json and status.recovery.json
+    as the other last wrote them: no round is lost, no window is submitted
+    twice, and no status run writes back an older read."""
     with open(RECOVERY_LOCK, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         yield
+
+
+# How long a recovery workunit recorded before its SubmitJob (job_id None)
+# counts as submitted while nobody has seen its job: ListJobs can lag a
+# SubmitJob that went through. After that, recovery marks it abandoned (and
+# retries its subjobs) unless Batch lists the job.
+PENDING_GRACE_SECONDS = 900
+
+
+def pending_in_grace(recovery, now):
+    """A recorded recovery workunit not yet known to have a job, and still
+    young enough that its job may simply not be listed yet. Status and
+    recovery both count its subjobs as submitted; once it is older, both
+    fall back to the subjobs' previous attempt."""
+    return (not recovery.get('job_id') and not recovery.get('abandoned')
+            and now - recovery.get('recorded_at', 0) < PENDING_GRACE_SECONDS)
 
 
 MANIFEST_VERSION = 1

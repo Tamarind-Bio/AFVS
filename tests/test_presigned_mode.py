@@ -35,7 +35,7 @@ DATA_BUCKET = "data-bucket"
 JOB_PREFIX = "scores/someone/dataset"
 DATA_PREFIX = "virtual-screen/someone/dataset"
 JOB_NAME = "presigned-job"
-EXPIRY = 3600
+EXPIRY = 7200
 # A collection listed in todo.all that was never staged
 MISSING_COLLECTION = "AACAAC_00003"
 
@@ -163,8 +163,8 @@ class Head:
         class Batch:
             def submit_job(self, **kwargs):
                 if head.fail_next_submit:
-                    head.fail_next_submit = False
-                    raise RuntimeError("SubmitJob failed")
+                    error, head.fail_next_submit = head.fail_next_submit, False
+                    raise error if isinstance(error, Exception) else RuntimeError("SubmitJob failed")
                 head.submits.append(kwargs)
                 job_id = f"job-{len(head.submits)}"
                 head.existing_jobs.setdefault(kwargs['jobName'], []).append((job_id, int(time.time() * 1000)))
@@ -600,7 +600,7 @@ def test_a_subjob_that_keeps_failing_does_not_starve_the_round(screen):
     assert code == 0 and originals_of_round(2) == ["1"]
 
 
-@pytest.mark.parametrize("case", ["submitted", "not_listed_yet", "never_submitted", "namesake_from_before"])
+@pytest.mark.parametrize("case", ["submitted", "not_listed_yet", "never_submitted", "namesake", "rejected"])
 def test_recovery_survives_dying_between_record_and_submit(screen, case):
     """A recovery workunit is recorded before SubmitJob; the next call settles
     a record left without a job id by asking Batch for the job by name."""
@@ -618,26 +618,38 @@ def test_recovery_survives_dying_between_record_and_submit(screen, case):
         job_id = entry['job_id']
         entry['job_id'] = None
         recovery_file.write_text(json.dumps({'recovery_workunits': entries}))
+    elif case == "rejected":
+        # Batch rejected the SubmitJob: there is no job to wait for
+        client_error = sys.modules["botocore.exceptions"].ClientError
+        screen.head.fail_next_submit = client_error("SubmitJob rejected")
+        with pytest.raises(client_error):
+            recover_call(screen, recover)
+        assert [entry['abandoned'] for entry in recovery_entries(screen).values()] == [True]
     else:
         screen.head.fail_next_submit = True
         with pytest.raises(RuntimeError):
             recover_call(screen, recover)
         entries = recovery_entries(screen)
         assert [entry['job_id'] for entry in entries.values()] == [None]
-        (entry,) = entries.values()
-        if case in ("never_submitted", "namesake_from_before"):
+        ((recovery_id, entry),) = entries.items()
+        if case in ("never_submitted", "namesake"):
             # Long enough ago that ListJobs would list it by now
             entry['recorded_at'] -= 3600
-        if case == "namesake_from_before":
-            # A job of that name exists, but from before this record (another
-            # screen's, or a re-prepared one): it is not this workunit's job
-            screen.head.existing_jobs[entry['job_name']] = [("job-old", int((entry['recorded_at'] - 7200) * 1000))]
+        if case == "namesake":
+            # A job named as this workunit's id alone (an earlier attempt, or
+            # another screen's) is not this attempt's job
+            screen.head.existing_jobs[f"afvs-recovery-{recovery_id}"] = [("job-other", 0)]
         recovery_file.write_text(json.dumps({'recovery_workunits': entries}))
 
-    # --report-only changes nothing
+    # --report-only changes nothing, and counts the subjob as the real call
+    # will act on it: in flight while its record may still be listed, failed
+    # once that record is too old (or abandoned)
     before = recovery_file.read_text()
-    code, _ = recover_call(screen, recover, "--report-only")
+    code, out = recover_call(screen, recover, "--report-only")
     assert code == 0 and recovery_file.read_text() == before
+    in_flight = case in ("submitted", "not_listed_yet")
+    recorded = sum(len(entry['recovery_subjobs_mapping']) for entry in recovery_entries(screen).values())
+    assert out.rsplit("Remaining failed subjobs: ", 1)[1].split()[0] == ("0" if in_flight else str(recorded))
 
     submits = len(screen.head.submits)
     code, out = recover_call(screen, recover)
@@ -652,8 +664,8 @@ def test_recovery_survives_dying_between_record_and_submit(screen, case):
         assert [entry['job_id'] for entry in entries.values()] == [None]
         assert len(screen.head.submits) == submits and "No failed subjobs found!" in out
     else:
-        # Never submitted: kept as abandoned (its id is never reused), and the
-        # subjob is submitted now under a new id
+        # Never submitted (or rejected): kept as abandoned (its id is never
+        # reused), and the subjob is submitted now under a new id
         (old_id, old), (new_id, new) = entries.items()
         assert old['abandoned'] and old['job_id'] is None
         assert new_id != old_id and new['job_id'] is not None
@@ -721,8 +733,10 @@ def test_killall_refuses_in_presigned_mode(screen):
      "'presigned_url_expiry_seconds' must be a positive integer"),
     (f"presigned_url_expiry_seconds={EXPIRY}", "presigned_url_expiry_seconds=604801",
      "'presigned_url_expiry_seconds' must be at most 604800"),
-    (f"presigned_url_expiry_seconds={EXPIRY}", "presigned_url_expiry_seconds=1799",
-     "'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout'"),
+    # aws_batch_subjob_timeout=1800: URLs must outlast it plus an hour queued
+    (f"presigned_url_expiry_seconds={EXPIRY}", "presigned_url_expiry_seconds=5399",
+     "'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout' + 3600"),
+    (f"job_name={JOB_NAME}", "job_name=" + "j" * 81, "'job_name' must be at most 80 characters"),
 ])
 def test_prepare_validates_presigned_configs(screen, old, new, message):
     ctrl = screen.tools / "templates" / "all.ctrl"
