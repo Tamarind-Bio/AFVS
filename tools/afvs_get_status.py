@@ -663,8 +663,10 @@ def process_presigned_locked(config):
     parser = argparse.ArgumentParser()
     parser.add_argument('--detailed', action='store_true',
         help="Get detailed ligand information (this can take a long time!)")
+    # Accepted for the callers that pass it after recovering; in this mode the
+    # report always shows each subjob's latest attempt, recovery rounds included
     parser.add_argument('--recovery', action='store_true',
-        help="Show only recovery jobs status")
+        help="Same report: each subjob's latest attempt, recovery rounds included")
     parser.parse_args()
 
     client = boto3.client('batch', config=Config(region_name=config['aws_region']))
@@ -788,7 +790,13 @@ def process_presigned_locked(config):
             'subjobs': 0
         }
 
+    # The padding child of a size-1 array runs too, if only briefly
     active_vcpus = 0
+    for workunit in submitted:
+        padding = workunit.get('padding', {})
+        if padding.get('status') in ('RUNNING', 'STARTING'):
+            active_vcpus += padding.get('vcpus', batch_job_vcpus({}, config))
+
     for workunit_id, workunit in main_workunits.items():
         if 'job_id' not in workunit:
             # workunit has not been submitted yet

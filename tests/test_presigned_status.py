@@ -398,8 +398,9 @@ def test_status_reads_and_writes_under_the_lock(screen, boto, monkeypatch):
 
 
 def test_fractional_vcpus_in_the_config_are_not_truncated_or_fatal(screen, boto):
-    """Batch takes fractional vCPUs (Fargate); a running child Batch reports
-    is counted as it reports, one it has not reported as configured."""
+    """Batch takes fractional vCPUs (Fargate): a running child is counted at
+    the vCPUs Batch reports for it, or as configured when its container says
+    nothing, never truncated and never fatal."""
     config_file = screen.workflow / "config.json"
     config = json.loads(config_file.read_text())
     config['aws_batch_subjob_vcpus'] = "0.5"
@@ -414,3 +415,24 @@ def test_fractional_vcpus_in_the_config_are_not_truncated_or_fatal(screen, boto)
     assert "Active vCPUs: 1.0" in out.splitlines()
     after = json.loads((screen.workflow / "status.json").read_text())
     assert [after['workunits'][n]['subjobs']['0'].get('vcpus') for n in ("1", "2")] == [0.5, 0.5]
+
+
+def test_a_running_padding_child_counts_as_active(screen, boto):
+    """A size-1 array runs two children; while the padding one runs, its
+    vCPUs are in use too."""
+    boto.describe_jobs_responses = [
+        {'jobs': [parent("j1", "RUNNING"), parent("j2", "SUCCEEDED"), parent("j3", "SUCCEEDED")]},
+        {'jobs': [
+            {'jobId': "j1:0", 'status': "RUNNING", 'container': vcpu_requirement(16), 'attempts': []},
+            {'jobId': "j1:1", 'status': "RUNNING", 'container': vcpu_requirement(16), 'attempts': []},
+            {'jobId': "j2:0", 'status': "SUCCEEDED", 'container': vcpu_requirement(16),
+             'attempts': [{'startedAt': 0, 'stoppedAt': 1000}]},
+            {'jobId': "j2:1", 'status': "SUCCEEDED", 'container': vcpu_requirement(16),
+             'attempts': [{'startedAt': 0, 'stoppedAt': 1000}]},
+            {'jobId': "j3:0", 'status': "SUCCEEDED", 'container': vcpu_requirement(16),
+             'attempts': [{'startedAt': 0, 'stoppedAt': 1000}]},
+            {'jobId': "j3:1", 'status': "SUCCEEDED", 'container': vcpu_requirement(16),
+             'attempts': [{'startedAt': 0, 'stoppedAt': 1000}]},
+        ]},
+    ]
+    assert "Active vCPUs: 32" in screen().splitlines()
