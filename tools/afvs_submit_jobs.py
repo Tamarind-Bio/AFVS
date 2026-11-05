@@ -344,19 +344,18 @@ def process_unlocked(config, start, stop):
                         run_bash(config, current_workunit, jobline)
                     else:
                         print(f"Unknown submit type {submit_type}")
+
+        # Output all of the information about the workunits into JSON so we can easily grab this data in the future
+
+        print("Writing the json status file out")
+
+        write_status(status)
     except BaseException:
-        # However the loop ends, the jobs already submitted keep their ids:
-        # a rerun skips them instead of submitting them again
+        # However submit ends, the jobs already submitted keep their ids: a
+        # rerun skips them instead of submitting them again
         if afvs_presign.is_presigned(config):
             write_status(status)
         raise
-
-
-    # Output all of the information about the workunits into JSON so we can easily grab this data in the future
-    
-    print("Writing the json status file out")
-
-    write_status(status)
 
     print("Making copy for status.submission as backup")
     shutil.copyfile("../workflow/status.json", "../workflow/status.submission.json")

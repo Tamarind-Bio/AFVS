@@ -389,7 +389,13 @@ def test_submit_gives_each_job_one_presigned_url_and_no_credentials(screen):
     assert {bucket for _, bucket, _, _ in screen.head.presign_calls} == {JOB_BUCKET, DATA_BUCKET}
 
 
-def test_submit_keeps_the_job_ids_it_got_and_holds_the_lock(screen):
+@pytest.mark.parametrize("interrupted_at, submitted", [
+    # between two SubmitJobs
+    ("Submitting jobline 2", 1),
+    # after the last one, before its ids are written
+    ("Writing the json status file out", 3),
+])
+def test_submit_keeps_the_job_ids_it_got_and_holds_the_lock(screen, interrupted_at, submitted):
     """A submit that fails partway keeps the ids of the jobs already
     submitted, so a rerun does not submit them again. Status holds the lock
     for its whole run, so submit takes it too and no stale status write can
@@ -413,8 +419,8 @@ def test_submit_keeps_the_job_ids_it_got_and_holds_the_lock(screen):
         assert held, "SubmitJob outside the lock"
 
     def interrupted_between_jobs(*args, **kwargs):
-        # The loop is interrupted between two SubmitJobs, not inside one
-        if args and str(args[0]).startswith("Submitting jobline 2"):
+        # Interrupted outside any SubmitJob
+        if args and str(args[0]).startswith(interrupted_at):
             raise KeyboardInterrupt
         print(*args, **kwargs)
 
@@ -424,7 +430,8 @@ def test_submit_keeps_the_job_ids_it_got_and_holds_the_lock(screen):
         module.process(module.parse_config("../workflow/config.json"), 1, 3)
     screen.monkeypatch.delattr(module, "print")
     workunits = screen.status()['workunits']
-    assert workunits["1"]['job_id'] == "job-1" and 'job_id' not in workunits["2"]
+    assert [workunits[str(n)].get('job_id') for n in (1, 2, 3)] == \
+        [f"job-{n}" if n <= submitted else None for n in (1, 2, 3)]
 
     with redirect_stdout(io.StringIO()):
         module.process(module.parse_config("../workflow/config.json"), 1, 3)
