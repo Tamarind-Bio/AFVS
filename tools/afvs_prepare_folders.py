@@ -37,6 +37,14 @@ from pathlib import Path
 import shutil
 
 
+# How much longer than aws_batch_subjob_timeout presigned URLs must live. They
+# are signed at submit and a job uploads its outputs at the end of its run, so
+# they must outlast the run plus a little time queued. A job that starts after
+# its URLs expired fails its first download and is recovered by re-signing.
+# Kept small because the head's AWS sessions (and so its URLs) last an hour.
+PRESIGNED_QUEUE_MARGIN_SECONDS = 300
+
+
 def parse_config(filename):
 
     config = {}
@@ -236,10 +244,9 @@ def check_parameters(config):
             print("* 'presigned_url_expiry_seconds' must be at most 604800 (7 days)")
             error = 1
         elif(re.search(r'^[0-9]+$', config.get('aws_batch_subjob_timeout', '')) and
-             int(config['presigned_url_expiry_seconds']) < int(config['aws_batch_subjob_timeout']) + 3600):
-            # URLs are signed at submit and a job uploads its outputs at the
-            # end of its run, so they must outlast the run plus time queued
-            print("* 'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout' + 3600")
+             int(config['presigned_url_expiry_seconds']) < int(config['aws_batch_subjob_timeout']) + PRESIGNED_QUEUE_MARGIN_SECONDS):
+            # See PRESIGNED_QUEUE_MARGIN_SECONDS
+            print(f"* 'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout' + {PRESIGNED_QUEUE_MARGIN_SECONDS}")
             error = 1
         if(empty_value(config, 'job_name')):
             # Job outputs, manifests and status all key on job_name

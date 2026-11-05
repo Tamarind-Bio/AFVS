@@ -12,7 +12,8 @@ filesystem.
 batchsystem=awsbatch
 job_storage_mode=presigned
 data_storage_mode=s3
-presigned_url_expiry_seconds=43200
+presigned_url_expiry_seconds=3300
+aws_batch_subjob_timeout=2700
 aws_batch_prefix=vf-sealed
 aws_batch_number_of_queues=1
 aws_batch_jobdef=vf-jobdef-afvs-sealed
@@ -21,10 +22,12 @@ aws_batch_jobdef=vf-jobdef-afvs-sealed
 The `object_store_*`, `aws_region` and other `aws_batch_*` keys are the same as
 in s3 mode. Prepare rejects presigned mode unless `batchsystem=awsbatch` and
 `data_storage_mode=s3`. It requires `presigned_url_expiry_seconds` to be at
-most 604800 (the SigV4 limit) and at least `aws_batch_subjob_timeout` + 3600.
+most 604800 (the SigV4 limit) and at least `aws_batch_subjob_timeout` + 300.
 URLs are signed at submit, and a job uploads its outputs at the end of its run,
-so they must outlast the run plus its time in the queue. A job queued for longer
-than that hour can find its URLs expired: it fails, and recovery re-signs it.
+so they must outlast the run plus a little time in the queue. A URL also dies
+with the AWS session that signed it, and the production head's sessions last an
+hour, so its expiry is at most about 3300 s. A job that starts after its URLs
+expired fails its first download, and recovery re-signs and reruns it.
 `job_name` must be set (`job_letter` is not supported) and can be at most 100
 letters, digits, `-` or `_`, so recovery job names (`afvs-r-<job_name>-r<round>-<n>-<8 hex>`)
 stay within Batch's 128 while round and workunit numbers have 9 digits
