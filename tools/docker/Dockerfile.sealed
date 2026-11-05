@@ -1,0 +1,103 @@
+# Copyright (C) 2026 Tamarind Bio
+#
+# This file is part of AdaptiveFlow.
+#
+# AdaptiveFlow is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# AdaptiveFlow is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with AdaptiveFlow.  If not, see <https://www.gnu.org/licenses/>.
+
+# ---------------------------------------------------------------------------
+#
+# CPU-only image for sealed virtual screening (job_storage_mode=presigned):
+#
+#  - the AWS Batch docking jobs (job definition vf-jobdef-afvs-sealed) run
+#    templates/afvs_run.py from it with no AWS identity, as UID 1000 on a
+#    read-only root filesystem, reaching S3 only through presigned URLs;
+#  - the T2 sealed tool container uses it for receptor prep, result parsing
+#    and active learning (bash run.sh in /app, calling $AFVS_HOME/tools/*).
+#
+# It has AFVS (at $AFVS_HOME=/opt/AFVS), the bundled docking binaries, Open
+# Babel, and python with pandas/pyarrow plus torch/rdkit, and no AWS SDK on
+# purpose: nothing that runs in it should hold or reach for credentials.
+# No ENTRYPOINT: the job definition and the pod each set the command.
+# Build from the repository root:
+#
+#   docker build --platform linux/amd64 -t afvs-sealed -f tools/docker/Dockerfile.sealed .
+#
+# The bundled docking binaries in bin/ are x86-64, so the image is amd64.
+#
+# ---------------------------------------------------------------------------
+
+# The bundled bin/gwovina is linked against Boost 1.65, which bookworm does not
+# have: rebuild it against the image's Boost, as tools/docker/Dockerfile does
+FROM --platform=linux/amd64 python:3.12.8-slim-bookworm AS gwovina
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential wget ca-certificates \
+        libboost-system-dev libboost-thread-dev libboost-program-options-dev libboost-filesystem-dev
+
+WORKDIR /build
+RUN wget -q -O gwovina-1.0.tar.gz https://sourceforge.net/projects/gwovina/files/gwovina-1.0.tar.gz/download \
+    && echo "2007503d9dd7ce34347f8a9fe6d8d76f97d3aec837c38d783da83cb573abafc5  gwovina-1.0.tar.gz" | sha256sum -c - \
+    && tar -xzf gwovina-1.0.tar.gz \
+    && cd gwovina-1.0/build/linux/release \
+    && make gwovina LIBS="-l boost_system -l boost_thread -l boost_program_options -l boost_filesystem" \
+    && mv gwovina /build/gwovina-bin
+
+FROM --platform=linux/amd64 python:3.12.8-slim-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openbabel procps \
+        libboost-system1.74.0 libboost-thread1.74.0 libboost-program-options1.74.0 libboost-filesystem1.74.0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Verify obabel is available
+RUN obabel -V
+
+RUN pip install --no-cache-dir \
+        numpy==2.1.3 \
+        pandas==2.2.3 \
+        pyarrow==18.1.0 \
+        scipy==1.14.1 \
+        tqdm==4.67.1 \
+        jinja2==3.1.4 \
+        rdkit==2024.9.6 \
+    && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+
+ENV AFVS_HOME=/opt/AFVS
+ENV AFVS_TOOLS_PATH=/opt/AFVS/tools/bin
+
+# The AFVS tools (scripts, templates, docking binaries, vendored molpal)
+COPY tools /opt/AFVS/tools
+COPY --from=gwovina /build/gwovina-bin /opt/AFVS/tools/bin/gwovina
+RUN chmod +x /opt/AFVS/tools/*.py /opt/AFVS/tools/templates/*.py /opt/AFVS/tools/templates/*.sh /opt/AFVS/tools/bin/* \
+    && rm -rf /opt/AFVS/tools/docker
+
+# Fail the build if what run.sh relies on is missing, or if the docking job or
+# the active-learning stack cannot import
+RUN command -v bash stdbuf tee python3 \
+    && ! ldd /opt/AFVS/tools/bin/* 2> /dev/null | grep "not found" \
+    && cd /opt/AFVS/tools \
+    && python -c "import pandas, pyarrow, torch, rdkit" \
+    && python -c "import ast; ast.parse(open('templates/afvs_run.py').read())" \
+    && python afvs_al_controller.py --help > /dev/null \
+    && ! python -c "import boto3" 2> /dev/null
+
+# Matches the sealed pod's unprivileged tool container. The tools write their
+# workflow state beside themselves (templates/all.ctrl, ../workflow,
+# ../input-files), so the tree belongs to that user.
+RUN useradd --uid 1000 --create-home afvs \
+    && mkdir -p /opt/AFVS/workflow /opt/AFVS/input-files /app/inputs /app/out \
+    && chown -R 1000:1000 /opt/AFVS /app
+USER 1000
+
+WORKDIR /app

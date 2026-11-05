@@ -1,0 +1,14 @@
+REMARK    SMILES: c1ccncc1
+REMARK    * Heavy atom count: 6
+REMARK SMILES c1ccncc1
+REMARK SMILES IDX 1 1 2 2 3 3 4 4 5 5 6 6
+REMARK H PARENT
+ROOT
+ATOM      1  C   UNL     1      -0.358   1.128   0.037  1.00  0.00     0.003 A 
+ATOM      2  C   UNL     1      -1.290   0.095   0.012  1.00  0.00     0.020 A 
+ATOM      3  C   UNL     1      -0.822  -1.209  -0.032  1.00  0.00     0.111 A 
+ATOM      4  N   UNL     1       0.488  -1.537  -0.051  1.00  0.00    -0.265 NA
+ATOM      5  C   UNL     1       1.369  -0.513  -0.025  1.00  0.00     0.111 A 
+ATOM      6  C   UNL     1       0.999   0.822   0.018  1.00  0.00     0.020 A 
+ENDROOT
+TORSDOF 0

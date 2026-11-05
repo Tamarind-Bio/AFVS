@@ -37,6 +37,14 @@ from pathlib import Path
 import shutil
 
 
+# How much longer than aws_batch_subjob_timeout presigned URLs must live. They
+# are signed at submit and a job uploads its outputs at the end of its run, so
+# they must outlast the run plus a little time queued. A job that starts after
+# its URLs expired fails its first download and is recovered by re-signing.
+# Kept small because the head's AWS sessions (and so its URLs) last an hour.
+PRESIGNED_QUEUE_MARGIN_SECONDS = 300
+
+
 def parse_config(filename):
 
     config = {}
@@ -148,11 +156,12 @@ def check_parameters(config):
         config['object_store_job_addressing_mode'] = config['job_addressing_mode']
 
 
-    if(empty_value(config, 'job_storage_mode') or (config['job_storage_mode'] != "s3" and config['job_storage_mode'] != "sharedfs")):
-        print("* 'job_storage_mode' must be set to 's3' or 'sharedfs'")
+    if(empty_value(config, 'job_storage_mode') or config['job_storage_mode'] not in ("s3", "sharedfs", "presigned")):
+        print("* 'job_storage_mode' must be set to 's3', 'sharedfs' or 'presigned'")
         error = 1
     else:
-        if(config['job_storage_mode'] == "s3"):
+        # presigned keeps the job in S3 too: the head signs URLs for the jobs
+        if(config['job_storage_mode'] in ("s3", "presigned")):
             if(empty_value(config, 'object_store_job_bucket')):
                 print("* 'object_store_job_bucket' must be set if job_storage_mode is 's3'")
                 error = 1
@@ -166,7 +175,7 @@ def check_parameters(config):
         print("* 'job_storage_mode' must be set to 's3' or 'sharedfs'")
         error = 1
     else:
-        if(config['job_storage_mode'] == "s3"):
+        if(config['job_storage_mode'] in ("s3", "presigned")):
             if(empty_value(config, 'object_store_data_bucket')):
                 print("* 'object_store_data_bucket' must be set if job_storage_mode is 's3'")
                 error = 1
@@ -220,6 +229,40 @@ def check_parameters(config):
         else:
             print(f"* batchsystem '{config['batchsystem']}' is not supported. Only awsbatch and slurm are supported")
 
+
+    if(config.get('job_storage_mode') == "presigned"):
+        # Docking jobs get URLs, not credentials: the head (awsbatch) signs
+        # them for collections in S3
+        if(config.get('batchsystem') != "awsbatch" or config.get('data_storage_mode') != "s3"):
+            print("* job_storage_mode=presigned requires batchsystem=awsbatch and data_storage_mode=s3")
+            error = 1
+        if(empty_value(config, 'presigned_url_expiry_seconds') or not re.search(r'^[1-9][0-9]*$', config['presigned_url_expiry_seconds'])):
+            print("* 'presigned_url_expiry_seconds' must be a positive integer if job_storage_mode is 'presigned'")
+            error = 1
+        elif(int(config['presigned_url_expiry_seconds']) > 604800):
+            # The longest a SigV4 presigned URL can be valid
+            print("* 'presigned_url_expiry_seconds' must be at most 604800 (7 days)")
+            error = 1
+        elif(not re.search(r'^[1-9][0-9]*$', config.get('aws_batch_subjob_timeout') or '')
+             or int(config['aws_batch_subjob_timeout']) < 60):
+            # The URLs' lifetime is checked against it, so it must be a plain
+            # number, and Batch takes no attempt timeout under 60 s
+            print("* 'aws_batch_subjob_timeout' must be an integer of at least 60 if job_storage_mode is 'presigned'")
+            error = 1
+        elif(int(config['presigned_url_expiry_seconds']) < int(config['aws_batch_subjob_timeout']) + PRESIGNED_QUEUE_MARGIN_SECONDS):
+            # See PRESIGNED_QUEUE_MARGIN_SECONDS
+            print(f"* 'presigned_url_expiry_seconds' must be at least 'aws_batch_subjob_timeout' + {PRESIGNED_QUEUE_MARGIN_SECONDS}")
+            error = 1
+        if(empty_value(config, 'job_name')):
+            # Job outputs, manifests and status all key on job_name
+            print("* 'job_name' must be set if job_storage_mode is 'presigned' (job_letter is not supported)")
+            error = 1
+        elif(not re.search(r'^[A-Za-z0-9_-]{1,100}$', config['job_name'])):
+            # Batch job names are at most 128 characters of letters, digits,
+            # hyphens and underscores, and recovery jobs are named
+            # afvs-r-<job_name>-r<round>-<n>-<8 hex>
+            print("* 'job_name' must be at most 100 characters, all letters, digits, '-' or '_', if job_storage_mode is 'presigned'")
+            error = 1
 
     if(empty_value(config, 'ligand_library_format')):
         print("* 'ligand_library_format' must be set in all.ctrl")

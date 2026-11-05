@@ -25,13 +25,10 @@
 
 import os
 import json
-import boto3
-import botocore
 import re
 import tempfile
 import gzip
 import time
-from botocore.config import Config
 
 
 
@@ -44,6 +41,10 @@ def parse_config(filename):
 
 
 def process(config):
+    import boto3
+    import botocore
+    from botocore.config import Config
+
 
     aws_config = Config(
         region_name=config['aws_region']
@@ -126,6 +127,13 @@ def process(config):
 def main():
 
     config = parse_config("../workflow/config.json")
+
+    # The presigned (sealed) head has no batch:TerminateJob: a stopped screen
+    # stops submitting and lets in-flight jobs run out instead
+    if config.get('job_storage_mode') == "presigned":
+        print("job_storage_mode=presigned does not terminate jobs; stop submitting new workunits instead")
+        exit(2)
+
     process(config)
 
 
