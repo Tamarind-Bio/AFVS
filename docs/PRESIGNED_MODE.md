@@ -37,7 +37,8 @@ between them.
 `object_store_job_folder` (optional, presigned mode only) names the folder of
 the job's outputs under `object_store_job_prefix` apart from `job_name`: one
 folder of at most 100 letters, digits, `-` or `_`, and not `_manifests` or
-`recovery`. Only outputs move there (`summary/`, and per scenario `logs/`,
+`recovery`, not `job_name`, and not two hex digits when job addressing is
+hashed (input tarballs go to `<prefix>/<hh>/<hh>/`). Only outputs move there (`summary/`, and per scenario `logs/`,
 `parquet/` and `csv/`, recovery outputs included), and
 `afvs_get_top_results.py` and `afvs_gen_sparse.py` read them there. Input
 tarballs (`<prefix>/<job_name>/input/`, or `<prefix>/hh/hh/<job_name>/input/`
@@ -149,6 +150,9 @@ once.
 - `s3:ListBucket` on the collection prefixes. Without it, S3 answers 403 for a
   missing object and the job cannot tell a missing collection from a rejected
   URL, so the subjob fails instead of recording a failed download.
+- With `object_store_job_folder` set, `s3:ListBucket` on the job bucket for
+  `<prefix>/<folder>/`: prepare checks the folder is empty, and fails without
+  it.
 - The data bucket must be in `aws_region`: every URL is signed for that
   region.
 - URLs live as long as the credentials that signed them, so they expire at

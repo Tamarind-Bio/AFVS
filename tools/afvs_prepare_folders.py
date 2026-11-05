@@ -273,6 +273,13 @@ def check_parameters(config):
             # live in these folders
             print("* 'object_store_job_folder' cannot be '_manifests' or 'recovery'")
             error = 1
+        elif(config.get('object_store_job_folder') == config['job_name'] or
+             (config.get('object_store_job_addressing_mode') == "hash" and
+              re.search(r'^[0-9a-f]{2}$', config['object_store_job_folder']))):
+            # Input tarballs go to <job_name>/, or to <hh>/<hh>/ when
+            # addressing is hashed, and the output folder holds outputs only
+            print("* 'object_store_job_folder' cannot be job_name, or two hex digits if job addressing is hashed")
+            error = 1
     elif(not empty_value(config, 'object_store_job_folder')):
         print("* 'object_store_job_folder' is only supported if job_storage_mode is 'presigned'")
         error = 1

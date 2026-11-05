@@ -306,12 +306,12 @@ class Screen:
         spec.loader.exec_module(module)
         return module
 
-    def prepare(self):
+    def prepare(self, out=None):
         ret = subprocess.run([sys.executable, "./afvs_prepare_folders.py", "--overwrite", "--skip_errors"],
                              cwd=self.tools, capture_output=True, text=True)
         assert ret.returncode == 0, ret.stdout + ret.stderr
         self.monkeypatch.chdir(self.tools)
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(out or io.StringIO()):
             self.load("afvs_prepare_workunits.py").main()
 
     def submit(self, start, stop):
@@ -691,8 +691,10 @@ def test_slices_of_a_screen_keep_to_their_own_folders(tmp_path, s3, head, monkey
         if attempt > 1:
             # A fresh attempt starts from an empty folder: what the earlier
             # one wrote there would read as its results
+            out = io.StringIO()
             with pytest.raises(SystemExit):
-                screen.prepare()
+                screen.prepare(out)
+            assert f"The output folder {slices_prefix}/{sid}/ is not empty" in out.getvalue()
             for key in [key for key in s3.objects if key[1].startswith(f"{slices_prefix}/{sid}/")]:
                 del s3.objects[key]
         screen.prepare()
@@ -997,6 +999,11 @@ def test_killall_refuses_in_presigned_mode(screen):
      "'object_store_job_folder' cannot be '_manifests' or 'recovery'"),
     (f"job_name={JOB_NAME}", f"job_name={JOB_NAME}\nobject_store_job_folder=recovery",
      "'object_store_job_folder' cannot be '_manifests' or 'recovery'"),
+    # The output folder holds outputs only, never a job's input tarballs
+    (f"job_name={JOB_NAME}", f"job_name={JOB_NAME}\nobject_store_job_folder={JOB_NAME}",
+     "'object_store_job_folder' cannot be job_name"),
+    ("job_addressing_mode=metatranche", "job_addressing_mode=hash\nobject_store_job_folder=a7",
+     "'object_store_job_folder' cannot be job_name, or two hex digits if job addressing is hashed"),
     ("job_storage_mode=presigned", "job_storage_mode=s3\nobject_store_job_folder=s0001",
      "'object_store_job_folder' is only supported if job_storage_mode is 'presigned'"),
 ])
