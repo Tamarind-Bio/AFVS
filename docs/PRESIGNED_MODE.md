@@ -43,9 +43,9 @@ hashed (input tarballs go to `<prefix>/<hh>/<hh>/`). Only outputs move there (`s
 `afvs_get_top_results.py` and `afvs_gen_sparse.py` read them there. Input
 tarballs (`<prefix>/<job_name>/input/`, or `<prefix>/hh/hh/<job_name>/input/`
 when addressing is hashed), manifests (`<prefix>/_manifests/<job_name>/`),
-recovery tarballs (`<prefix>/recovery/<job_name>/`) and the Athena tools'
-query results (`<prefix>/<job_name>/athena/`) stay keyed by `job_name`, as do
-Batch job names. Without it the folder is `job_name` and
+recovery tarballs (`<prefix>/recovery/<job_name>/`) and
+`afvs_get_top_results.py`'s query results (`<prefix>/<job_name>/athena/`) stay
+keyed by `job_name`, as do Batch job names. Without it the folder is `job_name` and
 nothing changes. Prepare sees one job only, so it cannot stop a folder from
 equalling another job's `job_name` or folder under the same prefix: keep each
 folder distinct from every `job_name` there.
@@ -76,7 +76,9 @@ Otherwise whatever reads the folder sees both attempts: the Athena tools
 build their table on every parquet under it, so the old attempt's outputs,
 its `recovery-<job_name>-…` ones included, show up as duplicate or extra rows.
 `afvs_prepare_workunits.py` refuses to start while the folder holds anything,
-but it cannot see an upload still to come.
+but it cannot see an upload still to come, and it is not a lock: two attempts
+prepared before either writes pass it both. Run one attempt of a slice at a
+time.
 Slices on one head share its Batch queues, credentials and
 `/dev/shm` (`tempdir_default`), so size the head for the slices it runs at
 once.

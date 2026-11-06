@@ -989,6 +989,8 @@ def test_killall_refuses_in_presigned_mode(screen):
     (f"job_name={JOB_NAME}", "job_name=" + "j" * 101, "'job_name' must be at most 100 characters"),
     (f"job_name={JOB_NAME}", "job_name=screen.prod", "'job_name' must be at most 100 characters, all letters"),
     (f"job_name={JOB_NAME}", f"job_letter={JOB_NAME}", "'job_name' must be set if job_storage_mode is 'presigned'"),
+    (f"job_name={JOB_NAME}", f"job_letter={JOB_NAME}\nobject_store_job_folder=s0001",
+     "'job_name' must be set if job_storage_mode is 'presigned'"),
     # A slice's folder is one folder under the prefix, never a path
     (f"job_name={JOB_NAME}", f"job_name={JOB_NAME}\nobject_store_job_folder=slices/s0001",
      "'object_store_job_folder' must be at most 100 characters"),
@@ -1012,7 +1014,24 @@ def test_prepare_validates_presigned_configs(screen, old, new, message):
     ctrl.write_text(ctrl.read_text().replace(old, new))
     ret = subprocess.run([sys.executable, "./afvs_prepare_folders.py", "--overwrite"], cwd=screen.tools,
                          capture_output=True, text=True)
-    assert ret.returncode == 1 and message in ret.stdout
+    # A refusal is a message, not a crash after it
+    assert ret.returncode == 1 and message in ret.stdout and "Traceback" not in ret.stderr, ret.stdout + ret.stderr
+
+
+@pytest.mark.parametrize("old, new", [
+    # Hashed job addressing without a folder is as before
+    ("job_addressing_mode=metatranche", "job_addressing_mode=hash"),
+    (f"job_name={JOB_NAME}", f"job_name={JOB_NAME}\nobject_store_job_folder=s0001"),
+    ("job_addressing_mode=metatranche", "job_addressing_mode=hash\nobject_store_job_folder=s0001"),
+])
+def test_prepare_accepts_presigned_folder_configs(screen, old, new):
+    ctrl = screen.tools / "templates" / "all.ctrl"
+    ctrl.write_text(ctrl.read_text().replace(old, new))
+    ret = subprocess.run([sys.executable, "./afvs_prepare_folders.py", "--overwrite"], cwd=screen.tools,
+                         capture_output=True, text=True)
+    assert [line for line in ret.stdout.splitlines() if line.startswith("* ")] == \
+        ["* RECOMMENDED that 'tempdir_default' be '/dev/shm' if awsbatch is used"], ret.stdout
+    assert ret.stderr == "" and "Workflow has validation errors" in ret.stdout, ret.stdout + ret.stderr
 
 
 @pytest.mark.parametrize("expiry, timeout", [
