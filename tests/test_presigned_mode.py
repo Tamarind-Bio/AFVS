@@ -756,7 +756,8 @@ class TableCreated(Exception):
 ])
 def test_athena_tools_read_a_slices_outputs_from_its_folder(tmp_path, s3, head, monkeypatch, script, argv, extra_config):
     """The Athena tools build their table on the parquet outputs, which a
-    slice writes to slices/<sid>/, not under its job_name."""
+    slice writes to slices/<sid>/, not under its job_name, and name it from
+    the job_name with its hyphens replaced."""
     screen = slice_screen(tmp_path, s3, head, monkeypatch, "s0001", 1)
     screen.prepare()
     config_path = screen.tools.parent / "workflow" / "config.json"
@@ -783,6 +784,8 @@ def test_athena_tools_read_a_slices_outputs_from_its_folder(tmp_path, s3, head, 
     with pytest.raises(TableCreated) as created:
         tool.main()
     assert f"LOCATION 's3://{JOB_BUCKET}/{JOB_PREFIX}/{JOB_NAME}/slices/s0001/qvina02/parquet'" in str(created.value)
+    # ...on a table Athena can name: the slice's job_name has hyphens
+    assert "vs_0123abcd_s0001_a1" in str(created.value) and "vs-0123abcd" not in str(created.value)
 
 
 @pytest.mark.parametrize("args, message", [
