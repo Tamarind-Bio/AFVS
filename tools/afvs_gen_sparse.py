@@ -105,10 +105,15 @@ def main():
     print(f"Scenario '{scenario}'' is not defined as part of this job")
     exit(1)
 
-  table_name = ctx['config']['job_name']
+  # Athena identifiers take no '-', which job names may have
+  table_name = ctx['config']['job_name'].replace("-","_")
   athena_location = ctx['config']['athena_s3_location']
   database_name = f"{ctx['config']['aws_batch_prefix']}_afvs"
-  job_location = f"{ctx['config']['object_store_job_prefix_full']}/{scenario}/parquet"
+  # The job's outputs: under object_store_job_folder if set (presigned mode)
+  output_prefix = ctx['config']['object_store_job_prefix_full']
+  if ctx['config'].get('object_store_job_folder'):
+    output_prefix = f"{ctx['config']['object_store_job_prefix']}/{ctx['config']['object_store_job_folder']}"
+  job_location = f"{output_prefix}/{scenario}/parquet"
   object_store_job_bucket = ctx['config']['object_store_job_bucket']
   scenario_info = ctx['config']['docking_scenarios_internal'][scenario]
 

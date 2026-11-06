@@ -971,16 +971,18 @@ def generate_tarfile(dir, tarname):
 
 
 def generate_output_path(ctx, scenario_key, content_type, extension):
+    # In S3 the job's outputs go under its folder: object_store_job_folder if
+    # set (presigned mode only; see afvs_presign.job_folder), else job_name
 
     if scenario_key != None:
         if(ctx['main_config']['job_storage_mode'] in ("s3", "presigned")):
-            return f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{scenario_key}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
+            return f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config'].get('object_store_job_folder') or ctx['main_config']['job_name']}/{scenario_key}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
         else:
             outputfiles_dir = Path(ctx['main_config']['sharedfs_output_files_path']) / scenario_key / content_type / str(ctx['workunit_id'])
             return f"{ctx['main_config']['sharedfs_output_files_path']}/{scenario_key}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
     else:
         if(ctx['main_config']['job_storage_mode'] in ("s3", "presigned")):
-            return f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config']['job_name']}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
+            return f"{ctx['main_config']['object_store_job_prefix']}/{ctx['main_config'].get('object_store_job_folder') or ctx['main_config']['job_name']}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"
         else:
             outputfiles_dir = Path(ctx['main_config']['sharedfs_output_files_path']) / content_type / str(ctx['workunit_id'])
             return f"{ctx['main_config']['sharedfs_output_files_path']}/{content_type}/{ctx['workunit_id']}/{ctx['subjob_id']}.{extension}"

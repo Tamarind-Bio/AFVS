@@ -160,6 +160,10 @@ class Head:
             def download_fileobj(self, bucket, key, f):
                 f.write(head.store.objects[(bucket, key)])
 
+            def list_objects_v2(self, Bucket, Prefix, MaxKeys=1000):
+                keys = sorted(key for bucket, key in head.store.objects if bucket == Bucket and key.startswith(Prefix))
+                return {'KeyCount': len(keys[:MaxKeys]), 'Contents': [{'Key': key} for key in keys[:MaxKeys]]}
+
             def generate_presigned_url(self, ClientMethod, Params, ExpiresIn):
                 head.presign_calls.append((ClientMethod, Params['Bucket'], Params['Key'], ExpiresIn))
                 method = {'get_object': "GET", 'put_object': "PUT"}[ClientMethod]
@@ -302,12 +306,12 @@ class Screen:
         spec.loader.exec_module(module)
         return module
 
-    def prepare(self):
+    def prepare(self, out=None):
         ret = subprocess.run([sys.executable, "./afvs_prepare_folders.py", "--overwrite", "--skip_errors"],
                              cwd=self.tools, capture_output=True, text=True)
         assert ret.returncode == 0, ret.stdout + ret.stderr
         self.monkeypatch.chdir(self.tools)
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(out or io.StringIO()):
             self.load("afvs_prepare_workunits.py").main()
 
     def submit(self, start, stop):
@@ -657,6 +661,133 @@ def test_a_subjob_that_keeps_failing_does_not_starve_the_round(screen):
     assert code == 0 and originals_of_round(2) == ["1"]
 
 
+def slice_screen(tmp_path, s3, head, monkeypatch, sid, attempt):
+    """One attempt of one slice of a sliced screen: an ordinary run in its own
+    working directory, with a short job_name unique to the attempt and its
+    outputs under the screen's slices/<sid>/ folder."""
+    job_name = f"vs-0123abcd-{sid}-a{attempt}"
+    screen = Screen(tmp_path / job_name, s3, head, monkeypatch)
+    ctrl = screen.tools / "templates" / "all.ctrl"
+    ctrl.write_text(ctrl.read_text()
+                    .replace(f"job_name={JOB_NAME}\n", f"job_name={job_name}\nobject_store_job_folder={sid}\n")
+                    .replace(f"object_store_job_prefix={JOB_PREFIX}\n", f"object_store_job_prefix={JOB_PREFIX}/{JOB_NAME}/slices\n"))
+    return screen
+
+
+def test_slices_of_a_screen_keep_to_their_own_folders(tmp_path, s3, head, monkeypatch):
+    """Two slices, and a fresh second attempt of one of them, run side by side
+    against one bucket and one queue. Outputs, recovery outputs included, go
+    to slices/<sid>/, which a fresh attempt must find empty; inputs,
+    manifests and recovery tarballs key on the attempt's job_name, so no
+    attempt reads or overwrites another's; Batch names are each attempt's own
+    and fit in 128 characters."""
+    slices_prefix = f"{JOB_PREFIX}/{JOB_NAME}/slices"
+    attempts = [("s0001", 1), ("s0002", 1), ("s0002", 2)]
+    screens = {(sid, attempt): slice_screen(tmp_path, s3, head, monkeypatch, sid, attempt)
+               for sid, attempt in attempts}
+
+    manifest_keys = set()
+    for (sid, attempt), screen in screens.items():
+        if attempt > 1:
+            # A fresh attempt starts from an empty folder: what the earlier
+            # one wrote there would read as its results
+            out = io.StringIO()
+            with pytest.raises(SystemExit):
+                screen.prepare(out)
+            assert f"The output folder {slices_prefix}/{sid}/ is not empty" in out.getvalue()
+            for key in [key for key in s3.objects if key[1].startswith(f"{slices_prefix}/{sid}/")]:
+                del s3.objects[key]
+        screen.prepare()
+        before = len(head.submits)
+        screen.submit(1, 1)
+        (submit,) = head.submits[before:]
+        assert submit['jobName'] == f"afvs-vs-0123abcd-{sid}-a{attempt}-1"
+        manifest_keys.add(next(key for bucket, key in s3.objects
+                               if key.startswith(f"{slices_prefix}/_manifests/vs-0123abcd-{sid}-a{attempt}/")))
+        manifest = manifest_of(screen, submit)
+        assert sorted(manifest['subjobs']['0']['outputs']) == sorted([
+            f"{slices_prefix}/{sid}/summary/1/0.json.gz",
+            f"{slices_prefix}/{sid}/qvina02/logs/1/0.tar.gz",
+            f"{slices_prefix}/{sid}/qvina02/parquet/1/0.parquet",
+            f"{slices_prefix}/{sid}/qvina02/csv/1/0.csv.gz",
+        ])
+        ret = screen.run_job(submit)
+        assert ret.returncode == 0, ret.stdout + ret.stderr
+    assert len(manifest_keys) == len(attempts)
+
+    # Recovery of one attempt stays with that attempt, its outputs in the slice
+    screen = screens[("s0002", 2)]
+    monkeypatch.chdir(screen.tools)
+    fail_all(screen)
+    recover = screen.load("afvs_recover_failed_subjobs.py")
+    before = len(head.submits)
+    code, _ = recover_call(screen, recover)
+    assert code == 0
+    (rerun,) = head.submits[before:]
+    assert rerun['jobName'].startswith("afvs-r-vs-0123abcd-s0002-a2-r1-1-") and len(rerun['jobName']) <= 128
+    ret = screen.run_job(rerun)
+    assert ret.returncode == 0, ret.stdout + ret.stderr
+    assert (JOB_BUCKET, f"{slices_prefix}/s0002/qvina02/parquet/recovery-vs-0123abcd-s0002-a2-r1-1/0.parquet") in s3.objects
+
+    job_names = {f"vs-0123abcd-{sid}-a{attempt}" for sid, attempt in attempts}
+    job_keys = sorted(key for bucket, key in s3.objects if bucket == JOB_BUCKET)
+    assert job_keys and all(key.startswith(f"{slices_prefix}/") for key in job_keys)
+    folders = set()
+    for key in job_keys:
+        parts = key[len(slices_prefix) + 1:].split("/")
+        folders.add(parts[0])
+        if parts[0] in ("s0001", "s0002"):
+            # a slice's folder holds outputs only
+            assert parts[1] in ("summary", "qvina02"), key
+        elif parts[0] in ("_manifests", "recovery"):
+            assert parts[1] in job_names, key
+        else:
+            assert parts[0] in job_names and parts[1] == "input", key
+    assert folders == {"s0001", "s0002", "_manifests", "recovery"} | job_names
+
+
+class TableCreated(Exception):
+    pass
+
+
+@pytest.mark.parametrize("script, argv, extra_config", [
+    ("afvs_get_top_results.py", [], {}),
+    ("afvs_gen_sparse.py", ["--tranches", "1"], {'athena_s3_location': f"s3://{JOB_BUCKET}/athena"}),
+])
+def test_athena_tools_read_a_slices_outputs_from_its_folder(tmp_path, s3, head, monkeypatch, script, argv, extra_config):
+    """The Athena tools build their table on the parquet outputs, which a
+    slice writes to slices/<sid>/, not under its job_name, and name it from
+    the job_name with its hyphens replaced."""
+    screen = slice_screen(tmp_path, s3, head, monkeypatch, "s0001", 1)
+    screen.prepare()
+    config_path = screen.tools.parent / "workflow" / "config.json"
+    config_path.write_text(json.dumps({**json.loads(config_path.read_text()), **extra_config}))
+
+    class Athena:
+        def start_query_execution(self, QueryString, **kwargs):
+            if "CREATE EXTERNAL TABLE" in QueryString:
+                raise TableCreated(QueryString)
+            return {'QueryExecutionId': "q"}
+
+        def get_query_execution(self, QueryExecutionId):
+            return {'QueryExecution': {'Status': {'State': "SUCCEEDED"},
+                                       'ResultConfiguration': {'OutputLocation': f"s3://{JOB_BUCKET}/athena/tmp/q.csv"}}}
+
+        def delete_object(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(sys.modules["boto3"], "client", lambda *args, **kwargs: Athena())
+    monkeypatch.chdir(screen.tools)
+    monkeypatch.setattr(sys, "argv", [script] + argv)
+    tool = screen.load(script)
+    monkeypatch.setattr(tool.time, "sleep", lambda seconds: None)
+    with pytest.raises(TableCreated) as created:
+        tool.main()
+    assert f"LOCATION 's3://{JOB_BUCKET}/{JOB_PREFIX}/{JOB_NAME}/slices/s0001/qvina02/parquet'" in str(created.value)
+    # ...on a table Athena can name: the slice's job_name has hyphens
+    assert "vs_0123abcd_s0001_a1" in str(created.value) and "vs-0123abcd" not in str(created.value)
+
+
 @pytest.mark.parametrize("args, message", [
     (["--max-subjobs", "0"], "--max-subjobs must be at least 1"),
     (["--from-round", "0"], "--from-round must be at least 1"),
@@ -861,13 +992,49 @@ def test_killall_refuses_in_presigned_mode(screen):
     (f"job_name={JOB_NAME}", "job_name=" + "j" * 101, "'job_name' must be at most 100 characters"),
     (f"job_name={JOB_NAME}", "job_name=screen.prod", "'job_name' must be at most 100 characters, all letters"),
     (f"job_name={JOB_NAME}", f"job_letter={JOB_NAME}", "'job_name' must be set if job_storage_mode is 'presigned'"),
+    (f"job_name={JOB_NAME}", f"job_letter={JOB_NAME}\nobject_store_job_folder=s0001",
+     "'job_name' must be set if job_storage_mode is 'presigned'"),
+    # A slice's folder is one folder under the prefix, never a path
+    (f"job_name={JOB_NAME}", f"job_name={JOB_NAME}\nobject_store_job_folder=slices/s0001",
+     "'object_store_job_folder' must be at most 100 characters"),
+    (f"job_name={JOB_NAME}", f"job_name={JOB_NAME}\nobject_store_job_folder=..",
+     "'object_store_job_folder' must be at most 100 characters"),
+    # Every job under the prefix keeps its manifests and recovery tarballs there
+    (f"job_name={JOB_NAME}", f"job_name={JOB_NAME}\nobject_store_job_folder=_manifests",
+     "'object_store_job_folder' cannot be '_manifests' or 'recovery'"),
+    (f"job_name={JOB_NAME}", f"job_name={JOB_NAME}\nobject_store_job_folder=recovery",
+     "'object_store_job_folder' cannot be '_manifests' or 'recovery'"),
+    # The output folder holds outputs only, never a job's input tarballs
+    (f"job_name={JOB_NAME}", f"job_name={JOB_NAME}\nobject_store_job_folder={JOB_NAME}",
+     "'object_store_job_folder' cannot be job_name"),
+    ("job_addressing_mode=metatranche", "job_addressing_mode=hash\nobject_store_job_folder=a7",
+     "'object_store_job_folder' cannot be job_name, or two hex digits if job addressing is hashed"),
+    ("job_storage_mode=presigned", "job_storage_mode=s3\nobject_store_job_folder=s0001",
+     "'object_store_job_folder' is only supported if job_storage_mode is 'presigned'"),
 ])
 def test_prepare_validates_presigned_configs(screen, old, new, message):
     ctrl = screen.tools / "templates" / "all.ctrl"
     ctrl.write_text(ctrl.read_text().replace(old, new))
     ret = subprocess.run([sys.executable, "./afvs_prepare_folders.py", "--overwrite"], cwd=screen.tools,
                          capture_output=True, text=True)
-    assert ret.returncode == 1 and message in ret.stdout
+    # A refusal is a message, not a crash after it
+    assert ret.returncode == 1 and message in ret.stdout and "Traceback" not in ret.stderr, ret.stdout + ret.stderr
+
+
+@pytest.mark.parametrize("old, new", [
+    # Hashed job addressing without a folder is as before
+    ("job_addressing_mode=metatranche", "job_addressing_mode=hash"),
+    (f"job_name={JOB_NAME}", f"job_name={JOB_NAME}\nobject_store_job_folder=s0001"),
+    ("job_addressing_mode=metatranche", "job_addressing_mode=hash\nobject_store_job_folder=s0001"),
+])
+def test_prepare_accepts_presigned_folder_configs(screen, old, new):
+    ctrl = screen.tools / "templates" / "all.ctrl"
+    ctrl.write_text(ctrl.read_text().replace(old, new))
+    ret = subprocess.run([sys.executable, "./afvs_prepare_folders.py", "--overwrite"], cwd=screen.tools,
+                         capture_output=True, text=True)
+    assert [line for line in ret.stdout.splitlines() if line.startswith("* ")] == \
+        ["* RECOMMENDED that 'tempdir_default' be '/dev/shm' if awsbatch is used"], ret.stdout
+    assert ret.stderr == "" and "Workflow has validation errors" in ret.stdout, ret.stdout + ret.stderr
 
 
 @pytest.mark.parametrize("expiry, timeout", [

@@ -34,6 +34,55 @@ letters, digits, `-` or `_`, so recovery job names (`afvs-r-<job_name>-r<round>-
 stay within Batch's 128 while round and workunit numbers have 9 digits
 between them.
 
+`object_store_job_folder` (optional, presigned mode only) names the folder of
+the job's outputs under `object_store_job_prefix` apart from `job_name`: one
+folder of at most 100 letters, digits, `-` or `_`, and not `_manifests` or
+`recovery`, not `job_name`, and not two hex digits when job addressing is
+hashed (input tarballs go to `<prefix>/<hh>/<hh>/`). Only outputs move there (`summary/`, and per scenario `logs/`,
+`parquet/` and `csv/`, recovery outputs included), and
+`afvs_get_top_results.py` and `afvs_gen_sparse.py` read them there. Input
+tarballs (`<prefix>/<job_name>/input/`, or `<prefix>/hh/hh/<job_name>/input/`
+when addressing is hashed), manifests (`<prefix>/_manifests/<job_name>/`),
+recovery tarballs (`<prefix>/recovery/<job_name>/`) and
+`afvs_get_top_results.py`'s query results (`<prefix>/<job_name>/athena/`) stay
+keyed by `job_name`, as do Batch job names. Without it the folder is `job_name` and
+nothing changes. Prepare sees one job only, so it cannot stop a folder from
+equalling another job's `job_name` or folder under the same prefix: keep each
+folder distinct from every `job_name` there.
+
+### Slices of a screen
+
+A screen split into slices runs each slice as an ordinary AFVS run, in its own
+working directory (its own `all.ctrl`, `collections.json` and `workflow/`),
+with the tools run from that directory's `tools/`. For slice `<sid>` of a
+screen whose results go to `<screen prefix>`:
+
+```
+job_name=vs-<8 hex of the screen's job id>-<sid>-a<attempt>
+object_store_job_prefix=<screen prefix>/slices
+object_store_job_folder=<sid>
+```
+
+Outputs then land at `<screen prefix>/slices/<sid>/…`. `job_name` must be
+unique per attempt, not only per slice: a fresh attempt of a slice that reused
+it would overwrite the earlier attempt's input tarballs and manifests while
+that attempt's jobs may still be queued, and its Batch names would match.
+Outputs, though, share the slice's folder, keyed by workunit and subjob as in
+any run, so attempts write to one place. Start a fresh attempt from an empty
+folder: terminate the old attempt's Batch jobs, wait until their URLs have
+expired (`presigned_url_expiry_seconds` after the last signing), since a job
+already running can still upload, then delete `<screen prefix>/slices/<sid>/`.
+Otherwise whatever reads the folder sees both attempts: the Athena tools
+build their table on every parquet under it, so the old attempt's outputs,
+its `recovery-<job_name>-…` ones included, show up as duplicate or extra rows.
+`afvs_prepare_workunits.py` refuses to start while the folder holds anything,
+but it cannot see an upload still to come, and it is not a lock: two attempts
+prepared before either writes pass it both. Run one attempt of a slice at a
+time.
+Slices on one head share its Batch queues, credentials and
+`/dev/shm` (`tempdir_default`), so size the head for the slices it runs at
+once.
+
 ## What the head does
 
 - **`afvs_prepare_workunits.py`** uploads each workunit tarball to
@@ -46,10 +95,10 @@ between them.
     `logs/…tar.gz`, `parquet/…parquet` and `csv/…csv.gz` as `summary_formats`
     asks)
 
-  It uploads the manifest to `<prefix>/_manifests/<job>/<wu>.json`. That is
+  It uploads the manifest to `<prefix>/_manifests/<job_name>/<wu>.json`. That is
   beside the job's output prefix, not inside it, because a manifest grants
-  write access to the job's outputs, so whatever copies `<prefix>/<job>/`
-  must not pick manifests up. It then submits the job with only
+  write access to the job's outputs, so whatever copies the job's output
+  folder must not pick manifests up. It then submits the job with only
   `AFVS_CONFIG_JOB_URL` (a presigned GET for that manifest) and `TMPDIR` (the
   scratch area, since the job's root filesystem is read-only). It passes no
   tags.
@@ -103,6 +152,9 @@ between them.
 - `s3:ListBucket` on the collection prefixes. Without it, S3 answers 403 for a
   missing object and the job cannot tell a missing collection from a rejected
   URL, so the subjob fails instead of recording a failed download.
+- With `object_store_job_folder` set, `s3:ListBucket` on the job bucket for
+  `<prefix>/<folder>/`: prepare checks the folder is empty, and fails without
+  it.
 - The data bucket must be in `aws_region`: every URL is signed for that
   region.
 - URLs live as long as the credentials that signed them, so they expire at
