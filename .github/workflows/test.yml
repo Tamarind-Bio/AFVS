@@ -1,0 +1,65 @@
+name: Run Tests
+
+on:
+  pull_request:
+  push:
+    branches: [ develop ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # The suite arrives with the presigned-mode work. Until a ref has tests/, say so in the
+    # run instead of failing. Once it does, an empty collection fails the job (pytest exits
+    # 5); only removing the tests/ directory itself leaves a warning and no failure.
+    - name: Look for tests
+      id: tests
+      run: |
+        if [ -d tests ]; then
+          echo "present=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "present=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::No tests/ directory on this ref, so no tests ran."
+        fi
+
+    - name: Set up Python
+      if: steps.tests.outputs.present == 'true'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12.8'
+
+    # Same Python and package versions as the python:3.12.8-slim-bookworm image the suite
+    # was written in. No boto3 on purpose: the tests stub it, and the presigned-mode jobs
+    # run with it unimportable.
+    - name: Install dependencies
+      if: steps.tests.outputs.present == 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends openbabel
+        obabel -V
+        pip install \
+          numpy==2.1.3 \
+          pandas==2.2.3 \
+          pyarrow==18.1.0 \
+          scipy==1.14.1 \
+          tqdm==4.67.1 \
+          jinja2==3.1.4 \
+          rdkit==2024.9.6 \
+          pytest==8.3.4
+        pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+
+    - name: Run tests
+      if: steps.tests.outputs.present == 'true'
+      working-directory: tests
+      run: python -m pytest -p no:cacheprovider -v
