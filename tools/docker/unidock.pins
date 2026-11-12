@@ -1,0 +1,12 @@
+# The conda-forge packages that make up the Uni-Dock layer of the GPU image (Dockerfile.sealed, stage
+# unidock-pkgs): file name under https://conda.anaconda.org/conda-forge/linux-64/, then its sha256.
+# These are the exact builds the 2026-11-05 to 11-09 measurements ran (unidock 1.2.0, cuda129 build),
+# so the image runs what was measured. unidock itself is Apache-2.0 (its package's LICENSE file); its
+# CUDA runtime is linked in statically and libcuda comes from the host driver, so there is no CUDA
+# library in the image; the C++ runtime (GCC Runtime Library Exception) and Boost (BSL-1.0) are
+# the only other code in the layer.
+unidock-1.2.0-cuda129_h426df62_1.conda e6daeb48caa928667fe9d3fd2c7a00e1cd9bb61081a262de8191db216c6e0a42
+libboost-1.88.0-hd24cca6_7.conda dd489228e1916c7720c925248d0ba12803d1dc8b9898be0c51f4ab37bab6ffa5
+libstdcxx-16.2.0-h934c35e_7.conda fa7018298629fc429971fffd6ecba3d27a7b02e4e890d6a93ea01ffebe8cb745
+libgcc-16.2.0-ha9f2e26_7.conda e031634c3a928f9594eba868bc46ef5230d6571a364a0c63215b06c4563bfcea
+libgomp-16.2.0-he0feb66_7.conda 92a0bb350c7be6a4eedcb4e111c60aefd176018e6b1c009a6e025dbe9bbcd758

@@ -1,6 +1,7 @@
-# Build context is the repo root; the image only needs tools/
+# Build context is the repo root; the image only needs tools/ (and the Uni-Dock pins, for the build)
 *
 !tools
-tools/docker
+tools/docker/*
+!tools/docker/unidock.pins
 **/__pycache__
 **/*.pyc

@@ -17,23 +17,28 @@
 
 # ---------------------------------------------------------------------------
 #
-# CPU-only image for sealed virtual screening (job_storage_mode=presigned):
+# One recipe, two images for sealed virtual screening (job_storage_mode=presigned):
 #
-#  - the AWS Batch docking jobs (job definition vf-jobdef-afvs-sealed) run
-#    templates/afvs_run.py from it with no AWS identity, as UID 1000 on a
-#    read-only root filesystem, reaching S3 only through presigned URLs;
-#  - the T2 sealed tool container uses it for receptor prep, result parsing
-#    and active learning (bash run.sh in /app, calling $AFVS_HOME/tools/*).
+#   cpu  the CPU image. The AWS Batch docking jobs (job definition vf-jobdef-afvs-sealed) run
+#        templates/afvs_run.py from it with no AWS identity, as UID 1000 on a read-only root
+#        filesystem, reaching S3 only through presigned URLs; the T2 sealed tool container uses it
+#        for receptor prep, result parsing and active learning (bash run.sh in /app, calling
+#        $AFVS_HOME/tools/*). This is the last stage, so a build with no --target makes it.
+#   gpu  the same image plus Uni-Dock (/opt/unidock, linked as tools/bin/unidock) for the GPU
+#        job definition. Nothing else differs: same user, same files, same checks.
 #
 # It has AFVS (at $AFVS_HOME=/opt/AFVS), the bundled docking binaries, Open
 # Babel, and python with pandas/pyarrow plus torch/rdkit, and no AWS SDK on
 # purpose: nothing that runs in it should hold or reach for credentials.
-# No ENTRYPOINT: the job definition and the pod each set the command.
-# Build from the repository root:
+# No ENTRYPOINT: the job definition and the pod each set the command. Nothing is fetched at run time.
 #
-#   docker build --platform linux/amd64 -t afvs-sealed -f tools/docker/Dockerfile.sealed .
+# Build and push both, from a clean checkout, with tools/docker/build_sealed.sh (tags
+# sealed-cpu-<7 char AFVS sha> and sealed-gpu-<7 char AFVS sha>). By hand, from the repository root:
 #
-# The bundled docking binaries in bin/ are x86-64, so the image is amd64.
+#   docker build --platform linux/amd64 --target cpu -t afvs-sealed-cpu -f tools/docker/Dockerfile.sealed .
+#   docker build --platform linux/amd64 --target gpu -t afvs-sealed-gpu -f tools/docker/Dockerfile.sealed .
+#
+# The bundled docking binaries in bin/ are x86-64, so the images are amd64.
 #
 # ---------------------------------------------------------------------------
 
@@ -53,7 +58,37 @@ RUN wget -q -O gwovina-1.0.tar.gz https://sourceforge.net/projects/gwovina/files
     && make gwovina LIBS="-l boost_system -l boost_thread -l boost_program_options -l boost_filesystem" \
     && mv gwovina /build/gwovina-bin
 
-FROM --platform=linux/amd64 python:3.12.8-slim-bookworm
+# Uni-Dock for the gpu image: the packages in tools/docker/unidock.pins, each checked against its
+# sha256, unpacked by hand (no conda), keeping the binary and the libraries its RPATH ($ORIGIN/../lib)
+# finds. The C++ runtime is conda-forge's because the binary needs CXXABI_1.3.15, which bookworm's
+# libstdc++ (GCC 12) lacks.
+FROM --platform=$BUILDPLATFORM python:3.12.8-slim-bookworm AS unidock-pkgs
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates unzip zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY tools/docker/unidock.pins /pkgs/unidock.pins
+WORKDIR /pkgs
+RUN set -eu; \
+    grep -v '^#' unidock.pins | while read -r file sha; do \
+        curl -fsSL --retry 3 -o "$file" "https://conda.anaconda.org/conda-forge/linux-64/$file"; \
+        echo "$sha  $file" | sha256sum -c -; \
+        mkdir "x-$file"; \
+        unzip -q -d "x-$file" "$file"; \
+        for part in "x-$file"/*.tar.zst; do zstd -dc "$part" | tar -x -C "x-$file"; done; \
+    done; \
+    mkdir -p /opt/unidock/bin /opt/unidock/lib; \
+    cp x-unidock-*/bin/unidock /opt/unidock/bin/; \
+    cp x-unidock-*/info/licenses/LICENSE /opt/unidock/LICENSE; \
+    cp -a x-libboost-*/lib/libboost_thread.so.1.88.0 x-libboost-*/lib/libboost_filesystem.so.1.88.0 \
+          x-libboost-*/lib/libboost_program_options.so.1.88.0 x-libboost-*/lib/libboost_system.so.1.88.0 /opt/unidock/lib/; \
+    cp -a x-libstdcxx-*/lib/libstdc++.so.6 x-libstdcxx-*/lib/libstdc++.so.6.0.36 /opt/unidock/lib/; \
+    cp -a x-libgcc-*/lib/libgcc_s.so.1 /opt/unidock/lib/; \
+    cp -a x-libgomp-*/lib/libgomp.so.1.0.0 /opt/unidock/lib/ && ln -s libgomp.so.1.0.0 /opt/unidock/lib/libgomp.so.1; \
+    echo "ce09fb167733c8df916636395571a0d5a80b36513110a888f57e081234e06e16  /opt/unidock/bin/unidock" | sha256sum -c -
+
+FROM --platform=linux/amd64 python:3.12.8-slim-bookworm AS base
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openbabel procps \
@@ -101,3 +136,29 @@ RUN useradd --uid 1000 --create-home afvs \
 USER 1000
 
 WORKDIR /app
+
+
+# The GPU image: base plus Uni-Dock. The binary has CUDA's runtime linked in; libcuda.so.1 comes from the
+# host driver through the NVIDIA container runtime, which needs the compute capability asked for here.
+FROM base AS gpu
+
+ARG AFVS_REVISION=unknown
+USER root
+COPY --from=unidock-pkgs /opt/unidock /opt/unidock
+RUN ln -s /opt/unidock/bin/unidock /opt/AFVS/tools/bin/unidock \
+    && ! ldd /opt/unidock/bin/unidock | grep "not found" \
+    && /opt/unidock/bin/unidock --version 2>&1 | grep -q "Uni-Dock v1.2.0"
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+LABEL org.opencontainers.image.revision="${AFVS_REVISION}" \
+      bio.tamarind.afvs.flavor="gpu" \
+      bio.tamarind.unidock.version="1.2.0" \
+      bio.tamarind.unidock.binary-sha256="ce09fb167733c8df916636395571a0d5a80b36513110a888f57e081234e06e16"
+USER 1000
+
+
+# The CPU image: base as it is. Last, so it is what a build with no --target makes.
+FROM base AS cpu
+
+ARG AFVS_REVISION=unknown
+LABEL org.opencontainers.image.revision="${AFVS_REVISION}" \
+      bio.tamarind.afvs.flavor="cpu"

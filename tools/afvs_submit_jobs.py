@@ -36,6 +36,7 @@ import shutil
 import jinja2
 import subprocess
 import afvs_presign
+import afvs_batch_resources
 
 
 def parse_config(filename):
@@ -249,16 +250,7 @@ def submit_aws_batch(config, client, current_workunit, jobline):
             },
             jobDefinition=f"{config['aws_batch_jobdef']}",
             containerOverrides={
-                'resourceRequirements': [
-                    {
-                        'type': 'VCPU',
-                        'value': config['aws_batch_subjob_vcpus'],
-                    },
-                    {
-                        'type': 'MEMORY',
-                        'value': config['aws_batch_subjob_memory'],
-                    },
-                ],
+                'resourceRequirements': afvs_batch_resources.resource_requirements(config),
                 'environment': environment
             }
         )
