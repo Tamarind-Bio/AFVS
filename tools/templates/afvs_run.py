@@ -2605,12 +2605,13 @@ def docking_finish_unidock(batch, ret):
         shutil.move(str(pose_file), item['output_path'])
         scored.append(item)
 
-    # Open Babel, one process per ligand, kept off the GPU's critical path as
-    # far as a few threads can
+    # Open Babel, one process per ligand, a few at a time
     workers = max(1, min(8, os.cpu_count() or 1))
+    start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for item, sdf_path in zip(scored, pool.map(lambda scored_item: convert_pose_to_sdf(scored_item['output_path']), scored)):
             item['output_path'] = sdf_path
+    print(f"converted {len(scored)} poses to SDF in {time.perf_counter() - start:.1f}s with {workers} threads")
 
 
 ## smina

@@ -12,14 +12,16 @@ import json
 import os
 import queue
 import shutil
+import subprocess
 import sys
+import tarfile
 import uuid
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from conftest import COLLECTIONS, FIXTURES, TOOLS, ligand_names, make_collection_tarball, data_key
+from conftest import COLLECTIONS, FIXTURES, TOOLS, ligand_names, make_collection_tarball, data_key, write_pocket_receptor
 # The presigned-mode harness: a fake S3 behind presigned URLs, a stubbed head, and a Screen that
 # prepares, submits and runs jobs the way Batch does. Its fixtures are used here as they are.
 from test_presigned_mode import Screen, JOB_BUCKET, JOB_NAME, JOB_PREFIX, DATA_BUCKET, DATA_PREFIX, head, s3  # noqa: F401
@@ -342,16 +344,26 @@ class UniScreen(Screen):
     """The presigned screen, docking with unidock on a GPU class: batches of 2, four workers asked for
     (so the cap is what leaves one), a GPU requested, and a glued ligand staged in the first collection."""
 
-    def __init__(self, base, s3, head, monkeypatch):
+    def __init__(self, base, s3, head, monkeypatch, real_engine=False):
         super().__init__(base, s3, head, monkeypatch)
         inputs = base / "afvs" / "input-files"
         shutil.rmtree(inputs / "qvina02")
         (inputs / "unidock").mkdir()
-        (inputs / "unidock" / "config.txt").write_text(CONFIG)
         (inputs / "receptors").mkdir()
-        (inputs / "receptors" / "receptor.pdbqt").write_text("receptor\n")
-        fake_binary(self.fakebin, "unidock", FAKE_UNIDOCK)
-        fake_binary(self.fakebin, "obabel", FAKE_OBABEL)
+        if real_engine:
+            # The Uni-Dock in the tools' bin (the GPU image has it there), docking into the imatinib
+            # pocket of 1IEP with a receptor PDBQT that Open Babel makes, hydrogens added
+            self.fakebin = unidock_binary().parent
+            write_pocket_receptor(inputs / "receptors" / "receptor.pdb")
+            subprocess.run(["obabel", "-ipdb", str(inputs / "receptors" / "receptor.pdb"), "-opdbqt", "-xr", "-h",
+                            "-O", str(inputs / "receptors" / "receptor.pdbqt")], check=True, capture_output=True)
+            (inputs / "unidock" / "config.txt").write_text(
+                (FIXTURES / "receptor" / "config.txt").read_text().replace("receptor.pdb", "receptor.pdbqt"))
+        else:
+            (inputs / "unidock" / "config.txt").write_text(CONFIG)
+            (inputs / "receptors" / "receptor.pdbqt").write_text("receptor\n")
+            fake_binary(self.fakebin, "unidock", FAKE_UNIDOCK)
+            fake_binary(self.fakebin, "obabel", FAKE_OBABEL)
 
         ctrl = self.tools / "templates" / "all.ctrl"
         text = ctrl.read_text()
@@ -368,7 +380,6 @@ class UniScreen(Screen):
         # The first collection also holds a ligand with Meeko glue atoms
         glued = base / "staging" / "glued"
         make_collection_tarball(COLLECTIONS[0], glued / "c.tar.gz")
-        import tarfile
         number = COLLECTIONS[0].split("_", 1)[1]
         with tarfile.open(glued / "c.tar.gz", "r:gz") as source:
             members = [(member, source.extractfile(member).read()) for member in source.getmembers()]
@@ -381,7 +392,9 @@ class UniScreen(Screen):
         s3.objects[(DATA_BUCKET, f"{DATA_PREFIX}/{data_key(COLLECTIONS[0])}")] = (glued / "c2.tar.gz").read_bytes()
 
     def job_env(self):
-        return {'PATH': f"{self.fakebin}{os.pathsep}{os.environ['PATH']}", 'FAKE_UNIDOCK_LOG': str(self.tools.parent / "calls.jsonl")}
+        # The fake engines are found first on PATH (a real engine's directory is not put on it)
+        path = f"{self.fakebin}{os.pathsep}{os.environ['PATH']}" if self.fakebin.name == "fakebin" else os.environ['PATH']
+        return {'PATH': path, 'FAKE_UNIDOCK_LOG': str(self.tools.parent / "calls.jsonl")}
 
     def calls(self):
         path = self.tools.parent / "calls.jsonl"
@@ -440,7 +453,6 @@ def test_the_poses_are_in_the_logs_archive_as_output_sdf(uni):
     ret = uni.run_job(uni.head.submits[0], env_override=uni.job_env())
     assert ret.returncode == 0, ret.stdout + ret.stderr
 
-    import tarfile
     prefix = f"{JOB_PREFIX}/{JOB_NAME}"
     archive = uni.s3.objects[(JOB_BUCKET, f"{prefix}/unidock/logs/1/0.tar.gz")]
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
@@ -451,3 +463,46 @@ def test_the_poses_are_in_the_logs_archive_as_output_sdf(uni):
     assert not any(name.endswith("/output") for name in names)
     assert any("/batch_exec/" in name for name in names)
     assert not any("glued" in name for name in names)
+
+
+def unidock_binary():
+    return Path(os.environ.get("AFVS_TOOLS", TOOLS)) / "bin" / "unidock"
+
+
+def unidock_runs():
+    import platform
+    try:
+        return (platform.system() == "Linux" and shutil.which("obabel") is not None and unidock_binary().exists()
+                and subprocess.run([str(unidock_binary()), "--version"], capture_output=True, timeout=60).returncode == 0
+                and subprocess.run(["nvidia-smi", "-L"], capture_output=True, timeout=60).returncode == 0)
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not unidock_runs(), reason="needs Uni-Dock in the tools' bin (x86-64 Linux), a GPU and Open Babel")
+def test_real_unidock_through_presigned_urls(tmp_path, s3, head, monkeypatch):
+    """One real GPU docking job end to end (AFVS_TOOLS=/opt/AFVS/tools inside the gpu image): the
+    real Uni-Dock in batches, no AWS identity, a glued ligand skipped, poses converted by Open Babel."""
+    screen = UniScreen(tmp_path, s3, head, monkeypatch, real_engine=True)
+    screen.prepare()
+    screen.submit(1, 2)
+
+    prefix = f"{JOB_PREFIX}/{JOB_NAME}"
+    for jobline, submit in enumerate(screen.head.submits, start=1):
+        ret = screen.run_job(submit)
+        assert ret.returncode == 0, ret.stdout + ret.stderr
+        screen.assert_no_url_leaked(ret.stdout, ret.stderr)
+
+        summary = json.loads(gzip.decompress(s3.objects[(JOB_BUCKET, f"{prefix}/summary/{jobline}/0.json.gz")]))
+        scores = pd.read_parquet(io.BytesIO(s3.objects[(JOB_BUCKET, f"{prefix}/unidock/parquet/{jobline}/0.parquet")]))
+        assert sorted(scores['ligand']) == ligand_names(COLLECTIONS[jobline - 1])
+        assert summary['dockings_status'] == {'success': 3, 'failed': 0}
+        assert scores['score_min'].between(-15, 0).all() and (scores['score_min'] <= scores['score_average']).all()
+        assert summary['skipped_ligands'] == (1 if jobline == 1 else 0)
+        print(scores[['ligand', 'score_min', 'score_average']].to_string(index=False))
+
+        with tarfile.open(fileobj=io.BytesIO(s3.objects[(JOB_BUCKET, f"{prefix}/unidock/logs/{jobline}/0.tar.gz")])) as tar:
+            poses = [member for member in tar.getmembers() if member.name.endswith("output.sdf")]
+            assert len(poses) == 3
+            for pose in poses:
+                assert tar.extractfile(pose).read().count(b"$$$$") >= 1
