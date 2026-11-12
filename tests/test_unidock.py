@@ -397,6 +397,29 @@ def test_retrying_in_halves_gives_up_after_a_budget_of_failed_calls(tmp_path, mo
     assert {item['status'] for item in reported} == {"failed"}
 
 
+def test_a_call_that_times_out_is_split_like_one_that_fails(tmp_path, monkeypatch):
+    batch = Batch(tmp_path, monkeypatch, NAMES)
+    real_run = batch.module.subprocess.run
+    timeouts = []
+
+    def run(cmd, **kwargs):
+        links = [line.strip() for line in Path(cmd[cmd.index('--ligand_index') + 1]).read_text().splitlines()]
+        if "ethanol" in [os.path.basename(os.path.realpath(link)).split('.')[0] for link in links]:
+            timeouts.append(kwargs['timeout'])
+            raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(batch.module.subprocess, "run", run)
+    done = batch.run()
+
+    # The per-docking timeout (60 s) once per ligand in the call: 5, then the half of 2, then the one
+    assert timeouts == [300, 120, 60]
+    status = {item['ligand_key']: item['status'] for finished in done for item in finished['items']}
+    assert status == {name: ("failed" if name == "ethanol" else "success") for name in NAMES}
+    ethanol = next(item for finished in done for item in finished['items'] if item['ligand_key'] == "ethanol")
+    assert ethanol['log']['reason'] == "Batched execution timed out"
+
+
 def test_search_mode_modes_and_seed_reach_the_call(tmp_path, monkeypatch):
     batch = Batch(tmp_path, monkeypatch, NAMES, config=CONFIG + "search_mode = balance\nnum_modes = 3\nseed = 7\n")
     batch.run()
@@ -594,3 +617,37 @@ def test_qvina02_skips_a_glued_ligand_as_before(screen):
     summary = json.loads(gzip.decompress(screen.s3.objects[(JOB_BUCKET, f"{JOB_PREFIX}/{JOB_NAME}/summary/1/0.json.gz")]))
     assert summary['dockings_status'] == {'success': 3, 'failed': 0}
     assert [(skip['ligand_key'], skip['reason']) for skip in summary['skipped_ligand_list']] == [("glued", "duplicate coordinates")]
+
+
+@pytest.mark.parametrize("scenarios, gpus", [
+    ("unidock", None), ("unidock", ""), ("unidock", "0"), ("qvina02:unidock", None), ("qvina02:unidock", "0"),
+])
+def test_prepare_refuses_unidock_without_a_gpu(screen, scenarios, gpus):
+    # Every Uni-Dock call fails without one, so the job must not be prepared, let alone submitted
+    ctrl = screen.tools / "templates" / "all.ctrl"
+    text = ctrl.read_text().replace("docking_scenario_names=qvina02", f"docking_scenario_names={scenarios}")
+    text = text.replace("docking_scenario_methods=qvina02", f"docking_scenario_methods={scenarios}")
+    if ":" in scenarios:
+        text = text.replace("docking_scenario_replicas=1", "docking_scenario_replicas=1:1").replace(
+            "docking_scenario_batchsizes=1", "docking_scenario_batchsizes=1:2")
+    ctrl.write_text(text + ("" if gpus is None else f"aws_batch_subjob_gpus={gpus}\n"))
+    ret = subprocess.run([sys.executable, "./afvs_prepare_folders.py", "--overwrite"], cwd=screen.tools, capture_output=True, text=True)
+    assert ret.returncode == 1 and "* 'aws_batch_subjob_gpus' must be at least 1 if a docking scenario method is 'unidock'" in ret.stdout \
+        and "Traceback" not in ret.stderr, ret.stdout + ret.stderr
+
+
+@pytest.mark.parametrize("scenarios, gpus", [("unidock", "1"), ("qvina02:unidock", "1"), ("qvina02", None), ("qvina02", "1")])
+def test_prepare_accepts_a_gpu_for_unidock_and_none_for_qvina02(screen, scenarios, gpus):
+    (screen.tools.parent / "input-files" / "unidock").mkdir(exist_ok=True)
+    ctrl = screen.tools / "templates" / "all.ctrl"
+    text = ctrl.read_text().replace("docking_scenario_names=qvina02", f"docking_scenario_names={scenarios}")
+    text = text.replace("docking_scenario_methods=qvina02", f"docking_scenario_methods={scenarios}")
+    if ":" in scenarios:
+        text = text.replace("docking_scenario_replicas=1", "docking_scenario_replicas=1:1").replace(
+            "docking_scenario_batchsizes=1", "docking_scenario_batchsizes=1:2")
+    ctrl.write_text(text + ("" if gpus is None else f"aws_batch_subjob_gpus={gpus}\n"))
+    ret = subprocess.run([sys.executable, "./afvs_prepare_folders.py", "--overwrite"], cwd=screen.tools, capture_output=True, text=True)
+    # Only the fixture's tempdir recommendation is left to complain about
+    assert [line for line in ret.stdout.splitlines() if line.startswith("* ")] == \
+        ["* RECOMMENDED that 'tempdir_default' be '/dev/shm' if awsbatch is used"], ret.stdout
+    assert ret.stderr == ""

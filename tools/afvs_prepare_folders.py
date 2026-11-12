@@ -218,6 +218,10 @@ def check_parameters(config):
             if(not empty_value(config, 'aws_batch_subjob_gpus') and not re.fullmatch(r'[0-9]+', config['aws_batch_subjob_gpus'])):
                 print("* 'aws_batch_subjob_gpus' must be a whole number if it is set")
                 error = 1
+            elif('unidock' in config['docking_scenario_methods'] and (empty_value(config, 'aws_batch_subjob_gpus') or int(config['aws_batch_subjob_gpus']) < 1)):
+                # Uni-Dock runs on a GPU only: without one every call fails
+                print("* 'aws_batch_subjob_gpus' must be at least 1 if a docking scenario method is 'unidock'")
+                error = 1
             if(empty_value(config, 'tempdir_default') or config['tempdir_default'] != "/dev/shm/"):
                 print("* RECOMMENDED that 'tempdir_default' be '/dev/shm' if awsbatch is used")
                 error = 1

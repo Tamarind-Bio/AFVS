@@ -834,6 +834,7 @@ def execute_batch(batched_item, temp_dir, failed_calls=None):
         logging.error(f"Invalid cmd generation for batched execution (program: '{batched_item['program']}')")
         raise(err)
 
+    timed_out = False
     try:
         ret = subprocess.run(cmd, capture_output=True,
                  text=True, cwd=batched_item['tmp_run_dir_input'], timeout=batched_item['timeout'])
@@ -842,6 +843,7 @@ def execute_batch(batched_item, temp_dir, failed_calls=None):
         for item in items:
             item['log']['reason'] = reason
         logging.error(reason)
+        timed_out = True
 
     split = False
 
@@ -864,6 +866,13 @@ def execute_batch(batched_item, temp_dir, failed_calls=None):
         with open(batched_item['log_path'], "w") as output_f:
             output_f.write(f"STDOUT:\n{ret.stdout}\n")
             output_f.write(f"STDERR:\n{ret.stderr}\n")
+
+    if timed_out:
+        # A call that hangs on one ligand is split like one that fails on it; each half has its
+        # own, shorter timeout (the per-docking timeout times the ligands in it)
+        failed_calls[0] += 1
+        split = (bool(program.get('split_failed_batches')) and len(items) > 1
+                 and failed_calls[0] <= MAX_FAILED_CALLS_PER_BATCH)
 
     docking_process_clean_common(batched_item)
     print(f"processing - done in {batched_item['seconds']}")
