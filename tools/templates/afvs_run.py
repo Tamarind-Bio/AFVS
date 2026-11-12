@@ -66,6 +66,9 @@ logger = logging.getLogger(__name__)
 GLUE_ATOM_TYPE = re.compile(r'^C?G[0-9]+$')
 GLUE_SKIP_REASON = "macrocycle_glue_atoms"
 
+# A batch program that retries a failed call in halves gives up on that after this many failed calls in a batch
+MAX_FAILED_CALLS_PER_BATCH = 100
+
 
 # boto3 is imported only by the S3 code paths, so a presigned job (which has no
 # AWS identity and no boto3) never reaches for it.
@@ -793,13 +796,19 @@ def docking_process_batch(summary_queue, scenario, items, temp_dir):
 
 
 
-def execute_batch(batched_item, temp_dir):
+def execute_batch(batched_item, temp_dir, failed_calls=None):
     """Run one call of a batch program over batched_item['items'] and return
     the batches to report: just batched_item, or, for a program that sets
     'split_failed_batches', batched_item (as the failed call, with no items,
     so its log is kept) followed by the batches its two halves became. A
     single ligand that crashes the program then fails alone, not its whole
-    batch with it."""
+    batch with it. Splitting stops after MAX_FAILED_CALLS_PER_BATCH failed
+    calls (failed_calls counts them across the halves): finding k bad ligands
+    in n takes about 2 k log2(n) failed calls, while a cause that fails every
+    call, such as a missing GPU, would otherwise take about 2 n."""
+
+    if failed_calls is None:
+        failed_calls = [0]
 
     program = DOCKING_PROGRAMS[batched_item['program']]
     items = batched_item['items']
@@ -847,7 +856,9 @@ def execute_batch(batched_item, temp_dir):
             logging.error(reason)
             logging.error(f"stdout:\n{ret.stdout}\nstderr:{ret.stderr}\n")
 
-            split = bool(program.get('split_failed_batches')) and len(items) > 1
+            failed_calls[0] += 1
+            split = (bool(program.get('split_failed_batches')) and len(items) > 1
+                     and failed_calls[0] <= MAX_FAILED_CALLS_PER_BATCH)
 
         # Place output into files
         with open(batched_item['log_path'], "w") as output_f:
@@ -869,7 +880,7 @@ def execute_batch(batched_item, temp_dir):
         part_batch['items'] = part
         for item in part:
             item['log']['reason'] = ""
-        finished.extend(execute_batch(part_batch, temp_dir))
+        finished.extend(execute_batch(part_batch, temp_dir, failed_calls))
     return finished
 
 
@@ -2512,6 +2523,11 @@ def docking_finish_vina(item, ret):
 
 UNIDOCK_SEARCH_MODES = ("fast", "balance", "detail")
 UNIDOCK_BOX_KEYS = ("center_x", "center_y", "center_z", "size_x", "size_y", "size_z")
+# Measured on Uni-Dock 1.2.0: a side of s Angstrom takes ceil(s / 0.375) + 1 grid points; at most 128 a side
+# and 81 ** 3 = 531441 in all (a 30 Angstrom cube fits, 30.01 does not; 20 x 20 x 40 fits, 20 x 20 x 50 does not)
+UNIDOCK_GRID_SPACING = 0.375
+UNIDOCK_MAX_SIDE_POINTS = 128
+UNIDOCK_MAX_GRID_POINTS = 81 ** 3
 
 
 def docking_start_unidock(batch):
@@ -2537,11 +2553,26 @@ def docking_start_unidock(batch):
     if not receptor.endswith(".pdbqt"):
         raise RuntimeError("unidock needs 'receptor' in its config.txt to be a PDBQT file with hydrogens")
 
+    box = {}
     for key in UNIDOCK_BOX_KEYS:
         try:
-            float(config_[key])
+            box[key] = float(config_[key])
         except (KeyError, ValueError):
             raise RuntimeError(f"unidock needs a number for '{key}' in its config.txt")
+        if not math.isfinite(box[key]):
+            raise RuntimeError(f"unidock needs a finite number for '{key}' in its config.txt")
+
+    # Uni-Dock puts the box on a grid and exits 1 on every ligand when it does not fit; a box of
+    # 0 or less also exits 1, an infinite one hangs. Refuse here, once, not after a call per ligand
+    points = []
+    for key in UNIDOCK_BOX_KEYS[3:]:
+        if box[key] <= 0:
+            raise RuntimeError(f"unidock needs '{key}' in its config.txt to be above 0")
+        points.append(math.ceil(box[key] / UNIDOCK_GRID_SPACING) + 1)
+    if max(points) > UNIDOCK_MAX_SIDE_POINTS or points[0] * points[1] * points[2] > UNIDOCK_MAX_GRID_POINTS:
+        raise RuntimeError("unidock's search box does not fit its grid (the size is in Angstrom, a grid point every "
+                           f"{UNIDOCK_GRID_SPACING}: at most {UNIDOCK_MAX_SIDE_POINTS} points a side and {UNIDOCK_MAX_GRID_POINTS} in all; "
+                           "a 30 Angstrom cube is the largest cube)")
 
     search_mode = config_.get('search_mode', "detail")
     if search_mode not in UNIDOCK_SEARCH_MODES:

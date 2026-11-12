@@ -355,6 +355,48 @@ def test_a_bad_config_is_refused_before_any_call(tmp_path, monkeypatch, config, 
     assert batch.calls() == []
 
 
+@pytest.mark.parametrize("sizes, fits", [
+    ((30, 30, 30), True), ((30.01, 30, 30), False), ((20, 20, 40), True), ((20, 20, 50), False),
+    ((47.625, 1, 1), True), ((47.99, 1, 1), False),
+    ((0, 20, 20), False), ((-5, 20, 20), False), (("inf", 20, 20), False), (("nan", 20, 20), False),
+])
+def test_the_search_box_must_fit_unidocks_grid(tmp_path, monkeypatch, sizes, fits):
+    # Measured on Uni-Dock 1.2.0: it exits 1 on every ligand when the box does not fit its grid,
+    # and an infinite box hangs it. The refusal must come before any call
+    config = CONFIG.replace("size_x = 20\nsize_y = 20.5\nsize_z = 22  # a comment", "\n".join(f"size_{axis} = {size}" for axis, size in zip("xyz", sizes)))
+    batch = Batch(tmp_path, monkeypatch, NAMES, config=config)
+    if fits:
+        (finished,) = batch.run()
+        assert [item['status'] for item in finished['items']] == ["success"] * len(NAMES)
+    else:
+        with pytest.raises(RuntimeError, match="size_|grid"):
+            batch.run()
+        assert batch.calls() == []
+
+
+@pytest.mark.parametrize("center", ["inf", "nan"])
+def test_a_box_centre_must_be_finite(tmp_path, monkeypatch, center):
+    batch = Batch(tmp_path, monkeypatch, NAMES, config=CONFIG.replace("center_x = 15.6", f"center_x = {center}"))
+    with pytest.raises(RuntimeError, match="center_x"):
+        batch.run()
+    assert batch.calls() == []
+
+
+def test_retrying_in_halves_gives_up_after_a_budget_of_failed_calls(tmp_path, monkeypatch):
+    # A cause that fails every call (a missing GPU) must not cost a call per ligand and more
+    names = [f"lig{i}" for i in range(20)]
+    monkeypatch.setenv("FAKE_UNIDOCK_CRASH", ",".join(names))
+    batch = Batch(tmp_path, monkeypatch, names)
+    monkeypatch.setattr(batch.module, "MAX_FAILED_CALLS_PER_BATCH", 5)
+    done = batch.run()
+
+    # Without a budget this is 39 calls (every ligand alone); with one, at most the batch and two halves for each of its five failures
+    assert len(batch.calls()) <= 11
+    reported = [item for finished in done for item in finished['items']]
+    assert sorted(item['ligand_key'] for item in reported) == sorted(names)
+    assert {item['status'] for item in reported} == {"failed"}
+
+
 def test_search_mode_modes_and_seed_reach_the_call(tmp_path, monkeypatch):
     batch = Batch(tmp_path, monkeypatch, NAMES, config=CONFIG + "search_mode = balance\nnum_modes = 3\nseed = 7\n")
     batch.run()
