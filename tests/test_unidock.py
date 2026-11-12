@@ -24,7 +24,7 @@ import pytest
 from conftest import COLLECTIONS, FIXTURES, TOOLS, ligand_names, make_collection_tarball, data_key, write_pocket_receptor
 # The presigned-mode harness: a fake S3 behind presigned URLs, a stubbed head, and a Screen that
 # prepares, submits and runs jobs the way Batch does. Its fixtures are used here as they are.
-from test_presigned_mode import Screen, JOB_BUCKET, JOB_NAME, JOB_PREFIX, DATA_BUCKET, DATA_PREFIX, head, s3  # noqa: F401
+from test_presigned_mode import Screen, JOB_BUCKET, JOB_NAME, JOB_PREFIX, DATA_BUCKET, DATA_PREFIX, head, s3, screen  # noqa: F401
 
 
 def load(script, monkeypatch):
@@ -80,6 +80,30 @@ ROOT
 ATOM      1  C   UNL     1       0.000   0.000   0.000  1.00  0.00     0.000 C
 ATOM      2  C   UNL     1       1.500   0.000   0.000  1.00  0.00     0.000 CG0
 ATOM      3  C   UNL     1       3.000   0.000   0.000  1.00  0.00     0.000 G0
+ENDROOT
+TORSDOF 0
+"""
+
+# What Meeko writes: the glue atoms of a broken ring come in pairs at the same coordinates
+GLUE_PAIRED = """\
+REMARK  Name = glued
+REMARK SMILES C1CCCCCCCCCCC1
+ROOT
+ATOM      1  C   UNL     1      -5.804  -0.969  -1.751  1.00  0.00     0.003 CG0
+ATOM      2  G   UNL     1      -5.681   0.352  -2.514  1.00  0.00     0.000 G0
+ATOM      3  C   UNL     1      -5.681   0.352  -2.514  1.00  0.00     0.022 CG0
+ATOM      4  G   UNL     1      -5.804  -0.969  -1.751  1.00  0.00     0.000 G0
+ENDROOT
+TORSDOF 0
+"""
+
+# A glue atom detected only as the second atom at its coordinates (the first is an ordinary atom)
+GLUE_OVERLAP = """\
+REMARK  Name = glued
+ROOT
+ATOM      1  C   UNL     1      -5.804  -0.969  -1.751  1.00  0.00     0.003 C
+ATOM      2  C   UNL     1       1.500   0.000   0.000  1.00  0.00     0.000 A
+ATOM      3  G   UNL     1      -5.804  -0.969  -1.751  1.00  0.00     0.000 G0
 ENDROOT
 TORSDOF 0
 """
@@ -340,11 +364,27 @@ def test_search_mode_modes_and_seed_reach_the_call(tmp_path, monkeypatch):
 
 # --- a whole job ------------------------------------------------------------------
 
+def stage_glued_collection(base, s3, glue_text):
+    """The first collection, staged in the fake S3, with a ligand named glued that has Meeko glue atoms."""
+    staged = base / "staging" / "glued"
+    make_collection_tarball(COLLECTIONS[0], staged / "c.tar.gz")
+    number = COLLECTIONS[0].split("_", 1)[1]
+    with tarfile.open(staged / "c.tar.gz", "r:gz") as source:
+        members = [(member, source.extractfile(member).read()) for member in source.getmembers()]
+    with tarfile.open(staged / "c2.tar.gz", "w:gz") as tar:
+        for member, body in members:
+            tar.addfile(member, io.BytesIO(body))
+        info = tarfile.TarInfo(f"{number}/glued.pdbqt")
+        info.size = len(glue_text.encode())
+        tar.addfile(info, io.BytesIO(glue_text.encode()))
+    s3.objects[(DATA_BUCKET, f"{DATA_PREFIX}/{data_key(COLLECTIONS[0])}")] = (staged / "c2.tar.gz").read_bytes()
+
+
 class UniScreen(Screen):
     """The presigned screen, docking with unidock on a GPU class: batches of 2, four workers asked for
     (so the cap is what leaves one), a GPU requested, and a glued ligand staged in the first collection."""
 
-    def __init__(self, base, s3, head, monkeypatch, real_engine=False):
+    def __init__(self, base, s3, head, monkeypatch, real_engine=False, glue_text=GLUE_LIGAND):
         super().__init__(base, s3, head, monkeypatch)
         inputs = base / "afvs" / "input-files"
         shutil.rmtree(inputs / "qvina02")
@@ -377,19 +417,8 @@ class UniScreen(Screen):
             text = text.replace(old, new)
         ctrl.write_text(text + "aws_batch_subjob_gpus=1\n")
 
-        # The first collection also holds a ligand with Meeko glue atoms
-        glued = base / "staging" / "glued"
-        make_collection_tarball(COLLECTIONS[0], glued / "c.tar.gz")
-        number = COLLECTIONS[0].split("_", 1)[1]
-        with tarfile.open(glued / "c.tar.gz", "r:gz") as source:
-            members = [(member, source.extractfile(member).read()) for member in source.getmembers()]
-        with tarfile.open(glued / "c2.tar.gz", "w:gz") as tar:
-            for member, body in members:
-                tar.addfile(member, io.BytesIO(body))
-            info = tarfile.TarInfo(f"{number}/glued.pdbqt")
-            info.size = len(GLUE_LIGAND.encode())
-            tar.addfile(info, io.BytesIO(GLUE_LIGAND.encode()))
-        s3.objects[(DATA_BUCKET, f"{DATA_PREFIX}/{data_key(COLLECTIONS[0])}")] = (glued / "c2.tar.gz").read_bytes()
+        self.glue = {GLUE_LIGAND: "apart", GLUE_PAIRED: "paired", GLUE_OVERLAP: "overlap"}[glue_text]
+        stage_glued_collection(base, s3, glue_text)
 
     def job_env(self):
         # The fake engines are found first on PATH (a real engine's directory is not put on it)
@@ -401,9 +430,10 @@ class UniScreen(Screen):
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
-@pytest.fixture
-def uni(tmp_path, s3, head, monkeypatch):
-    return UniScreen(tmp_path, s3, head, monkeypatch)
+@pytest.fixture(params=["apart", "paired", "overlap"])
+def uni(request, tmp_path, s3, head, monkeypatch):
+    """The glued ligand has its glue atoms apart, in Meeko's pairs at the same coordinates, or one on an ordinary atom."""
+    return UniScreen(tmp_path, s3, head, monkeypatch, glue_text={"apart": GLUE_LIGAND, "paired": GLUE_PAIRED, "overlap": GLUE_OVERLAP}[request.param])
 
 
 def test_a_gpu_job_docks_in_batches_on_one_worker_and_skips_glued_ligands(uni):
@@ -439,8 +469,11 @@ def test_a_gpu_job_docks_in_batches_on_one_worker_and_skips_glued_ligands(uni):
         if jobline == 1:
             # The glued ligand is counted and named, never docked
             assert summary['skipped_ligands'] == 1
-            assert [(skip['ligand_key'], skip['reason'], skip['scenario']) for skip in summary['skipped_ligand_list']] == [
-                ("glued", "macrocycle_glue_atoms", "unidock")]
+            assert [(skip['ligand_key'], skip['reason']) for skip in summary['skipped_ligand_list']] == [
+                ("glued", "macrocycle_glue_atoms")]
+            # skipped for the one scenario when its glue atoms are apart; Meeko's pairs fail the duplicate
+            # coordinates check, which skips the ligand outright, so there is no scenario to name
+            assert [skip.get('scenario') for skip in summary['skipped_ligand_list']] == (["unidock"] if uni.glue == "apart" else [None])
         else:
             assert summary['skipped_ligands'] == 0
 
@@ -506,3 +539,16 @@ def test_real_unidock_through_presigned_urls(tmp_path, s3, head, monkeypatch):
             assert len(poses) == 3
             for pose in poses:
                 assert tar.extractfile(pose).read().count(b"$$$$") >= 1
+
+
+def test_qvina02_skips_a_glued_ligand_as_before(screen):
+    """The glue guard is Uni-Dock's: a run of qvina02 still skips Meeko's glued ligand, as duplicate coordinates."""
+    stage_glued_collection(screen.base, screen.s3, GLUE_PAIRED)
+    screen.prepare()
+    screen.submit(1, 1)
+    ret = screen.run_job(screen.head.submits[0])
+    assert ret.returncode == 0, ret.stdout + ret.stderr
+
+    summary = json.loads(gzip.decompress(screen.s3.objects[(JOB_BUCKET, f"{JOB_PREFIX}/{JOB_NAME}/summary/1/0.json.gz")]))
+    assert summary['dockings_status'] == {'success': 3, 'failed': 0}
+    assert [(skip['ligand_key'], skip['reason']) for skip in summary['skipped_ligand_list']] == [("glued", "duplicate coordinates")]

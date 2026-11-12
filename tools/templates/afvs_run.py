@@ -454,6 +454,11 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
                         parts = line.split()
                         coord_str = ":".join(parts[5:8])
 
+                        # The AutoDock type is the last field of an ATOM line. Checked before the
+                        # coordinates: Meeko's glue atoms come in pairs at the same coordinates
+                        if glue_guarded and GLUE_ATOM_TYPE.match(parts[-1]):
+                            has_glue_atoms = True
+
                         if(coord_str in coords):
                             logging.error(
                                 f"Found duplicate coordinates in {ligand}. Skipping.")
@@ -462,10 +467,6 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
                             skip_ligand = 1
                             break
                         coords[coord_str] = 1
-
-                        # The AutoDock type is the last field of an ATOM line
-                        if glue_guarded and GLUE_ATOM_TYPE.match(parts[-1]):
-                            has_glue_atoms = True
 
                     # Checking for dynamic tranche filtering
                     if (int(ctx['main_config']['dynamic_tranche_filtering']) == 1):
@@ -496,6 +497,11 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
                                 skip_ligand = 1
                                 break
 
+
+            if skip_ligand and has_glue_atoms and skip_reason_json == "duplicate coordinates":
+                # Every Meeko glue ligand fails the check above, for every program (its glue atoms
+                # sit in pairs at the same coordinates); in a run with a guarded program, say what it is
+                skip_reason_json = GLUE_SKIP_REASON
 
             if(skip_ligand == 0):
 
