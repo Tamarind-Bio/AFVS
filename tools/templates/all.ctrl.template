@@ -61,6 +61,11 @@ aws_batch_subjob_vcpus=16
 aws_batch_subjob_memory=32000
 # Memory per subjob to setup for the container in MB
 
+# aws_batch_subjob_gpus=1
+# Add this, as a whole number, only for a job that docks on a GPU (a GPU
+# program such as unidock): each subjob then also requests that many GPUs.
+# Leave it out for every other job.
+
 aws_batch_subjob_timeout=20800
 # Maximum amount of time (in seconds) that a single AWS Batch job should 
 # ever run before being terminated.

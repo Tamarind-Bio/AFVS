@@ -59,6 +59,14 @@ import urllib.error
 logger = logging.getLogger(__name__)
 
 
+# Meeko writes glue atoms (types G0, G1, ... and CG0, CG1, ...) where it opens
+# a ring of 7 or more members. qvina02 rejects such a ligand itself; Uni-Dock
+# accepts it and returns nonsense scores (+46 kcal/mol at the median, -34 at
+# the lowest), so a program that sets 'reject_glue_atoms' never gets one.
+GLUE_ATOM_TYPE = re.compile(r'^C?G[0-9]+$')
+GLUE_SKIP_REASON = "macrocycle_glue_atoms"
+
+
 # boto3 is imported only by the S3 code paths, so a presigned job (which has no
 # AWS identity and no boto3) never reaches for it.
 def s3_client(**config_args):
@@ -412,6 +420,12 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
             scenario_directory.mkdir(parents=True, exist_ok=True)
 
 
+        # Programs that must never be given a ligand with Meeko glue atoms
+        # (see GLUE_ATOM_TYPE) skip it in their own scenarios only
+
+        glue_guarded = [scenario_key for scenario_key, scenario in ctx['main_config']['docking_scenarios'].items()
+                        if DOCKING_PROGRAMS.get(scenario['program'], {}).get('reject_glue_atoms')]
+
         # Process every ligand after making sure it is valid
 
         for ligand_key in item['ligands']:
@@ -419,6 +433,7 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
 
             coords = {}
             skip_ligand = 0
+            has_glue_atoms = False
 
             with open(ligand['path'], "r") as read_file:
                 for index, line in enumerate(read_file):
@@ -447,6 +462,10 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
                             skip_ligand = 1
                             break
                         coords[coord_str] = 1
+
+                        # The AutoDock type is the last field of an ATOM line
+                        if glue_guarded and GLUE_ATOM_TYPE.match(parts[-1]):
+                            has_glue_atoms = True
 
                     # Checking for dynamic tranche filtering
                     if (int(ctx['main_config']['dynamic_tranche_filtering']) == 1):
@@ -482,8 +501,22 @@ def collection_process(ctx, collection_queue, docking_queue, summary_queue):
 
                 # We can submit this for processing
                 ligand_attrs = get_attrs(ctx['main_config']['ligand_library_format'], ligand['path'], ctx['main_config']['print_attrs_in_summary'])
-                submit_ligand_for_docking(ctx, docking_queue, ligand_key, ligand['path'], ligand['collection_key'], ligand['base_collection_key'], ligand_attrs, item['temp_dir'])
-                expected_ligands += completions_per_ligand
+                skip_scenarios = glue_guarded if has_glue_atoms else []
+                expected_ligands += submit_ligand_for_docking(ctx, docking_queue, ligand_key, ligand['path'], ligand['collection_key'], ligand['base_collection_key'], ligand_attrs, item['temp_dir'], skip_scenarios)
+
+                # A skipped ligand is counted and named, never scored
+                for scenario_key in skip_scenarios:
+                    logging.error(f"Found Meeko glue atoms in {ligand_key}. Skipping it for {scenario_key}.")
+                    summary_queue.put({
+                        'type': "skip",
+                        'log': {
+                            'base_collection_key': ligand['base_collection_key'],
+                            'collection_key': ligand['collection_key'],
+                            'ligand_key': ligand_key,
+                            'reason': GLUE_SKIP_REASON,
+                            'scenario': scenario_key
+                        }
+                    })
 
             else:
                 # log this to know we skipped
@@ -551,9 +584,15 @@ def get_attrs(ligand_format, ligand_path, attrs = ['smi']):
     return attributes
 
 
-def submit_ligand_for_docking(ctx, docking_queue, ligand_name, ligand_path, collection_key, base_collection_key, ligand_attrs, temp_dir):
+def submit_ligand_for_docking(ctx, docking_queue, ligand_name, ligand_path, collection_key, base_collection_key, ligand_attrs, temp_dir, skip_scenarios=()):
+    """Queue the ligand for every scenario but skip_scenarios; returns how many dockings it queued."""
+
+    queued = 0
 
     for scenario_key in ctx['main_config']['docking_scenarios']:
+        if scenario_key in skip_scenarios:
+            continue
+
         scenario = ctx['main_config']['docking_scenarios'][scenario_key]
 
         for replica_index in range(scenario['replicas']):
@@ -580,9 +619,12 @@ def submit_ligand_for_docking(ctx, docking_queue, ligand_name, ligand_path, coll
             }
 
             docking_queue.put(docking_item)
+            queued += 1
 
     while docking_queue.qsize() > 100:
             time.sleep(0.2)
+
+    return queued
 
 
 def read_config_line(line):
@@ -662,7 +704,8 @@ def docking_process_batch(summary_queue, scenario, items, temp_dir):
         'items': items,
         'program': scenario['program'],
         'execution_type': DOCKING_PROGRAMS[scenario['program']]['ligands'],
-        'scenario_key': scenario['key']
+        'scenario_key': scenario['key'],
+        'input_files_dir': items[0]['input_files_dir']
     }
 
     for item in batched_item['items']:
@@ -720,52 +763,16 @@ def docking_process_batch(summary_queue, scenario, items, temp_dir):
             docking_process_clean_common(item)
 
     elif batched_item['execution_type'] == "batch":
-        ret = None
+        # Normally one batch; a batch whose call failed outright is followed by
+        # the halves it was split into (see execute_batch)
+        for finished_batch in execute_batch(batched_item, temp_dir):
+            while summary_queue.qsize() > 200:
+                time.sleep(0.2)
 
-        docking_process_setup_common(batched_item, "batch", temp_dir)
+            finished_batch['type'] = "docking_complete"
+            summary_queue.put(finished_batch)
 
-        print(f"processing batch of {len(batched_item['items'])} items")
-
-        # Mark which docking these ligands were associated with
-        for item in batched_item['items']:
-            with open(f"{item['output_dir']}/dock_uuid", "w") as output_f:
-                output_f.write(f"{item['uuid']}\n")
-
-        try:
-            cmd = program_runstring_array_batch(batched_item)
-        except RuntimeError as err:
-            logging.error(f"Invalid cmd generation for batched execution (program: '{batched_item['program']}')")
-            raise(err)
-
-        try:
-            ret = subprocess.run(cmd, capture_output=True,
-                     text=True, cwd=batched_item['tmp_run_dir_input'], timeout=batched_item['timeout'])
-        except subprocess.TimeoutExpired as err:
-            reason = "Batched execution timed out"
-            for item in batched_item['items']:
-                item['log']['reason'] = reason
-            logging.error(reason)
-
-        if ret != None:
-            if ret.returncode == 0:
-                process_docking_completion_batch(batched_item, ret)
-            else:
-                reason = f"Non zero return code for batched execution"
-                for item in batched_item['items']:
-                    item['log']['reason'] = reason
-
-                logging.error(reason)
-                logging.error(f"stdout:\n{ret.stdout}\nstderr:{ret.stderr}\n")
-
-
-            # Place output into files
-            with open(batched_item['log_path'], "w") as output_f:
-                output_f.write(f"STDOUT:\n{ret.stdout}\n")
-                output_f.write(f"STDERR:\n{ret.stderr}\n")
-
-
-        print(f"processing - done in {batched_item['seconds']}")
-        docking_process_clean_common(batched_item)
+        return
 
     else:
         logging.error(f"Invalid ligand processing model for program {scenario['program']}")
@@ -780,9 +787,90 @@ def docking_process_batch(summary_queue, scenario, items, temp_dir):
 
 
 
+def execute_batch(batched_item, temp_dir):
+    """Run one call of a batch program over batched_item['items'] and return
+    the batches to report: just batched_item, or, for a program that sets
+    'split_failed_batches', batched_item (as the failed call, with no items,
+    so its log is kept) followed by the batches its two halves became. A
+    single ligand that crashes the program then fails alone, not its whole
+    batch with it."""
+
+    program = DOCKING_PROGRAMS[batched_item['program']]
+    items = batched_item['items']
+
+    # The per-docking timeout, once per ligand in the call. The Batch job's
+    # own timeout is what really bounds a hung call
+    batched_item['timeout'] = items[0]['timeout'] * len(items)
+
+    ret = None
+
+    docking_process_setup_common(batched_item, "batch", temp_dir)
+
+    print(f"processing batch of {len(items)} items")
+
+    # Mark which docking these ligands were associated with
+    for item in items:
+        with open(f"{item['output_dir']}/dock_uuid", "w") as output_f:
+            output_f.write(f"{batched_item['uuid']}\n")
+
+    try:
+        cmd = program_runstring_array_batch(batched_item)
+    except RuntimeError as err:
+        logging.error(f"Invalid cmd generation for batched execution (program: '{batched_item['program']}')")
+        raise(err)
+
+    try:
+        ret = subprocess.run(cmd, capture_output=True,
+                 text=True, cwd=batched_item['tmp_run_dir_input'], timeout=batched_item['timeout'])
+    except subprocess.TimeoutExpired as err:
+        reason = "Batched execution timed out"
+        for item in items:
+            item['log']['reason'] = reason
+        logging.error(reason)
+
+    split = False
+
+    if ret != None:
+        if ret.returncode == 0:
+            process_docking_completion_batch(batched_item, ret)
+        else:
+            reason = f"Non zero return code for batched execution"
+            for item in items:
+                item['log']['reason'] = reason
+
+            logging.error(reason)
+            logging.error(f"stdout:\n{ret.stdout}\nstderr:{ret.stderr}\n")
+
+            split = bool(program.get('split_failed_batches')) and len(items) > 1
+
+        # Place output into files
+        with open(batched_item['log_path'], "w") as output_f:
+            output_f.write(f"STDOUT:\n{ret.stdout}\n")
+            output_f.write(f"STDERR:\n{ret.stderr}\n")
+
+    docking_process_clean_common(batched_item)
+    print(f"processing - done in {batched_item['seconds']}")
+
+    if not split:
+        return [batched_item]
+
+    # Dock each half in a call of its own; this call stays as a log-only entry
+    half = len(items) // 2
+    failed_call = {**batched_item, 'items': []}
+    finished = [failed_call]
+    for part in (items[:half], items[half:]):
+        part_batch = {key: batched_item[key] for key in ('program', 'execution_type', 'scenario_key', 'input_files_dir')}
+        part_batch['items'] = part
+        for item in part:
+            item['log']['reason'] = ""
+        finished.extend(execute_batch(part_batch, temp_dir))
+    return finished
+
+
 def move_batch_logs(item, scenario_directories):
 
     scenario_dest = Path(scenario_directories[item['scenario_key']]) / "batch_exec" / item['uuid']
+    scenario_dest.mkdir(parents=True, exist_ok=True)
     batch_output = Path(item['output_dir'])
     for dir_file in batch_output.iterdir():
         shutil.move(str(dir_file), f"{str(scenario_dest)}/")
@@ -2414,6 +2502,117 @@ def docking_finish_vina(item, ret):
         item['log']['reason'] = f"Could not find score"
         logging.error(item['log']['reason'])
 
+## Uni-Dock (GPU, one call per batch of ligands)
+
+UNIDOCK_SEARCH_MODES = ("fast", "balance", "detail")
+UNIDOCK_BOX_KEYS = ("center_x", "center_y", "center_z", "size_x", "size_y", "size_z")
+
+
+def docking_start_unidock(batch):
+    """The Uni-Dock command for one batch.
+
+    Reads the scenario's config.txt (the Vina style key = value file the head
+    writes): receptor (a PDBQT with hydrogens: Uni-Dock reads nothing else),
+    the box (center_x/y/z, size_x/y/z), and optionally search_mode (fast,
+    balance or detail, default detail), num_modes (default 9) and seed (default:
+    Uni-Dock's own). Each ligand is linked under a number, so ligands from
+    different collections can share a name, and Uni-Dock names the pose file
+    <number>_out.pdbqt."""
+
+    items = batch['items']
+
+    with open(items[0]['config_path']) as fd:
+        config_ = dict(read_config_line(line) for line in fd)
+    for key in config_:
+        if '#' in config_[key]:
+            config_[key] = config_[key].split('#')[0].strip()
+
+    receptor = config_.get('receptor', '')
+    if not receptor.endswith(".pdbqt"):
+        raise RuntimeError("unidock needs 'receptor' in its config.txt to be a PDBQT file with hydrogens")
+
+    for key in UNIDOCK_BOX_KEYS:
+        try:
+            float(config_[key])
+        except (KeyError, ValueError):
+            raise RuntimeError(f"unidock needs a number for '{key}' in its config.txt")
+
+    search_mode = config_.get('search_mode', "detail")
+    if search_mode not in UNIDOCK_SEARCH_MODES:
+        raise RuntimeError(f"unidock 'search_mode' must be one of {', '.join(UNIDOCK_SEARCH_MODES)}")
+
+    try:
+        num_modes = int(config_.get('num_modes', 9))
+        seed = int(config_['seed']) if config_.get('seed') else None
+    except ValueError:
+        raise RuntimeError("unidock 'num_modes' and 'seed' must be integers")
+    if num_modes < 1:
+        raise RuntimeError("unidock 'num_modes' must be at least 1")
+
+    ligand_dir = Path(batch['tmp_run_dir']) / "unidock_ligands"
+    batch['unidock_out'] = Path(batch['tmp_run_dir']) / "unidock_out"
+    ligand_dir.mkdir()
+    batch['unidock_out'].mkdir()
+
+    batch['unidock_poses'] = {}
+    index_path = Path(batch['tmp_run_dir']) / "unidock_index.txt"
+    with open(index_path, "w") as index:
+        for number, item in enumerate(items):
+            link = ligand_dir / f"{number}.pdbqt"
+            os.symlink(os.path.abspath(item['ligand_path']), link)
+            batch['unidock_poses'][number] = batch['unidock_out'] / f"{number}_out.pdbqt"
+            index.write(f"{link}\n")
+
+    cmd = [
+        f"{items[0]['tools_path']}/unidock",
+        '--receptor', receptor,
+        '--ligand_index', str(index_path),
+        *[arg for key in UNIDOCK_BOX_KEYS for arg in (f"--{key}", config_[key])],
+        '--search_mode', search_mode,
+        '--scoring', 'vina',
+        '--num_modes', str(num_modes),
+        '--dir', str(batch['unidock_out']),
+    ]
+    if seed is not None:
+        cmd += ['--seed', str(seed)]
+    return cmd
+
+
+def docking_finish_unidock(batch, ret):
+    """Score each ligand from its pose file, as docking_finish_vina does:
+    score is the best pose's score, all_scores every pose's, and the poses
+    are converted to the ligand's output.sdf (Open Babel, a few at a time)."""
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    scored = []
+    for number, item in enumerate(batch['items']):
+        pose_file = batch['unidock_poses'][number]
+        scores = []
+        if pose_file.exists():
+            with open(pose_file) as pose_f:
+                scores = [float(match.group('value')) for match in
+                          re.finditer(r'^REMARK VINA RESULT:\s+(?P<value>-?[0-9.]+)', pose_f.read(), flags=re.MULTILINE)]
+
+        if not scores:
+            item['log']['reason'] = "Uni-Dock returned no pose"
+            logging.error(f"{item['ligand_key']}: {item['log']['reason']}")
+            continue
+
+        item['score'] = min(scores)
+        item['all_scores'] = scores
+        item['status'] = "success"
+        shutil.move(str(pose_file), item['output_path'])
+        scored.append(item)
+
+    # Open Babel, one process per ligand, kept off the GPU's critical path as
+    # far as a few threads can
+    workers = max(1, min(8, os.cpu_count() or 1))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for item, sdf_path in zip(scored, pool.map(lambda scored_item: convert_pose_to_sdf(scored_item['output_path']), scored)):
+            item['output_path'] = sdf_path
+
+
 ## smina
 
 def docking_start_smina(task):
@@ -4039,6 +4238,18 @@ def scoring_finish_hawkins_gbsa(task, ret):
     return
 
 DOCKING_PROGRAMS = {
+    # One Uni-Dock call per batch of ligands (docking_scenario_batchsizes):
+    # a single docking worker, because the call sizes its batches to the GPU
+    # memory that is free when it starts. A ligand with Meeko glue atoms is
+    # skipped before it gets here; a call that fails is retried in halves.
+    'unidock': {
+        'start': docking_start_unidock,
+        'end': docking_finish_unidock,
+        'ligands': 'batch',
+        'reject_glue_atoms': True,
+        'max_workers': 1,
+        'split_failed_batches': True,
+    },
     'MpSDockZN': {
         'start': docking_start_MpSDockZN,
         'end': docking_finish_MpSDockZN,
@@ -4474,7 +4685,7 @@ def process(ctx):
             collection_processes[i].start()
 
         docking_processes = []
-        for i in range(0, ctx['vcpus_to_use']):
+        for i in range(0, docking_worker_count(ctx)):
             # docking_process(docking_queue, summary_queue)
             docking_processes.append(Process(target=docking_process, args=(ctx, docking_queue, summary_queue)))
             docking_processes[i].start()
@@ -4552,6 +4763,19 @@ def process(ctx):
             process.kill()
         sys.exit(1)
 
+
+
+def docking_worker_count(ctx):
+    """One docking worker per vCPU, except where a program caps it: a GPU
+    program's single worker feeds the one GPU the job owns, and more workers
+    would each size their batches to the GPU memory that is free at the moment
+    they start."""
+    workers = ctx['vcpus_to_use']
+    for scenario in ctx['main_config']['docking_scenarios'].values():
+        cap = DOCKING_PROGRAMS.get(scenario['program'], {}).get('max_workers')
+        if cap:
+            workers = min(workers, cap)
+    return max(workers, 1)
 
 
 def flush_queue(queue, processes, description):

@@ -549,3 +549,19 @@ A config.txt file is required for running Hawkins GBSA. An example of the config
     size_z=10
 ```
 The variable `chimera_path` should be updated to the location of the Chimera on your system. Chimera can be downloaded: [https://www.cgl.ucsf.edu/chimera/download.html](https://www.cgl.ucsf.edu/chimera/download.html).
+
+### Running with Uni-Dock (GPU):
+Uni-Dock docks many ligands in one call on one GPU, so it is a batch program: the ligands of a docking worker go to `unidock` in groups of `docking_scenario_batchsizes` (set it to about 2000; above that the call's speed stays the same). Name the scenario and method `unidock`, and give the AWS Batch job a GPU with `aws_batch_subjob_gpus=1` in all.ctrl. The job uses a single docking worker whatever `threads_to_use` says, because the call sizes its batches to the GPU memory free when it starts. An executable named `unidock` must be in /tools/bin (the `sealed-gpu` image has Uni-Dock there).<br>
+The config.txt file must contain a PDBQT receptor with hydrogens (Uni-Dock reads no other format) and the box; `search_mode` (`fast`, `balance` or `detail`, default `detail`), `num_modes` (default 9) and `seed` (default: Uni-Dock's own) are optional:
+```
+    receptor=../input-files/receptors/receptor.pdbqt
+    center_x=16.0
+    center_y=10.0
+    center_z=3.0
+    size_x=20.0
+    size_y=20.0
+    size_z=20.0
+    search_mode=detail
+```
+Scores go to the same summary and parquet files as qvina02's (`score_min` is the best pose's Vina score, lower is better) and poses to `output.sdf` in the logs archive, so the reducer and the pose viewer need no change. Uni-Dock does not reproduce its scores for a repeated run at a fixed seed.<br>
+A ligand with Meeko glue atoms (atom types `G0`, `CG0`, ..., which Meeko writes where it opens a ring of 7 or more members) is never given to Uni-Dock, which would score it with nonsense: it is skipped, counted in `skipped_ligands` and named in `skipped_ligand_list` with the reason `macrocycle_glue_atoms`. If a call fails outright, it is retried in halves down to single ligands, so one bad ligand fails alone.

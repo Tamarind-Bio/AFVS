@@ -35,6 +35,7 @@ import tarfile
 import shutil
 from pathlib import Path
 import afvs_presign
+import afvs_batch_resources
 
 MAX_LIGANDS_ON_DEMAND = 100000 # This will be about 100 subjobs
 
@@ -256,16 +257,7 @@ def submit_recovery_job(ctx, recovery_workunit, recovery_id, queue_name=None):
             },
             jobDefinition=f"{config['aws_batch_jobdef']}",
             containerOverrides={
-                'resourceRequirements': [
-                    {
-                        'type': 'VCPU',
-                        'value': config['aws_batch_subjob_vcpus'],
-                    },
-                    {
-                        'type': 'MEMORY',
-                        'value': config['aws_batch_subjob_memory'],
-                    },
-                ],
+                'resourceRequirements': afvs_batch_resources.resource_requirements(config),
                 'environment': [
                     {
                         'name': 'AFVS_RUN_MODE',
@@ -372,10 +364,7 @@ def submit_presigned_recovery_job(ctx, recovery_workunit, recovery_id, manifest_
         },
         jobDefinition=f"{config['aws_batch_jobdef']}",
         containerOverrides={
-            'resourceRequirements': [
-                {'type': 'VCPU', 'value': config['aws_batch_subjob_vcpus']},
-                {'type': 'MEMORY', 'value': config['aws_batch_subjob_memory']},
-            ],
+            'resourceRequirements': afvs_batch_resources.resource_requirements(config),
             'environment': afvs_presign.job_environment(config, workunit_id, manifest_url)
         }
     )

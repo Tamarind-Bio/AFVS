@@ -215,6 +215,9 @@ def check_parameters(config):
             if(empty_value(config, 'aws_batch_subjob_timeout')):
                 print("* 'aws_batch_subjob_timeout' must be set if batchsystem is 'awsbatch'")
                 error = 1
+            if(not empty_value(config, 'aws_batch_subjob_gpus') and not re.fullmatch(r'[0-9]+', config['aws_batch_subjob_gpus'])):
+                print("* 'aws_batch_subjob_gpus' must be a whole number if it is set")
+                error = 1
             if(empty_value(config, 'tempdir_default') or config['tempdir_default'] != "/dev/shm/"):
                 print("* RECOMMENDED that 'tempdir_default' be '/dev/shm' if awsbatch is used")
                 error = 1
